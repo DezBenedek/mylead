@@ -318,6 +318,10 @@ export interface EmailMessage {
   errorMessage: string | null;
   sentAt: string | null;
   createdAt: string;
+  scheduledSendAt?: string | null;
+  autoSendStatus?: "scheduled" | "paused" | "cancelled" | "sent" | "failed" | string | null;
+  aiSummary?: string | null;
+  aiRewriteNote?: string | null;
 }
 
 export interface InboxThread {
@@ -328,13 +332,58 @@ export interface InboxThread {
   fitScore: number;
   campaignId: string | null;
   campaignName: string | null;
+  offerTitle?: string | null;
   lastMessageAt: string;
   lastDirection: string;
   latestIntent: string | null;
   hasPendingDraft: boolean;
+  pendingReplyId?: string | null;
+  scheduledSendAt?: string | null;
+  autoSendStatus?: "scheduled" | "paused" | "cancelled" | "sent" | "failed" | string | null;
   bookingLinkSent: boolean;
   messageCount: number;
   messages: EmailMessage[];
+}
+
+export interface GeneratedEmail {
+  subject: string;
+  body: string;
+}
+
+export interface DirectEmailInput {
+  leadId: string;
+  senderAccountId?: string | null;
+  offerId?: string | null;
+  subject: string;
+  body: string;
+  dryRun: boolean;
+  scheduleMode: "now" | "auto_random" | "custom";
+  scheduledSendAt?: string | null;
+}
+
+export interface CreateLeadInput {
+  companyName: string;
+  websiteUrl: string;
+  industry: string;
+  location: string;
+  phone: string;
+  primaryEmail: string;
+  notes: string;
+  runAudit: boolean;
+}
+
+export interface CampaignUpdateInput {
+  id: string;
+  name?: string | null;
+  projectId?: string | null;
+  offerId?: string | null;
+  senderAccountId?: string | null;
+  status?: string | null;
+  tone?: string | null;
+  autoReplyMode?: string | null;
+  dailyLimit?: number | null;
+  includeBookingLink?: boolean | null;
+  customInstructions?: string | null;
 }
 
 export interface AppSettings {
@@ -351,6 +400,17 @@ export interface AppSettings {
   defaultLanguage: string;
   companySignature: string;
   imapPollMinutes: number;
+  autoReplyEnabled: boolean;
+  autoReplyWorkdays: number[];
+  autoReplyStartHour: number;
+  autoReplyEndHour: number;
+  autoReplyMinDelayMin: number;
+  autoReplyMaxDelayMin: number;
+  autoReplyDefaultDryRun: boolean;
+  aiAnalysisFocus: string;
+  aiReplyInstructions: string;
+  defaultTone: string;
+  defaultDailyLimit: number;
 }
 
 export interface DiscoveryToolStatus {

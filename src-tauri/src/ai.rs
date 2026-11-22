@@ -1,5 +1,6 @@
 use crate::crawler::CrawledSiteData;
-use crate::models::{AiModelOption, AppSettings, Lead, LocalCliStatus, Offer, Project, SearchJob, SearchJobInput, SearchOptimizationResult, WebsiteAudit};
+use crate::models::{AiModelOption, AppSettings, EmailMessage, Lead, LocalCliStatus, Offer, Project, SearchJob, SearchJobInput, SearchOptimizationResult, WebsiteAudit};
+use chrono::{Datelike, Duration as ChronoDuration, Local, TimeZone, Timelike, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -23,14 +24,20 @@ pub struct ProjectAiProfile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeadAiAnalysis {
     pub fit_score: i64,
+    #[serde(default)]
     pub employee_estimate: String,
+    #[serde(default)]
     pub company_summary: String,
+    #[serde(default)]
     pub pain_points: Vec<String>,
+    #[serde(default)]
     pub how_we_can_help: String,
+    #[serde(default)]
     pub recommended_pitch: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GeneratedEmail {
     pub subject: String,
     pub body: String,
@@ -39,9 +46,81 @@ pub struct GeneratedEmail {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplyClassification {
     pub intent: String, // interested | booking_request | question | objection | not_interested | out_of_office | unsubscribe
+    #[serde(default)]
     pub suggested_reply: String,
+    #[serde(default)]
     pub should_include_booking_link: bool,
+    #[serde(default)]
     pub summary: String,
+}
+
+/// Computes a human-like randomized send timestamp strictly inside configured business hours
+/// (default: Monday–Saturday 08:00–18:00 local time, 20–120 minutes after receipt).
+/// Returns UTC RFC3339 string.
+pub fn compute_random_business_send_time(settings: &AppSettings) -> String {
+    let min_delay = settings.auto_reply_min_delay_min.clamp(1, 720);
+    let max_delay = settings.auto_reply_max_delay_min.max(min_delay).clamp(min_delay, 1440);
+    let start_h = settings.auto_reply_start_hour.min(22) as u32;
+    let end_h = settings.auto_reply_end_hour.max((start_h as u8) + 1).min(24) as u32;
+    let workdays: Vec<u8> = if settings.auto_reply_workdays.is_empty() {
+        vec![1, 2, 3, 4, 5, 6]
+    } else {
+        settings.auto_reply_workdays.clone()
+    };
+
+    // Uniform random offset in [min_delay, max_delay] using UUID v4 randomness
+    let bytes = *Uuid::new_v4().as_bytes();
+    let rnd_u64 = u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]);
+    let span = (max_delay - min_delay + 1).max(1) as u64;
+    let delay_mins = min_delay + (rnd_u64 % span) as i64;
+    let extra_secs = (bytes[8] as i64) % 60;
+
+    let now_local = Local::now();
+    let candidate = now_local + ChronoDuration::minutes(delay_mins) + ChronoDuration::seconds(extra_secs);
+
+    let is_valid = |dt: chrono::DateTime<Local>| -> bool {
+        let wd = dt.weekday().number_from_monday() as u8;
+        if !workdays.contains(&wd) {
+            return false;
+        }
+        let h = dt.hour();
+        h >= start_h && h < end_h
+    };
+
+    if is_valid(candidate) {
+        return candidate.with_timezone(&Utc).to_rfc3339();
+    }
+
+    // Roll forward to the next valid business day opening + random offset in [min_delay, max_delay]
+    let window_mins = ((end_h - start_h) as i64 * 60).max(30);
+    let morning_offset = delay_mins.min(window_mins - 5).max(5);
+
+    let mut date = now_local.date_naive();
+    // If today is a workday and we haven't reached start_h yet, today is the next business window; otherwise tomorrow.
+    let today_wd = date.weekday().number_from_monday() as u8;
+    let can_use_today_morning = workdays.contains(&today_wd) && now_local.hour() < start_h;
+    if !can_use_today_morning {
+        date = date.succ_opt().unwrap_or(date);
+    }
+
+    for _ in 0..14 {
+        let wd = date.weekday().number_from_monday() as u8;
+        if workdays.contains(&wd) {
+            if let Some(naive_open) = date.and_hms_opt(start_h, 0, 0) {
+                if let Some(open_local) = Local.from_local_datetime(&naive_open).earliest() {
+                    let scheduled = open_local
+                        + ChronoDuration::minutes(morning_offset)
+                        + ChronoDuration::seconds(extra_secs);
+                    return scheduled.with_timezone(&Utc).to_rfc3339();
+                }
+            }
+        }
+        date = date.succ_opt().unwrap_or(date);
+    }
+
+    candidate.with_timezone(&Utc).to_rfc3339()
 }
 
 fn enriched_path_env() -> String {
@@ -362,9 +441,9 @@ async fn call_claude_cli(settings: &AppSettings, system_prompt: &str, user_promp
         let _ = stdin.write_all(user_prompt.as_bytes()).await;
     }
 
-    let output = tokio::time::timeout(Duration::from_secs(40), child.wait_with_output())
+    let output = tokio::time::timeout(Duration::from_secs(55), child.wait_with_output())
         .await
-        .map_err(|_| "Az AI modell (Claude CLI) nem adott választ 40 másodpercen belül (időtúllépés).".to_string())?
+        .map_err(|_| "Az AI modell (Claude CLI) nem adott választ 55 másodpercen belül (időtúllépés).".to_string())?
         .map_err(|e| format!("Claude CLI futtatási hiba: {}", e))?;
 
     let stdout = strip_ansi(&String::from_utf8_lossy(&output.stdout)).trim().to_string();
@@ -484,11 +563,11 @@ async fn call_opencode_cli(settings: &AppSettings, system_prompt: &str, user_pro
 
     cmd.arg(&combined_prompt);
 
-    let output = tokio::time::timeout(Duration::from_secs(40), cmd.output())
+    let output = tokio::time::timeout(Duration::from_secs(55), cmd.output())
         .await
         .map_err(|_| {
             format!(
-                "Az AI modell (OpenCode CLI / {}) nem adott választ 40 másodpercen belül (időtúllépés). Próbálj másik modellt a Beállításokban!",
+                "Az AI modell (OpenCode CLI / {}) nem adott választ 55 másodpercen belül (időtúllépés). Próbálj másik modellt a Beállításokban!",
                 if settings.ai_model.is_empty() { "alapértelmezett" } else { &settings.ai_model }
             )
         })?
@@ -852,13 +931,27 @@ pub async fn audit_and_score_lead(
 ) -> LeadAiAnalysis {
     let target_problem = search
         .map(|s| s.target_problem.as_str())
-        .unwrap_or("általános digitális, ügyfélszerzési vagy konverziós hiányosságok");
+        .unwrap_or("statikus vagy hiányzó ajánlatkérő / időpontfoglaló / okosűrlap folyamatok");
+
+    let analysis_focus = if settings.ai_analysis_focus.trim().is_empty() {
+        "Fókuszálj konkrétan arra, mit tehet egy okosűrlap (intelligens, többlépcsős ajánlatkérő / előszűrő / kalkulátor / időpontfoglaló űrlap) ennek a cégnek a saját szolgáltatásai alapján."
+    } else {
+        settings.ai_analysis_focus.trim()
+    };
 
     if has_live_ai(settings) {
-        let system = "Te egy B2B lead-minősítő és üzletfejlesztési elemző vagy. Elemezd a célcéget és a weboldal-auditját a saját projektünk és ajánlatunk szemszögéből MAGYAR nyelven. Adj vissza kizárólag JSON-t ezekkel a kulcsokkal: fit_score (0..100 integer), employee_estimate (string, pl. '10-25 fő'), company_summary (string, 2-3 mondat), pain_points (string[]), how_we_can_help (string), recommended_pitch (string).";
+        let system = "Te egy B2B üzletfejlesztési és konverzió-optimalizálási elemző vagy. Elemezd a célcéget és a weboldal-auditját a saját projektünk / okosűrlap-megoldásunk szemszögéből MAGYAR nyelven.\n\
+FONTOS SZABÁLYOK:\n\
+1. A 'how_we_can_help' mező legyen egy tömör, lényegre törő NAGYSÁGRENDI ÁTTEKINTÉS (2-4 rövid pont, soremeléssel elválasztva), amely KIFEJEZETTEN a cég valós szolgáltatásaira szabva mutatja meg, mit tehet az okosűrlap / megoldásunk értük (pl. milyen adatokat szűr előre az űrlap, milyen azonnali kalkulációt/előminősítést vagy foglalást ad, hány felesleges kört/telefont spórol, milyen nagyságrendű plusz érdeklődőt/időmegtakarítást hozhat).\n\
+2. NE írj megszólítási szöveget, pitch-et vagy levéltervezetet — a 'recommended_pitch' mező mindig legyen üres string \"\".\n\
+3. A 'fit_score' (0..100) őszintén tükrözze, mennyire hasznos az okosűrlap / megoldásunk ennek a cégnek (ha már profi interaktív rendszerük van vagy teljesen irreleváns a profiljuk, kapjon alacsony pontot; ha egyedi árajánlatot / konzultációt / időpontot igénylő szolgáltató csak sima kapcsolat-űrlappal vagy telefonszámmal, kapjon magas pontot).\n\
+Kizárólag érvényes JSON-t adj vissza ezekkel a kulcsokkal: fit_score (0..100 integer), employee_estimate (string, pl. '10-25 fő'), company_summary (string, tömör 1-2 mondat a cég fő tevékenységéről), pain_points (string[], 2-4 konkrét hiányosság), how_we_can_help (string, nagyságrendi áttekintés az okosűrlap konkrét értékéről ehhez a céghez), recommended_pitch (\"\").";
+
         let user = format!(
-            "SAJÁT PROJEKT:\nNév: {}\nÉrtékajánlat: {}\nMegoldott problémák: {:?}\nKiválasztott ajánlat: {}\nKeresett specifikus probléma: {}\n\nCÉLCÉG:\nNév: {}\nWeboldal: {}\nIparág: {}\nLokáció: {}\nGoogle értékelés: {:?} ({:?} értékelés)\nWeboldal audit: {}\nWeboldal szövegrészlet:\n{}",
+            "ELEMZÉSI FÓKUSZ (KIEMELTEN FIGYELJ RÁ):\n{}\n\nSAJÁT PROJEKT / MEGOLDÁS:\nNév: {}\nLeírás: {}\nÉrtékajánlat: {}\nMegoldott problémák: {:?}\nKiválasztott ajánlat: {}\nKeresett specifikus probléma: {}\n\nCÉLCÉG:\nNév: {}\nWeboldal: {}\nIparág: {}\nLokáció: {}\nGoogle értékelés: {:?} ({:?} értékelés)\nWeboldal audit: {}\nWeboldal szövegrészlet:\n{}",
+            analysis_focus,
             project.name,
+            project.description,
             project.value_proposition,
             project.pain_points_solved,
             offer.map(|o| format!("{} ({}) - {}", o.title, o.discount_value, o.description)).unwrap_or_else(|| "Nincs megadva".into()),
@@ -870,19 +963,21 @@ pub async fn audit_and_score_lead(
             lead.google_rating,
             lead.google_reviews,
             audit.map(|a| serde_json::to_string(a).unwrap_or_default()).unwrap_or_else(|| "Nincs weboldal / nem elérhető".into()),
-            crawled_text.chars().take(5000).collect::<String>()
+            crawled_text.chars().take(6000).collect::<String>()
         );
         if let Ok(json_str) = call_llm_json(settings, system, &user).await {
             if let Ok(mut parsed) = serde_json::from_str::<LeadAiAnalysis>(&json_str) {
                 parsed.fit_score = parsed.fit_score.clamp(0, 100);
+                parsed.recommended_pitch = String::new();
                 return parsed;
             }
         }
     }
 
-    // Deterministic high-signal scoring based on real audit findings
-    let mut score = 48i64;
+    // Deterministic high-signal scoring focused on smart form (okosűrlap) & conversion potential
+    let mut score = 46i64;
     let mut pain_points = Vec::new();
+    let mut okosurlap_points = Vec::new();
     let mut employee_estimate = if !lead.employee_estimate.is_empty() {
         lead.employee_estimate.clone()
     } else {
@@ -891,83 +986,82 @@ pub async fn audit_and_score_lead(
 
     if let Some(a) = audit {
         if !a.reachable {
-            score += 18;
+            score += 14;
             pain_points.push("A weboldal jelenleg nem elérhető vagy hibát ad vissza".to_string());
+            okosurlap_points.push("• Önálló linkként is megosztható okosűrlap (Google profilból, Facebookról) azonnali érdeklődő-fogadáshoz.".to_string());
         } else {
-            if !a.has_https {
+            if !a.has_booking_system {
+                score += 16;
+                pain_points.push("Nincs interaktív online időpontfoglaló vagy előszűrő folyamat".to_string());
+                okosurlap_points.push(format!(
+                    "• 0–24 órás okosűrlap a(z) {} szolgáltatásaira: automatikusan bekéri az igény paramétereit, és előszűrve adja át a leadeket.",
+                    if lead.industry.is_empty() { &lead.company_name } else { &lead.industry }
+                ));
+            }
+            if !a.has_contact_form {
                 score += 12;
-                pain_points.push("Hiányzó SSL (nem biztonságos HTTP oldal)".to_string());
+                pain_points.push("Nincs beépített ajánlatkérő / kapcsolatfelvételi űrlap az oldalon".to_string());
+                okosurlap_points.push("• Kötetlen e-mailezés / telefonálgatás kiváltása: 1 perces irányított okosűrlap + azonnali visszaigazolás.".to_string());
+            } else {
+                score += 6;
+                okosurlap_points.push("• A meglévő statikus kapcsolat-űrlap kiváltása intelligens, elágazó okosűrlappal (kevesebb hiányos megkeresés, +20–40% kitöltési arány).".to_string());
             }
             if !a.has_mobile_viewport {
-                score += 12;
-                pain_points.push("Nem mobilbarát kialakítás".to_string());
-            }
-            if !a.has_booking_system {
-                score += 14;
-                pain_points.push("Nincs online időpontfoglalási lehetőség a weboldalon".to_string());
+                score += 10;
+                pain_points.push("Nem mobilbarát kialakítás — mobilos érdeklődők elvesztése".to_string());
+                okosurlap_points.push("• Mobilra optimalizált, kártyás kitöltésű okosűrlap, amivel telefonról is fél perc az ajánlatkérés.".to_string());
             }
             if !a.has_analytics {
-                score += 9;
-                pain_points.push("Nincs telepített analitika vagy konverziókövetés".to_string());
+                score += 8;
+                pain_points.push("Nincs konverziókövetés az érdeklődéseken".to_string());
             }
             if !a.has_chat_widget {
-                score += 6;
-                pain_points.push("Nincs élő chat / azonnali ügyfélkezelés".to_string());
+                score += 5;
+                pain_points.push("Nincs azonnali interaktív ügyfél-irányítás az oldalon".to_string());
             }
             if a.load_time_ms > 2500 {
-                score += 7;
+                score += 5;
                 pain_points.push(format!("Lassú weboldal betöltés ({} ms)", a.load_time_ms));
             }
             if !a.extracted_emails.is_empty() {
-                score += 8; // Reachable contact boosts actionability
+                score += 7;
             }
             if a.pages_crawled >= 4 || a.tech_stack.len() >= 3 {
                 employee_estimate = "15–50 fő (becsült)".to_string();
             }
         }
     } else if lead.website_url.trim().is_empty() {
-        score += 16;
+        score += 12;
         pain_points.push("A cégnek nincs megadott saját weboldala".to_string());
+        okosurlap_points.push("• Önállóan megosztható okosűrlap landing (Google Maps / közösségi média mellé), weboldal-fejlesztés nélkül is azonnali lead-gyűjtés.".to_string());
         employee_estimate = "1–10 fő (becsült)".to_string();
     }
 
-    if !target_problem.trim().is_empty() && !pain_points.iter().any(|p| p.to_lowercase().contains(&target_problem.to_lowercase())) {
-        pain_points.push(format!("Keresési fókusz szempont: {}", target_problem));
+    if okosurlap_points.is_empty() {
+        okosurlap_points.push(format!(
+            "• A(z) {} megkereséseinek előszűrése és automatikus árajánlat-/konzultáció-előkészítés okosűrlappal.",
+            lead.company_name
+        ));
     }
-    if pain_points.is_empty() {
-        pain_points.push("Konverzió- és ügyfélszerzési optimalizálási lehetőség".to_string());
-    }
+    okosurlap_points.push("• Nagyságrendi hatás: kevesebb oda-vissza egyeztetés, gyorsabb reakcióidő, jobb minőségű beérkező ajánlatkérések.".to_string());
 
-    let offer_snippet = offer
-        .map(|o| format!("A „{}” ({}) ajánlatunkkal alacsony kockázattal elindítható az együttműködés.", o.title, o.discount_value))
-        .unwrap_or_else(|| format!("A(z) {} megoldásunk közvetlenül orvosolja a feltárt hiányosságokat.", project.name));
+    if pain_points.is_empty() {
+        pain_points.push("Statikus érdeklődőkezelés — okosűrlappal növelhető a konverzió".to_string());
+    }
 
     LeadAiAnalysis {
         fit_score: score.clamp(15, 96),
         employee_estimate,
         company_summary: format!(
-            "{} ({}, {}) — {} szektorban aktív vállalkozás. {}",
+            "{} ({}, {}) — {} területen működő vállalkozás.",
             lead.company_name,
             if lead.location.is_empty() { "Magyarország" } else { &lead.location },
             if lead.domain.is_empty() { "nincs domain" } else { &lead.domain },
-            if lead.industry.is_empty() { "B2B" } else { &lead.industry },
-            audit
-                .map(|a| format!("Weboldal-audit alapján {} potenciális fejlesztési pont azonosítva.", a.detected_issues.len()))
-                .unwrap_or_else(|| "Weboldal-audit még függőben vagy nincs weboldal.".to_string())
+            if lead.industry.is_empty() { "B2B szolgáltató" } else { &lead.industry },
         ),
-        pain_points: pain_points.clone(),
-        how_we_can_help: format!(
-            "A(z) {} segítségével megszüntethetők a legfőbb akadályok ({}). {}",
-            project.name,
-            pain_points.iter().take(2).cloned().collect::<Vec<_>>().join("; "),
-            offer_snippet
-        ),
-        recommended_pitch: format!(
-            "Hivatkozz a(z) {} oldalán talált konkrét pontra ({}), majd ajánld fel a(z) {} lehetőséget egy rövid egyeztetéssel.",
-            lead.company_name,
-            pain_points.first().cloned().unwrap_or_else(|| "online ügyfélszerzés".into()),
-            offer.map(|o| o.title.as_str()).unwrap_or(&project.name)
-        ),
+        pain_points,
+        how_we_can_help: okosurlap_points.join("\n"),
+        recommended_pitch: String::new(),
     }
 }
 
@@ -988,9 +1082,9 @@ pub async fn generate_cold_email(
     };
 
     if has_live_ai(settings) {
-        let system = "Te egy tapasztalt B2B sales szövegíró vagy. Írj egy természetes, emberi, NEM sablonos, nem spammy hideg e-mailt a megadott cégnek a valós weboldal-audit alapján. Ne használj túlzó marketing-kliséket vagy felkiáltójel-áradatot. Kizárólag JSON-t adj vissza: {\"subject\":\"...\",\"body\":\"...\"}";
+        let system = "Te egy tapasztalt B2B sales szövegíró vagy. Írj egy természetes, emberi, NEM sablonos, nem spammy hideg e-mailt a megadott cégnek a valós weboldal-audit és az okosűrlap / ajánlat konkrét haszna alapján. Ne használj túlzó marketing-kliséket vagy felkiáltójel-áradatot. Kizárólag JSON-t adj vissza: {\"subject\":\"...\",\"body\":\"...\"}";
         let user = format!(
-            "Nyelv: {}\nHangnem: {}\nSaját cég/projekt: {} ({})\nÉrtékajánlat: {}\nLanding oldal: {}\nIdőpontfoglaló link: {}\nIdőpontfoglaló beillesztése az első levélbe: {}\nAjánlat / kedvezmény: {}\nExtra utasítás: {}\nAláírás:\n{}\n\nCÉLCÉG:\nNév: {}\nWeboldal: {}\nFeltárt problémák: {:?}\nMiben tudunk segíteni: {}\nJavasolt szög: {}",
+            "Nyelv: {}\nHangnem: {}\nSaját megoldás: {} ({})\nÉrtékajánlat: {}\nLanding oldal: {}\nIdőpontfoglaló link: {}\nIdőpontfoglaló beillesztése az első levélbe: {}\nKiemelt ajánlat: {}\nTermék/Okosűrlap fókusz: {}\nExtra utasítás: {}\nAláírás:\n{}\n\nCÉLCÉG:\nNév: {}\nWeboldal: {}\nIparág: {}\nFeltárt problémák: {:?}\nMiben segíthet az okosűrlap / megoldásunk:\n{}",
             language,
             tone_desc,
             project.name,
@@ -999,14 +1093,15 @@ pub async fn generate_cold_email(
             project.landing_url,
             project.booking_url,
             include_booking_link,
-            offer.map(|o| format!("{} ({}) - {}", o.title, o.discount_value, o.description)).unwrap_or_else(|| "Nincs kiemelt kedvezmény".into()),
+            offer.map(|o| format!("{} ({}) — {} | CTA: {}", o.title, o.discount_value, o.description, o.cta_text)).unwrap_or_else(|| "Nincs kiemelt kedvezmény".into()),
+            settings.ai_analysis_focus,
             custom_instructions,
             settings.company_signature,
             lead.company_name,
             lead.website_url,
+            lead.industry,
             lead.pain_points,
             lead.how_we_can_help,
-            lead.recommended_pitch
         );
         if let Ok(json_str) = call_llm_json(settings, system, &user).await {
             if let Ok(parsed) = serde_json::from_str::<GeneratedEmail>(&json_str) {
@@ -1021,11 +1116,11 @@ pub async fn generate_cold_email(
         .pain_points
         .first()
         .cloned()
-        .unwrap_or_else(|| "az online érdeklődőszerzésben még komoly tartalék van".to_string());
+        .unwrap_or_else(|| "az online ajánlatkérési / érdeklődőkezelési folyamatban még komoly tartalék van".to_string());
 
     let offer_line = offer
-        .map(|o| format!("Jelenleg egy kiemelt ajánlattal is tudunk indulni: {} ({}). {}", o.title, o.discount_value, o.description))
-        .unwrap_or_else(|| format!("A(z) {} segítségével gyorsan, mérhetően javítható ez a terület.", project.name));
+        .map(|o| format!("Jelenlegi ajánlatunk: {} ({}). {}", o.title, o.discount_value, o.description))
+        .unwrap_or_else(|| format!("A(z) {} megoldásunk gyorsan, mérhetően segít ezen a területen.", project.name));
 
     let landing_line = if !project.landing_url.trim().is_empty() {
         format!("\nRészletek és példák itt láthatók: {}", project.landing_url)
@@ -1038,7 +1133,7 @@ pub async fn generate_cold_email(
     let booking_line = if include_booking_link && !project.booking_url.trim().is_empty() {
         format!("\nHa nyitottak egy rövid, 15 perces egyeztetésre, itt tudnak közvetlenül időpontot választani: {}", project.booking_url)
     } else {
-        "\nHa aktuális lehet a téma, elég egy rövid válasz erre a levélre, és szívesen átküldöm a részleteket vagy egyeztetünk 15 percben.".to_string()
+        "\nHa aktuális lehet a téma, elég egy rövid válasz erre a levélre, és szívesen megmutatom 10 percben, hogyan működne Önöknél.".to_string()
     };
 
     let greeting = if tone == "friendly_direct" {
@@ -1070,11 +1165,31 @@ pub async fn classify_and_draft_reply(
     offer: Option<&Offer>,
     lead: &Lead,
     inbound_body: &str,
+    thread_history: &[EmailMessage],
 ) -> ReplyClassification {
+    let history_text = thread_history
+        .iter()
+        .rev()
+        .take(6)
+        .rev()
+        .map(|m| {
+            format!(
+                "[{} | {}]: {}\n{}",
+                if m.direction == "inbound" { "ÜGYFÉL" } else { "MI" },
+                m.subject,
+                m.body.chars().take(600).collect::<String>(),
+                if m.booking_link_sent { "(foglalási link kiküldve)" } else { "" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n---\n");
+
     if has_live_ai(settings) {
-        let system = "Te egy profi B2B értékesítési asszisztens vagy. Elemezd az ügyfél válaszát, osztályozd a szándékát, és írj rá természetes, konverzióra fókuszáló választ MAGYAR nyelven. Ha időpontot, hívást, bemutatót vagy találkozót kér, illeszd be a projekt időpontfoglaló linkjét! Ha kérdez vagy érdeklődik, válaszolj pontosan és csábítsd a weboldalra/ajánlatra. Kizárólag JSON-t adj vissza: {\"intent\":\"interested|booking_request|question|objection|not_interested|out_of_office|unsubscribe\",\"suggested_reply\":\"...\",\"should_include_booking_link\":true|false,\"summary\":\"...\"}";
+        let system = "Te egy profi, emberi hangvételű B2B értékesítési asszisztens vagy. Elemezd az ügyfél beérkező levelét, osztályozd a szándékát, és MINDEN kérdésre, érdeklődésre, kifogásra vagy időpontkérésre írj pontos, természetes, segítőkész választ MAGYAR nyelven (csak leiratkozás vagy házon kívüli auto-válasz esetén hagyd üresen a suggested_reply mezőt).\n\
+Ha időpontot, hívást, bemutatót vagy találkozót kér, illeszd be a projekt időpontfoglaló linkjét! Ha kérdést tesz fel, válaszolj rá közvetlenül, konkrétan, és kapcsold össze az okosűrlap / ajánlat értékével.\n\
+Kizárólag JSON-t adj vissza: {\"intent\":\"interested|booking_request|question|objection|not_interested|out_of_office|unsubscribe\",\"suggested_reply\":\"...\",\"should_include_booking_link\":true|false,\"summary\":\"...\"}";
         let user = format!(
-            "Saját projekt: {} ({})\nLanding URL: {}\nIdőpontfoglaló URL: {}\nAjánlat: {}\nÉrtékajánlat: {}\nKifogáskezelés: {:?}\nAláírás:\n{}\n\nÜGYFÉL ({}):\n{}",
+            "Saját megoldás: {} ({})\nLanding URL: {}\nIdőpontfoglaló URL: {}\nAjánlat: {}\nÉrtékajánlat: {}\nKifogáskezelés: {:?}\nGlobális válasz-szabályok: {}\nAláírás:\n{}\n\nCÉG ({} — {})\nMiben segíthetünk nekik:\n{}\n\nKORÁBBI LEVÉLVÁLTÁS:\n{}\n\nLEGÚJABB BEÉRKEZŐ ÜZENET:\n{}",
             project.name,
             project.website_url,
             project.landing_url,
@@ -1082,8 +1197,12 @@ pub async fn classify_and_draft_reply(
             offer.map(|o| format!("{} ({}) - {}", o.title, o.discount_value, o.description)).unwrap_or_else(|| "Nincs".into()),
             project.value_proposition,
             project.objection_handlers,
+            settings.ai_reply_instructions,
             settings.company_signature,
             lead.company_name,
+            lead.industry,
+            lead.how_we_can_help,
+            if history_text.is_empty() { "Nincs előzmény".into() } else { history_text },
             inbound_body
         );
         if let Ok(json_str) = call_llm_json(settings, system, &user).await {
@@ -1098,7 +1217,7 @@ pub async fn classify_and_draft_reply(
     let unsub_kw = ["leiratkoz", "unsubscribe", "ne írjanak", "ne irjanak", "törölj", "torolj", "spam", "gdpr"];
     let no_kw = ["nem érdekel", "nem erdekel", "köszönjük nem", "koszonjuk nem", "nincs szükség", "nem aktuális", "nem aktualis"];
     let ooo_kw = ["házon kívül", "hazon kivul", "out of office", "szabadság", "szabadsag", "automatikus válasz"];
-    let question_kw = ["?", "mennyibe", "ár", "ar ", "hogyan", "részletek", "reszletek", "milyen"];
+    let question_kw = ["?", "mennyibe", "ár", "ar ", "hogyan", "részletek", "reszletek", "milyen", "működik", "mukodik"];
 
     let target_url = if !project.landing_url.trim().is_empty() {
         project.landing_url.as_str()
@@ -1145,7 +1264,7 @@ pub async fn classify_and_draft_reply(
         return ReplyClassification {
             intent: "booking_request".to_string(),
             suggested_reply: format!(
-                "Nagyon örülök az érdeklődésnek! Szívesen átbeszéljük röviden, hogyan tudunk segíteni a(z) {} számára.\n\n{}\n\nAddig is a részleteket és referenciákat itt találják: {}\n\n{}",
+                "Nagyon örülök az érdeklődésnek! Szívesen átbeszéljük röviden, hogyan tudunk segíteni a(z) {} számára.\n\n{}\n\nAddig is a részleteket itt találják: {}\n\n{}",
                 lead.company_name, booking_part, target_url, settings.company_signature
             ),
             should_include_booking_link: !project.booking_url.trim().is_empty(),
@@ -1165,11 +1284,11 @@ pub async fn classify_and_draft_reply(
         return ReplyClassification {
             intent: "question".to_string(),
             suggested_reply: format!(
-                "Köszönöm a kérdést! Röviden összefoglalva: {}\n{}\n\nA teljes leírást és esettanulmányokat ezen az oldalon találják: {}{}\n\n{}",
+                "Köszönöm a kérdést! Röviden összefoglalva: {}\n{}\n\nA teljes leírást és példákat ezen az oldalon találják: {}{}\n\n{}",
                 project.value_proposition, offer_part, target_url, booking_part, settings.company_signature
             ),
             should_include_booking_link: !project.booking_url.trim().is_empty(),
-            summary: "Érdeklődő kérdés érkezett — tájékoztatás + weboldal és foglalási link javasolt.".to_string(),
+            summary: "Érdeklődő kérdés érkezett — AI válasz elkészült és időzítésre kész.".to_string(),
         };
     }
 
@@ -1182,12 +1301,94 @@ pub async fn classify_and_draft_reply(
     ReplyClassification {
         intent: "interested".to_string(),
         suggested_reply: format!(
-            "Köszönöm a visszajelzést! Örülök, hogy releváns lehet a(z) {} számára a megoldásunk.\n\nA legfontosabb részleteket és a kedvezményes indulási feltételeket itt nézhetik meg: {}{}\n\n{}",
+            "Köszönöm a visszajelzést! Örülök, hogy releváns lehet a(z) {} számára a megoldásunk.\n\nA legfontosabb részleteket és az aktuális ajánlatot itt nézhetik meg: {}{}\n\n{}",
             lead.company_name, target_url, booking_part, settings.company_signature
         ),
         should_include_booking_link: !project.booking_url.trim().is_empty(),
         summary: "Pozitív / érdeklődő válasz érkezett.".to_string(),
     }
+}
+
+/// Rewrites an email draft or inbox auto-reply strictly following the user's comment/instruction
+pub async fn rewrite_email_with_instruction(
+    settings: &AppSettings,
+    project: Option<&Project>,
+    offer: Option<&Offer>,
+    lead: &Lead,
+    thread_history: &[EmailMessage],
+    current_subject: &str,
+    current_body: &str,
+    instruction: &str,
+) -> Result<GeneratedEmail, String> {
+    let history_text = thread_history
+        .iter()
+        .rev()
+        .take(5)
+        .rev()
+        .map(|m| {
+            format!(
+                "[{}]: {}",
+                if m.direction == "inbound" { "ÜGYFÉL" } else { "MI" },
+                m.body.chars().take(500).collect::<String>()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n---\n");
+
+    if has_live_ai(settings) {
+        let system = "Te egy profi B2B kommunikációs szövegíró vagy. A felhasználó megjegyzése / instrukciója alapján írd át a meglévő e-mail tervezetet MAGYAR nyelven. Tartsd meg a lényegi tényeket (linkek, ajánlat, aláírás, ha a felhasználó mást nem kér), legyen természetes és emberi. Kizárólag JSON-t adj vissza: {\"subject\":\"...\",\"body\":\"...\"}";
+        let user = format!(
+            "FELHASZNÁLÓ MEGJEGYZÉSE / ÁTÍRÁSI UTASÍTÁS:\n{}\n\nJELENLEGI TÁRGY: {}\nJELENLEGI LEVÉLSZÖVEG:\n{}\n\nCÉG: {} ({})\nMiben segíthetünk:\n{}\nSAJÁT PROJEKT: {}\nAJÁNLAT: {}\nFOGLALÁSI LINK: {}\nLANDING LINK: {}\nALÁÍRÁS:\n{}\n\nELŐZMÉNYEK:\n{}",
+            instruction,
+            current_subject,
+            current_body,
+            lead.company_name,
+            lead.industry,
+            lead.how_we_can_help,
+            project.map(|p| format!("{} — {}", p.name, p.value_proposition)).unwrap_or_else(|| "Nincs".into()),
+            offer.map(|o| format!("{} ({}) — {}", o.title, o.discount_value, o.description)).unwrap_or_else(|| "Nincs".into()),
+            project.map(|p| p.booking_url.as_str()).unwrap_or(""),
+            project.map(|p| p.landing_url.as_str()).unwrap_or(""),
+            settings.company_signature,
+            if history_text.is_empty() { "Nincs".into() } else { history_text },
+        );
+        let json_str = call_llm_json(settings, system, &user).await?;
+        let parsed = serde_json::from_str::<GeneratedEmail>(&json_str)
+            .map_err(|_| "Az AI nem érvényes JSON formátumban adta vissza az átírt levelet.".to_string())?;
+        if !parsed.body.trim().is_empty() {
+            return Ok(GeneratedEmail {
+                subject: if parsed.subject.trim().is_empty() {
+                    current_subject.to_string()
+                } else {
+                    parsed.subject
+                },
+                body: parsed.body,
+            });
+        }
+    }
+
+    // Heuristic fallback if live AI is unavailable
+    let lower = instruction.to_lowercase();
+    let mut next_body = current_body.to_string();
+    if lower.contains("rövid") || lower.contains("rovid") || lower.contains("tömör") {
+        let lines: Vec<&str> = current_body.lines().filter(|l| !l.trim().is_empty()).collect();
+        next_body = lines.into_iter().take(4).collect::<Vec<_>>().join("\n\n");
+        if !settings.company_signature.trim().is_empty() && !next_body.contains(settings.company_signature.trim()) {
+            next_body.push_str(&format!("\n\n{}", settings.company_signature));
+        }
+    } else if lower.contains("foglal") || lower.contains("időpont") || lower.contains("idopont") {
+        if let Some(url) = project.map(|p| p.booking_url.as_str()).filter(|u| !u.is_empty()) {
+            if !next_body.contains(url) {
+                next_body.push_str(&format!("\n\nItt tud közvetlenül időpontot választani: {}", url));
+            }
+        }
+    } else {
+        next_body = format!("{}\n\n(Megjegyzés alapján kiegészítve: {})", current_body.trim(), instruction.trim());
+    }
+    Ok(GeneratedEmail {
+        subject: current_subject.to_string(),
+        body: next_body,
+    })
 }
 
 /// AI Search Optimizer: fixes, sharpens, and configures a SearchJob based on the Project + user's goal
@@ -1320,5 +1521,36 @@ pub async fn optimize_search_config(
         offer_id: current.offer_id.clone().or_else(|| project.offers.first().map(|o| o.id.clone())),
         reasoning: "Átállítottam Okos Hibrid (DDGS + OSM + Scraper) módra a stabil találatokért, beállítottam a 72-es mély-kutatási küszöböt és hozzárendeltem a projekt fő ajánlatát.".to_string(),
         ai_error: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_random_business_send_time_respects_workdays_and_hours() {
+        let settings = AppSettings::default();
+        for _ in 0..50 {
+            let iso = compute_random_business_send_time(&settings);
+            let utc_dt = chrono::DateTime::parse_from_rfc3339(&iso).expect("valid RFC3339");
+            let local_dt = utc_dt.with_timezone(&Local);
+            let wd = local_dt.weekday().number_from_monday() as u8;
+            assert!(
+                settings.auto_reply_workdays.contains(&wd),
+                "Expected workday in {:?}, got {} ({})",
+                settings.auto_reply_workdays,
+                wd,
+                local_dt
+            );
+            assert!(
+                local_dt.hour() >= settings.auto_reply_start_hour as u32
+                    && local_dt.hour() < settings.auto_reply_end_hour as u32,
+                "Expected hour in {}..{}, got {}",
+                settings.auto_reply_start_hour,
+                settings.auto_reply_end_hour,
+                local_dt.hour()
+            );
+        }
     }
 }

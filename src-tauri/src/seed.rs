@@ -430,38 +430,61 @@ pub fn seed_demo_workspace(db: &Database) -> Result<(), String> {
         None, None, true, Some(&d_minus(3, 4)),
     )?;
 
-    // Thread 2: BudaSmile — Outbound -> Question inbound with AI suggested draft waiting for approval!
+    // Thread 2: BudaSmile — Outbound -> Question inbound + Scheduled AI auto-reply!
     db.insert_email_message(
         Some(&camp.id), &lead_ids[1], "outbound", "sent", 1,
         "BudaSmile — mobil foglalás és 30 napos ingyenes próba",
         "Tisztelt BudaSmile Csapat!\n\nA budasmile.hu oldal átvizsgálásakor láttam, hogy mobilon viszonylag lassan tölt be az űrlap, és még nincs közvetlen naptáras időpontfoglalás. A fogszabályozási konzultációkra érkező szülők nagy része este telefonról böngészik.\n\nA FoglaljPro 30 napig díjmentesen tesztelhető, 25% kedvezménnyel az első félévre: https://foglaljpro.hu/klinikaknak\n\nÉrdekelheti Önöket egy rövid bemutató?\n\nÜdvözlettel,\nKovács Márton",
         Some("<msg-budasmile-1@foglaljpro.hu>"), None, None, None, false, Some(&d_minus(2, 6)),
     )?;
-    db.insert_email_message(
+    let buda_suggested = "Szia Eszter!\n\nKöszönöm az érdeklődést! Igen, a FoglaljPro kétirányú szinkronban működik a Google Naptárral (minden kezelőszékhez / orvoshoz külön naptár köthető).\n\n4 kezelőszék esetén a csomag listaára 39 900 Ft/hó, amiből a 30 napos ingyenes próba után az első 6 hónapra 25% kedvezményt adunk (29 925 Ft/hó), rejtett beüzemelési díj nélkül.\n\nA pontos csomagokat itt is megnézheted: https://foglaljpro.hu/klinikaknak\n\nHa kényelmesebb, 10 percben megmutatom élőben a Google Naptár összekötést — itt tudsz időpontot választani:\nhttps://cal.com/foglaljpro/15perc-demo\n\nÜdvözlettel,\nKovács Márton";
+    db.insert_email_message_full(
         Some(&camp.id), &lead_ids[1], "inbound", "received", 1,
         "Re: BudaSmile — mobil foglalás és 30 napos ingyenes próba",
         "Szia Márton,\n\nÉrdekesnek hangzik. Meg tudod mondani, hogy mennyibe kerül pontosan 4 kezelőszékre a próba után, és összeköthető-e Google Naptárral?\n\nÜdv,\nTóth Eszter",
         Some("<msg-budasmile-reply-1@budasmile.hu>"), Some("<msg-budasmile-1@foglaljpro.hu>"),
         Some("question"),
-        Some("Szia Eszter!\n\nKöszönöm az érdeklődést! Igen, a FoglaljPro kétirányú szinkronban működik a Google Naptárral (minden kezelőszékhez / orvoshoz külön naptár köthető).\n\n4 kezelőszék esetén a csomag listaára 39 900 Ft/hó, amiből a 30 napos ingyenes próba után az első 6 hónapra 25% kedvezményt adunk (29 925 Ft/hó), rejtett beüzemelési díj nélkül.\n\nA pontos csomagokat itt is megnézheted: https://foglaljpro.hu/klinikaknak\n\nHa kényelmesebb, 10 percben megmutatom élőben a Google Naptár összekötést — itt tudsz időpontot választani:\nhttps://cal.com/foglaljpro/15perc-demo\n\nÜdvözlettel,\nKovács Márton"),
-        false, Some(&d_minus(1, 2)),
+        Some(buda_suggested),
+        false, Some(&d_minus(0, 1)), None, None,
+        Some("Árazás és Google Naptár integráció iránt érdeklődő kérdés."), None,
+    )?;
+    let scheduled_buda = crate::ai::compute_random_business_send_time(&AppSettings::default());
+    db.insert_email_message_full(
+        Some(&camp.id), &lead_ids[1], "outbound", "queued", 2,
+        "Re: BudaSmile — mobil foglalás és 30 napos ingyenes próba",
+        buda_suggested,
+        None, Some("<msg-budasmile-reply-1@budasmile.hu>"),
+        None, None, true, None,
+        Some(&scheduled_buda), Some("scheduled"),
+        Some("AI válasz automatikus küldésre időzítve munkaidőn belül."), None,
     )?;
 
-    // Thread 3: Arrabona Esztétika — Outbound -> Interested inbound with AI draft!
+    // Thread 3: Arrabona Esztétika — Outbound -> Interested inbound + Paused AI draft!
     db.insert_email_message(
         Some(&camp.id), &lead_ids[4], "outbound", "sent", 1,
         "Arrabona Esztétikai Központ — kétnyelvű online időpontfoglalás",
         "Tisztelt Arrabona Esztétikai Központ!\n\nLáttam, hogy Győrben kiemelkedő értékelésekkel dolgoznak, és sok osztrák páciensük is van, viszont a weboldalon még nincs közvetlen online foglaló. A FoglaljPro magyarul és németül is működik, SMS emlékeztetővel.\n\nRészletek és 25% induló kedvezmény: https://foglaljpro.hu/klinikaknak\n\nÜdvözlettel,\nKovács Márton",
         Some("<msg-arrabona-1@foglaljpro.hu>"), None, None, None, false, Some(&d_minus(1, 8)),
     )?;
-    db.insert_email_message(
+    let arrabona_suggested = "Tisztelt Varga Zsófia!\n\nNagyon örülök a visszajelzésének! Keddre és szerdára is van szabad sávom — az alábbi linken egy kattintással ki tudják választani a legkényelmesebb 15 perces időpontot:\nhttps://cal.com/foglaljpro/15perc-demo\n\nA bemutatón kifejezetten a német–magyar kétnyelvű foglalót és az automatikus SMS emlékeztetőt is megmutatom. Addig is a részletek itt elérhetők: https://foglaljpro.hu/klinikaknak\n\nÜdvözlettel,\nKovács Márton";
+    db.insert_email_message_full(
         Some(&camp.id), &lead_ids[4], "inbound", "received", 1,
         "Re: Arrabona Esztétikai Központ — kétnyelvű online időpontfoglalás",
         "Tisztelt Kovács Márton!\n\nA német nyelvű online foglaló és az SMS emlékeztető valóban nagyon aktuális nálunk. Szívesen megnéznénk egy bemutatót jövő hét kedden vagy szerdán!\n\nÜdvözlettel,\nVarga Zsófia",
         Some("<msg-arrabona-reply-1@arrabona-esztetika.hu>"), Some("<msg-arrabona-1@foglaljpro.hu>"),
         Some("booking_request"),
-        Some("Tisztelt Varga Zsófia!\n\nNagyon örülök a visszajelzésének! Keddre és szerdára is van szabad sávom — az alábbi linken egy kattintással ki tudják választani a legkényelmesebb 15 perces időpontot:\nhttps://cal.com/foglaljpro/15perc-demo\n\nA bemutatón kifejezetten a német–magyar kétnyelvű foglalót és az automatikus SMS emlékeztetőt is megmutatom. Addig is a részletek itt elérhetők: https://foglaljpro.hu/klinikaknak\n\nÜdvözlettel,\nKovács Márton"),
-        false, Some(&d_minus(0, 3)),
+        Some(arrabona_suggested),
+        false, Some(&d_minus(0, 3)), None, None,
+        Some("Időpontkérés bemutatóra jövő hét keddre vagy szerdára."), None,
+    )?;
+    db.insert_email_message_full(
+        Some(&camp.id), &lead_ids[4], "outbound", "draft", 2,
+        "Re: Arrabona Esztétikai Központ — kétnyelvű online időpontfoglalás",
+        arrabona_suggested,
+        None, Some("<msg-arrabona-reply-1@arrabona-esztetika.hu>"),
+        None, None, true, None,
+        None, Some("paused"),
+        Some("AI választervezet jóváhagyásra / átírásra kész."), None,
     )?;
 
     // Thread 4: Pannónia Dental — Outbound sent, awaiting reply

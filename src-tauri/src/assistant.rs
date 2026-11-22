@@ -820,7 +820,168 @@ pub async fn execute_search_pipeline(
     Ok(finished)
 }
 
-/// Fast, non-blocking Central AI Assistant: streams status, never swallows AI text, and runs heavy jobs in the background!
+/// Resilient parser for LLM JSON output so malformed quotes (e.g. Hungarian „rejected") NEVER leak raw JSON to the user!
+fn parse_assistant_output(raw: &str) -> Option<PlannedAssistantOutput> {
+    let trimmed = raw
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+
+    if let Ok(parsed) = serde_json::from_str::<PlannedAssistantOutput>(trimmed) {
+        return Some(parsed);
+    }
+
+    // Attempt 1: Fix common Hungarian „..." closing ASCII quote inside JSON string values
+    // (e.g. `„rejected"` -> `„rejected”`)
+    let re_hu_quote = regex::Regex::new(r#"„([^"„”\n]{1,80})""#).ok();
+    if let Some(re) = re_hu_quote {
+        let repaired = re.replace_all(trimmed, "„$1”").to_string();
+        if let Ok(parsed) = serde_json::from_str::<PlannedAssistantOutput>(&repaired) {
+            return Some(parsed);
+        }
+    }
+
+    // Attempt 2: Regex extraction of "reply", "actions", and "navigate_to" if raw looks like our JSON envelope
+    if trimmed.starts_with('{') && trimmed.contains("\"reply\"") {
+        let reply = regex::Regex::new(r#"(?s)"reply"\s*:\s*"(.*?)"\s*,\s*"(?:actions|navigate_to)"#)
+            .ok()
+            .and_then(|re| re.captures(trimmed))
+            .and_then(|c| c.get(1))
+            .map(|m| {
+                m.as_str()
+                    .replace("\\n", "\n")
+                    .replace("\\\"", "\"")
+                    .replace("\\\\", "\\")
+            })
+            .unwrap_or_default();
+
+        let actions: Vec<PlannedAction> = regex::Regex::new(r#"(?s)"actions"\s*:\s*(\[.*?\])\s*(?:,|\})"#)
+            .ok()
+            .and_then(|re| re.captures(trimmed))
+            .and_then(|c| c.get(1))
+            .and_then(|m| serde_json::from_str::<Vec<PlannedAction>>(m.as_str()).ok())
+            .unwrap_or_default();
+
+        let navigate_to = regex::Regex::new(r#""navigate_to"\s*:\s*"([^"]+)""#)
+            .ok()
+            .and_then(|re| re.captures(trimmed))
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string())
+            .filter(|s| !s.is_empty() && s != "null");
+
+        if !reply.is_empty() || !actions.is_empty() {
+            return Some(PlannedAssistantOutput {
+                reply,
+                actions,
+                navigate_to,
+            });
+        }
+    }
+
+    None
+}
+
+fn normalize_lead_status(raw: &str) -> String {
+    match raw.trim().to_lowercase().as_str() {
+        "rejected" | "archived" | "archive" | "elutasitva" | "elutasítva" | "disqualified" => "disqualified".to_string(),
+        "new" | "uj" | "új" => "new".to_string(),
+        "promising" | "igeretes" | "ígéretes" => "promising".to_string(),
+        "enriched" | "gazdagitott" | "gazdagított" => "enriched".to_string(),
+        "in_campaign" | "kampanyban" | "kampányban" => "in_campaign".to_string(),
+        "replied" | "valaszolt" | "válaszolt" => "replied".to_string(),
+        "booked" | "idopont" | "időpont" => "booked".to_string(),
+        "won" | "ugyfel" | "ügyfél" => "won".to_string(),
+        "unsubscribed" | "leiratkozott" => "unsubscribed".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Filter leads matching flexible assistant tool arguments (explicit IDs or score/status/search/email/query criteria)
+fn select_leads_by_args(leads: &[Lead], args: &Value) -> Vec<Lead> {
+    let explicit_ids: Vec<String> = args["leadIds"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+
+    if !explicit_ids.is_empty() {
+        return leads
+            .iter()
+            .filter(|l| explicit_ids.iter().any(|id| id == &l.id))
+            .cloned()
+            .collect();
+    }
+
+    let below_score = args["belowScore"].as_i64();
+    let max_score = args["maxScore"].as_i64();
+    let min_score = args["minScore"].as_i64();
+    let status_filter = args["status"].as_str().filter(|s| !s.trim().is_empty() && *s != "all").map(normalize_lead_status);
+    let search_filter = args["searchId"].as_str().filter(|s| !s.trim().is_empty() && *s != "all");
+    let without_email = args["withoutEmail"].as_bool().unwrap_or(false);
+    let only_with_email = args["onlyWithEmail"].as_bool().unwrap_or(false);
+    let query_filter = args["query"].as_str().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
+
+    let has_any_filter = below_score.is_some()
+        || max_score.is_some()
+        || min_score.is_some()
+        || status_filter.is_some()
+        || search_filter.is_some()
+        || without_email
+        || only_with_email
+        || query_filter.is_some();
+
+    if !has_any_filter {
+        return vec![];
+    }
+
+    leads
+        .iter()
+        .filter(|l| {
+            if let Some(bs) = below_score {
+                if l.fit_score >= bs {
+                    return false;
+                }
+            }
+            if let Some(ms) = max_score {
+                if l.fit_score > ms {
+                    return false;
+                }
+            }
+            if let Some(mins) = min_score {
+                if l.fit_score < mins {
+                    return false;
+                }
+            }
+            if let Some(ref st) = status_filter {
+                if &l.status != st {
+                    return false;
+                }
+            }
+            if let Some(sid) = search_filter {
+                if !l.searches.iter().any(|sp| sp.search_id == sid) {
+                    return false;
+                }
+            }
+            if without_email && !l.primary_email.trim().is_empty() {
+                return false;
+            }
+            if only_with_email && l.primary_email.trim().is_empty() {
+                return false;
+            }
+            if let Some(ref q) = query_filter {
+                let hay = format!("{} {} {} {} {}", l.company_name, l.domain, l.location, l.industry, l.primary_email).to_lowercase();
+                if !hay.contains(q) {
+                    return false;
+                }
+            }
+            true
+        })
+        .cloned()
+        .collect()
+}
+
+/// Fast, non-blocking Central AI Assistant: streams status, never leaks raw JSON, sees full lead distribution, and executes all workspace actions!
 pub async fn run_central_assistant(
     app: &AppHandle,
     db: &Database,
@@ -835,62 +996,163 @@ pub async fn run_central_assistant(
     let searches = db.list_searches()?;
     let leads = db.list_leads(None, None, None, None)?;
     let campaigns = db.list_campaigns()?;
+    let threads = db.list_inbox_threads().unwrap_or_default();
     let senders = db.list_sender_accounts()?;
     let analytics = db.get_analytics()?;
 
-    // Keep context lean & compact for fast LLM / CLI turnaround
+    // Build full score & status breakdown so the assistant is NEVER blind to low-score or filtered leads!
+    let mut status_counts: HashMap<String, usize> = HashMap::new();
+    let mut below_30 = 0usize;
+    let mut score_30_49 = 0usize;
+    let mut score_50_69 = 0usize;
+    let mut score_70_plus = 0usize;
+    let mut without_email_count = 0usize;
+    let mut min_fit = i64::MAX;
+    let mut max_fit = i64::MIN;
+
+    for l in &leads {
+        *status_counts.entry(l.status.clone()).or_insert(0) += 1;
+        if l.fit_score < 30 {
+            below_30 += 1;
+        } else if l.fit_score < 50 {
+            score_30_49 += 1;
+        } else if l.fit_score < 70 {
+            score_50_69 += 1;
+        } else {
+            score_70_plus += 1;
+        }
+        if l.primary_email.trim().is_empty() {
+            without_email_count += 1;
+        }
+        if l.fit_score < min_fit {
+            min_fit = l.fit_score;
+        }
+        if l.fit_score > max_fit {
+            max_fit = l.fit_score;
+        }
+    }
+
+    // Include BOTH top 25 AND bottom 25 leads (deduplicated) so assistant sees both best & weakest leads
+    let mut seen_lead_ids: HashSet<String> = HashSet::new();
+    let mut sample_leads: Vec<Value> = Vec::new();
+    for l in leads.iter().take(25).chain(leads.iter().rev().take(25)) {
+        if seen_lead_ids.insert(l.id.clone()) {
+            sample_leads.push(serde_json::json!({
+                "id": l.id,
+                "name": l.company_name,
+                "email": l.primary_email,
+                "fit": l.fit_score,
+                "status": l.status,
+                "loc": l.location
+            }));
+        }
+    }
+
+    let all_offers: Vec<Value> = projects
+        .iter()
+        .flat_map(|p| {
+            p.offers.iter().map(move |o| {
+                serde_json::json!({
+                    "id": o.id,
+                    "projectId": p.id,
+                    "projectName": p.name,
+                    "title": o.title,
+                    "val": o.discount_value,
+                    "active": o.active
+                })
+            })
+        })
+        .collect();
+
+    let scheduled_count = threads
+        .iter()
+        .filter(|t| t.auto_send_status.as_deref() == Some("scheduled"))
+        .count();
+
     let workspace_context = serde_json::json!({
         "activeSearchId": active_search_id,
         "stats": {
             "projects": projects.len(),
+            "offers": all_offers.len(),
             "searches": searches.len(),
-            "leads": leads.len(),
-            "promising": analytics.promising_leads,
-            "enriched": analytics.enriched_leads,
+            "leadsTotal": leads.len(),
+            "leadsWithoutEmail": without_email_count,
+            "scoreBuckets": {
+                "below30": below_30,
+                "30to49": score_30_49,
+                "50to69": score_50_69,
+                "70plus": score_70_plus,
+                "minScore": if leads.is_empty() { 0 } else { min_fit },
+                "maxScore": if leads.is_empty() { 0 } else { max_fit }
+            },
+            "statusCounts": status_counts,
             "sent": analytics.total_sent,
             "replies": analytics.total_replies,
-            "booked": analytics.booked_leads
+            "booked": analytics.booked_leads,
+            "scheduledAutoReplies": scheduled_count
         },
+        "autoReplySettings": {
+            "enabled": settings.auto_reply_enabled,
+            "workdays": settings.auto_reply_workdays,
+            "startHour": settings.auto_reply_start_hour,
+            "endHour": settings.auto_reply_end_hour,
+            "minDelayMin": settings.auto_reply_min_delay_min,
+            "maxDelayMin": settings.auto_reply_max_delay_min
+        },
+        "offers": all_offers,
         "projects": projects.iter().take(6).map(|p| serde_json::json!({
-            "id": p.id, "name": p.name, "url": p.website_url,
-            "offers": p.offers.iter().take(5).map(|o| serde_json::json!({"id": o.id, "title": o.title, "val": o.discount_value})).collect::<Vec<_>>()
+            "id": p.id, "name": p.name, "url": p.website_url
         })).collect::<Vec<_>>(),
-        "searches": searches.iter().take(10).map(|s| serde_json::json!({
+        "searches": searches.iter().take(12).map(|s| serde_json::json!({
             "id": s.id, "name": s.name, "query": s.query, "loc": s.location,
             "src": s.source, "max": s.max_results, "found": s.leads_found, "status": s.status
         })).collect::<Vec<_>>(),
-        "topLeads": leads.iter().take(8).map(|l| serde_json::json!({
-            "id": l.id, "name": l.company_name, "email": l.primary_email,
-            "fit": l.fit_score, "status": l.status
+        "leadsSample": sample_leads,
+        "campaigns": campaigns.iter().take(10).map(|c| serde_json::json!({
+            "id": c.id, "name": c.name, "offer": c.offer_title, "recipients": c.total_recipients, "sent": c.sent_count, "replies": c.reply_count
         })).collect::<Vec<_>>(),
-        "campaigns": campaigns.iter().take(6).map(|c| serde_json::json!({
-            "id": c.id, "name": c.name, "sent": c.sent_count, "replies": c.reply_count
+        "inboxThreads": threads.iter().take(12).map(|t| serde_json::json!({
+            "leadId": t.lead_id,
+            "company": t.lead_company,
+            "intent": t.latest_intent,
+            "pendingReplyId": t.pending_reply_id,
+            "autoSendStatus": t.auto_send_status,
+            "scheduledSendAt": t.scheduled_send_at
         })).collect::<Vec<_>>()
     });
 
-    let system_prompt = r#"Te vagy a MyLead központi végrehajtó AI asszisztense. Válaszolj GYORSAN, tömören magyarul, és adj vissza pontos JSON-t:
-{"reply":"Konkrét magyar válasz","actions":[{"tool":"...","args":{...}}],"navigate_to":"dashboard|projects|searches|leads|campaigns|inbox|analytics|settings|null"}
+    let system_prompt = r#"Te vagy a MyLead központi végrehajtó AI asszisztense. Válaszolj GYORSAN, okosan, tömören MAGYAR nyelven, és hajtsd végre a kért műveleteket a rendelkezésre álló eszközökkel!
+SZIGORÚ FORMÁTUM: Kizárólag érvényes, tiszta JSON objektumot adj vissza (NE használj escape-eletlen " idézőjelet a magyar szövegek belsejében — használj „...” vagy '...' jeleket!):
+{"reply":"Konkrét, barátságos magyar válasz","actions":[{"tool":"...","args":{...}}],"navigate_to":"dashboard|projects|searches|leads|campaigns|inbox|analytics|settings|null"}
 
-ELÉRHETŐ ESZKÖZÖK:
+ELÉRHETŐ ESZKÖZÖK (MINDEN VALÓBAN VÉGREHAJTÓDIK):
+- delete_leads: {"leadIds":[],"belowScore":32,"maxScore":null,"minScore":null,"status":null,"searchId":null,"withoutEmail":false,"query":null} — Törli a megadott ID-jú VAGY a szűrőnek megfelelő leadeket! Pl. '32 alatti leadek törlése' -> {"belowScore":32}.
+- bulk_update_lead_status: {"leadIds":[],"belowScore":null,"maxScore":null,"minScore":null,"status":null,"searchId":null,"query":null,"newStatus":"promising|enriched|in_campaign|replied|booked|won|disqualified|new"} — Tömeges státuszmódosítás.
+- query_leads: {"belowScore":null,"maxScore":null,"minScore":null,"status":null,"withoutEmail":false,"query":null} — Pontos szűrt lista lekérése.
+- create_lead: {"companyName","websiteUrl","primaryEmail","phone","location","industry","notes"} — Új lead felvétele kézzel.
+- update_lead_status: {"leadId","status","notes"}
+- enrich_leads: {"leadIds":[],"minScore":70}
 - create_project: {"name","websiteUrl","industry","description","bookingUrl","landingUrl"}
 - crawl_project: {"projectId":"id|LAST"}
-- create_offer: {"projectId":"id|LAST","title","offerType":"discount|free_trial|audit","discountValue","description"}
+- create_offer: {"projectId":"id|LAST","title","offerType":"discount|free_trial|audit|bundle|custom","discountValue","description","ctaText"}
 - create_search: {"projectId":"id|LAST","offerId","name","query","industry","location","companySize":"any|1-10|11-50|51-200|200+","targetProblem","source":"smart_hybrid|duckduckgo|gmaps_scraper|ai_cli_search|osm","maxResults":15,"autoAudit":true,"autoEnrichThreshold":70}
 - update_search: {"searchId":"id|activeSearchId","name","query","industry","location","companySize","targetProblem","source","maxResults","autoEnrichThreshold"}
-- run_search: {"searchId":"id|LAST|activeSearchId","continuous":false} (ha folyamatos / leállításig futó keresést kér: "continuous":true!)
+- run_search: {"searchId":"id|LAST|activeSearchId","continuous":false}
 - stop_search: {"searchId":"id|activeSearchId"}
-- enrich_leads: {"leadIds":[],"minScore":75}
-- create_campaign: {"name","projectId","offerId","searchId","leadIds":[],"tone":"professional_formal|friendly_direct","autoReplyMode":"draft|autopilot","includeBookingLink":false}
+- create_campaign: {"name","offerId","projectId","searchId","leadIds":[],"minScore":null,"tone":"professional_formal|friendly_direct|concise_executive","autoReplyMode":"draft|autopilot|manual","includeBookingLink":false,"customInstructions":""} — Ajánlat (offerId) alapján hoz létre kampányt!
+- add_leads_to_campaign: {"campaignId":"id|LAST","leadIds":[],"minScore":null,"searchId":null,"generateDrafts":true} — Meglévő kampányba veszi a leadeket!
 - send_campaign: {"campaignId":"id|LAST","dryRun":true}
-- update_lead_status: {"leadId","status","notes"}
+- send_direct_email: {"leadId","offerId","subject","body","generateWithAi":true,"instruction":"","scheduleMode":"now|auto_random","dryRun":false} — Közvetlen üzenet küldése vagy időzítése egy leadnek.
+- control_auto_reply: {"messageId":"id|ALL","leadId":null,"action":"pause|cancel|resume|reschedule_random|rewrite|send_now","instruction":"","dryRun":false} — Időzített AI auto-válasz megállítása, átírása megjegyzéssel, újraidőzítése vagy azonnali küldése!
+- update_settings: {"autoReplyEnabled":true,"autoReplyWorkdays":[1,2,3,4,5,6],"autoReplyStartHour":8,"autoReplyEndHour":18,"autoReplyMinDelayMin":20,"autoReplyMaxDelayMin":120,"aiAnalysisFocus":null,"aiReplyInstructions":null,"companySignature":null}
 - load_demo_data: {}
 
-Kizárólag érvényes JSON-t adj vissza!"#;
+FONTOS: Ha a felhasználó konkrét műveletet kér (pl. törlés, státuszváltás, kampányba vétel, üzenetküldés, auto-válasz megállítása), NE csak kérdezgesd vissza — hajtsd végre azonnal a megfelelő eszközzel és számolj be az eredményről!"#;
 
     let recent_history = history
         .iter()
         .rev()
-        .take(4)
+        .take(8)
         .rev()
         .map(|m| format!("{}: {}", m.role, m.content))
         .collect::<Vec<_>>()
@@ -916,29 +1178,22 @@ Kizárólag érvényes JSON-t adj vissza!"#;
         );
         match ai::call_llm_json(&settings, system_prompt, &user_prompt).await {
             Ok(raw_text) => {
-                let cleaned = raw_text
-                    .trim()
-                    .trim_start_matches("```json")
-                    .trim_start_matches("```")
-                    .trim_end_matches("```")
-                    .trim();
-                match serde_json::from_str::<PlannedAssistantOutput>(cleaned) {
-                    Ok(p) => p,
-                    Err(_) => {
-                        let plain = raw_text.trim();
-                        if !plain.is_empty() {
-                            PlannedAssistantOutput {
-                                reply: plain.to_string(),
-                                actions: vec![],
-                                navigate_to: None,
-                            }
-                        } else {
-                            ai_error_msg = Some(format!(
-                                "Az AI modell ({} / {}) üres választ adott vissza.",
-                                settings.ai_provider, settings.ai_model
-                            ));
-                            fallback_plan(user_message, &projects, &searches, &leads, &analytics, active_search_id)
+                if let Some(p) = parse_assistant_output(&raw_text) {
+                    p
+                } else {
+                    let plain = raw_text.trim();
+                    if !plain.is_empty() && !plain.starts_with('{') {
+                        PlannedAssistantOutput {
+                            reply: plain.to_string(),
+                            actions: vec![],
+                            navigate_to: None,
                         }
+                    } else {
+                        ai_error_msg = Some(format!(
+                            "Az AI modell ({} / {}) hibás JSON választ adott, ezért a beépített végrehajtó lépett közbe.",
+                            settings.ai_provider, settings.ai_model
+                        ));
+                        fallback_plan(user_message, &projects, &searches, &leads, &analytics, active_search_id)
                     }
                 }
             }
@@ -963,6 +1218,7 @@ Kizárólag érvényes JSON-t adj vissza!"#;
     let mut last_campaign_id = campaigns.first().map(|c| c.id.clone()).unwrap_or_default();
     let mut open_search_id: Option<String> = None;
     let mut data_changed = false;
+    let mut extra_reply_lines: Vec<String> = Vec::new();
 
     for act in planned.actions {
         emit_assistant_status(app, "executing", format!("Művelet végrehajtása: {}...", act.tool));
@@ -975,6 +1231,377 @@ Kizárólag érvényes JSON-t adj vissza!"#;
         };
 
         match act.tool.as_str() {
+            "delete_leads" => {
+                let current_leads = db.list_leads(None, None, None, None).unwrap_or_default();
+                let matched = select_leads_by_args(&current_leads, args);
+                if matched.is_empty() {
+                    action_logs.push(AssistantActionLog {
+                        tool: "delete_leads".into(),
+                        summary: "Nem volt a feltételnek megfelelő törölhető lead.".into(),
+                        ok: true,
+                    });
+                } else {
+                    let ids: Vec<String> = matched.iter().map(|l| l.id.clone()).collect();
+                    let names_preview: String = matched
+                        .iter()
+                        .take(5)
+                        .map(|l| format!("{} ({})", l.company_name, l.fit_score))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    match db.delete_leads(&ids) {
+                        Ok(_) => {
+                            data_changed = true;
+                            db.log_activity("search", "AI Asszisztens: leadek törölve", &format!("{} lead törölve", ids.len()), None);
+                            action_logs.push(AssistantActionLog {
+                                tool: "delete_leads".into(),
+                                summary: format!("{} lead törölve: {}{}", ids.len(), names_preview, if ids.len() > 5 { "…" } else { "" }),
+                                ok: true,
+                            });
+                        }
+                        Err(e) => action_logs.push(AssistantActionLog {
+                            tool: "delete_leads".into(),
+                            summary: format!("Törlési hiba: {}", e),
+                            ok: false,
+                        }),
+                    }
+                }
+            }
+            "bulk_update_lead_status" => {
+                let current_leads = db.list_leads(None, None, None, None).unwrap_or_default();
+                let matched = select_leads_by_args(&current_leads, args);
+                let new_st = normalize_lead_status(args["newStatus"].as_str().or_else(|| args["status"].as_str()).unwrap_or("disqualified"));
+                let ids: Vec<String> = matched.iter().map(|l| l.id.clone()).collect();
+                match db.bulk_update_lead_status(&ids, &new_st) {
+                    Ok(cnt) => {
+                        data_changed = cnt > 0;
+                        action_logs.push(AssistantActionLog {
+                            tool: "bulk_update_lead_status".into(),
+                            summary: format!("{} lead státusza frissítve erre: {}", cnt, new_st),
+                            ok: true,
+                        });
+                    }
+                    Err(e) => action_logs.push(AssistantActionLog {
+                        tool: "bulk_update_lead_status".into(),
+                        summary: format!("Hiba: {}", e),
+                        ok: false,
+                    }),
+                }
+            }
+            "query_leads" => {
+                let current_leads = db.list_leads(None, None, None, None).unwrap_or_default();
+                let matched = select_leads_by_args(&current_leads, args);
+                let lines: Vec<String> = matched
+                    .iter()
+                    .take(15)
+                    .map(|l| format!("• {} — Fit: {} | {} | {}", l.company_name, l.fit_score, l.status, if l.primary_email.is_empty() { "nincs e-mail" } else { &l.primary_email }))
+                    .collect();
+                if !lines.is_empty() {
+                    extra_reply_lines.push(format!("\nTalálatok ({} db):\n{}", matched.len(), lines.join("\n")));
+                }
+                action_logs.push(AssistantActionLog {
+                    tool: "query_leads".into(),
+                    summary: format!("{} megfelelő lead található", matched.len()),
+                    ok: true,
+                });
+            }
+            "create_lead" => {
+                let name = args["companyName"].as_str().unwrap_or("Új cég").to_string();
+                match db.upsert_discovered_lead(
+                    None,
+                    &name,
+                    args["websiteUrl"].as_str().unwrap_or_default(),
+                    args["industry"].as_str().unwrap_or("B2B"),
+                    args["location"].as_str().unwrap_or_default(),
+                    "",
+                    args["phone"].as_str().unwrap_or_default(),
+                    args["primaryEmail"].as_str().unwrap_or_default(),
+                    None,
+                    None,
+                    "AI Asszisztens",
+                ) {
+                    Ok(lid) => {
+                        if let Some(n) = args["notes"].as_str().filter(|s| !s.is_empty()) {
+                            let _ = db.update_lead_fields(LeadUpdateInput {
+                                id: lid,
+                                notes: Some(n.to_string()),
+                                ..Default::default()
+                            });
+                        }
+                        data_changed = true;
+                        action_logs.push(AssistantActionLog {
+                            tool: "create_lead".into(),
+                            summary: format!("Új lead felvéve: {}", name),
+                            ok: true,
+                        });
+                    }
+                    Err(e) => action_logs.push(AssistantActionLog {
+                        tool: "create_lead".into(),
+                        summary: format!("Hiba: {}", e),
+                        ok: false,
+                    }),
+                }
+            }
+            "add_leads_to_campaign" => {
+                let cid = resolve_id(args["campaignId"].as_str(), &last_campaign_id);
+                let generate_drafts = args["generateDrafts"].as_bool().unwrap_or(true);
+                if let Ok(camp) = db.get_campaign(&cid) {
+                    let current_leads = db.list_leads(None, None, None, None).unwrap_or_default();
+                    let matched = select_leads_by_args(&current_leads, args);
+                    let targets: Vec<Lead> = matched
+                        .into_iter()
+                        .filter(|l| !l.primary_email.trim().is_empty() && !db.is_suppressed(&l.primary_email) && !db.campaign_has_lead(&cid, &l.id))
+                        .collect();
+                    let cnt = targets.len();
+                    if let Ok(proj) = db.get_project(&camp.project_id) {
+                        let offer = camp.offer_id.as_deref().and_then(|oid| db.get_offer(oid).ok().flatten()).or_else(|| proj.offers.first().cloned());
+                        let app_c = app.clone();
+                        let settings_c = settings.clone();
+                        let camp_c = camp.clone();
+                        tokio::spawn(async move {
+                            for l in &targets {
+                                let (subj, body) = if generate_drafts {
+                                    let gen = ai::generate_cold_email(
+                                        &settings_c, &proj, offer.as_ref(), l,
+                                        &camp_c.tone, &camp_c.language, camp_c.include_booking_link, &camp_c.custom_instructions,
+                                    ).await;
+                                    (gen.subject, gen.body)
+                                } else {
+                                    (format!("{} — megkeresés", l.company_name), format!("Tisztelt {}!\n\n{}", l.company_name, settings_c.company_signature))
+                                };
+                                let db_bg = app_c.state::<Database>();
+                                let _ = db_bg.insert_email_message(
+                                    Some(&camp_c.id), &l.id, "outbound", "draft", 1,
+                                    &subj, &body, None, None, None, None, false, None,
+                                );
+                            }
+                        });
+                        data_changed = cnt > 0;
+                        action_logs.push(AssistantActionLog {
+                            tool: "add_leads_to_campaign".into(),
+                            summary: format!("{} új lead hozzáadva a „{}” kampányhoz", cnt, camp.name),
+                            ok: true,
+                        });
+                    }
+                } else {
+                    action_logs.push(AssistantActionLog {
+                        tool: "add_leads_to_campaign".into(),
+                        summary: "Kampány nem található.".into(),
+                        ok: false,
+                    });
+                }
+            }
+            "send_direct_email" => {
+                if let Some(lid) = args["leadId"].as_str() {
+                    if let Ok(lead) = db.get_lead(lid) {
+                        let offer_id = args["offerId"].as_str().map(|s| s.to_string()).filter(|s| !s.is_empty());
+                        let offer = offer_id.as_deref().and_then(|oid| db.get_offer(oid).ok().flatten());
+                        let proj = offer
+                            .as_ref()
+                            .and_then(|o| db.get_project(&o.project_id).ok())
+                            .or_else(|| projects.first().cloned());
+                        let gen_ai = args["generateWithAi"].as_bool().unwrap_or(false)
+                            || args["body"].as_str().unwrap_or("").trim().is_empty();
+                        let (subj, body) = if gen_ai {
+                            if let Some(ref p) = proj {
+                                let g = ai::generate_cold_email(
+                                    &settings,
+                                    p,
+                                    offer.as_ref().or_else(|| p.offers.first()),
+                                    &lead,
+                                    &settings.default_tone,
+                                    &settings.default_language,
+                                    true,
+                                    args["instruction"].as_str().unwrap_or_default(),
+                                )
+                                .await;
+                                (g.subject, g.body)
+                            } else {
+                                (
+                                    args["subject"].as_str().unwrap_or("Megkeresés").to_string(),
+                                    args["body"].as_str().unwrap_or("").to_string(),
+                                )
+                            }
+                        } else {
+                            (
+                                args["subject"].as_str().unwrap_or("Megkeresés").to_string(),
+                                args["body"].as_str().unwrap_or("").to_string(),
+                            )
+                        };
+                        let mode = args["scheduleMode"].as_str().unwrap_or("auto_random");
+                        let dry_run = args["dryRun"].as_bool().unwrap_or(false);
+                        if mode == "auto_random" {
+                            let sched = ai::compute_random_business_send_time(&settings);
+                            let _ = db.insert_email_message_full(
+                                None, &lead.id, "outbound", "queued", 2, &subj, &body,
+                                None, None, None, None, false, None, Some(&sched), Some("scheduled"), None, None,
+                            );
+                            let _ = app.emit("inbox-updated", ());
+                            data_changed = true;
+                            action_logs.push(AssistantActionLog {
+                                tool: "send_direct_email".into(),
+                                summary: format!("Üzenet előkészítve és munkaidőre időzítve: {}", lead.company_name),
+                                ok: true,
+                            });
+                        } else {
+                            let msg_id_res = if dry_run {
+                                Ok(format!("<asst-sim-{}.mylead@local>", uuid::Uuid::new_v4()))
+                            } else if let Some(acc) = senders.iter().find(|a| a.is_default).or_else(|| senders.first()) {
+                                mailer::send_email(acc, &lead.primary_email, &subj, &body, None).await
+                            } else {
+                                Err("Nincs küldő fiók beállítva".to_string())
+                            };
+                            match msg_id_res {
+                                Ok(mid) => {
+                                    let _ = db.insert_email_message(
+                                        None, &lead.id, "outbound", "sent", 1, &subj, &body,
+                                        Some(&mid), None, None, None, false, Some(&Utc::now().to_rfc3339()),
+                                    );
+                                    let _ = app.emit("inbox-updated", ());
+                                    data_changed = true;
+                                    action_logs.push(AssistantActionLog {
+                                        tool: "send_direct_email".into(),
+                                        summary: format!("Üzenet elküldve: {} ({})", lead.company_name, lead.primary_email),
+                                        ok: true,
+                                    });
+                                }
+                                Err(e) => action_logs.push(AssistantActionLog {
+                                    tool: "send_direct_email".into(),
+                                    summary: format!("Küldési hiba: {}", e),
+                                    ok: false,
+                                }),
+                            }
+                        }
+                    }
+                }
+            }
+            "control_auto_reply" => {
+                let action = args["action"].as_str().unwrap_or("pause");
+                let msg_id_arg = args["messageId"].as_str().unwrap_or("");
+                let lead_id_arg = args["leadId"].as_str().unwrap_or("");
+                let target_ids: Vec<String> = if msg_id_arg.eq_ignore_ascii_case("ALL") {
+                    threads
+                        .iter()
+                        .filter_map(|t| t.pending_reply_id.clone())
+                        .collect()
+                } else if !msg_id_arg.is_empty() {
+                    vec![msg_id_arg.to_string()]
+                } else if !lead_id_arg.is_empty() {
+                    threads
+                        .iter()
+                        .find(|t| t.lead_id == lead_id_arg)
+                        .and_then(|t| t.pending_reply_id.clone())
+                        .into_iter()
+                        .collect()
+                } else {
+                    threads
+                        .iter()
+                        .filter(|t| t.auto_send_status.as_deref() == Some("scheduled"))
+                        .filter_map(|t| t.pending_reply_id.clone())
+                        .collect()
+                };
+
+                let mut affected = 0usize;
+                for mid in target_ids {
+                    match action {
+                        "pause" | "stop" => {
+                            if db.update_email_schedule(&mid, "draft", Some("paused"), None, None).is_ok() {
+                                affected += 1;
+                            }
+                        }
+                        "cancel" | "delete" => {
+                            if db.delete_email_message(&mid).is_ok() {
+                                affected += 1;
+                            }
+                        }
+                        "resume" | "reschedule_random" => {
+                            let next_at = ai::compute_random_business_send_time(&settings);
+                            if db.update_email_schedule(&mid, "queued", Some("scheduled"), Some(&next_at), None).is_ok() {
+                                affected += 1;
+                            }
+                        }
+                        "rewrite" => {
+                            if let Ok(msg) = db.get_email_message(&mid) {
+                                if let Ok(lead) = db.get_lead(&msg.lead_id) {
+                                    let instr = args["instruction"].as_str().unwrap_or("Írd át barátságosabban és tömörebben.");
+                                    let hist = db.list_lead_messages(&lead.id).unwrap_or_default();
+                                    if let Ok(rew) = ai::rewrite_email_with_instruction(
+                                        &settings, projects.first(), projects.first().and_then(|p| p.offers.first()),
+                                        &lead, &hist, &msg.subject, &msg.body, instr,
+                                    ).await {
+                                        let _ = db.update_email_message_content(&mid, &rew.subject, &rew.body, Some(instr));
+                                        affected += 1;
+                                    }
+                                }
+                            }
+                        }
+                        "send_now" => {
+                            if let Ok(msg) = db.get_email_message(&mid) {
+                                if crate::commands::execute_send_for_message(db, &msg, args["dryRun"].as_bool().unwrap_or(false)).await.is_ok() {
+                                    affected += 1;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if affected > 0 {
+                    data_changed = true;
+                    let _ = app.emit("inbox-updated", ());
+                }
+                action_logs.push(AssistantActionLog {
+                    tool: "control_auto_reply".into(),
+                    summary: format!("{} időzített válasz frissítve ({})", affected, action),
+                    ok: affected > 0,
+                });
+            }
+            "update_settings" => {
+                let mut next = settings.clone();
+                if let Some(v) = args["autoReplyEnabled"].as_bool() {
+                    next.auto_reply_enabled = v;
+                }
+                if let Some(arr) = args["autoReplyWorkdays"].as_array() {
+                    let days: Vec<u8> = arr.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).filter(|d| (1..=7).contains(d)).collect();
+                    if !days.is_empty() {
+                        next.auto_reply_workdays = days;
+                    }
+                }
+                if let Some(h) = args["autoReplyStartHour"].as_u64() {
+                    next.auto_reply_start_hour = (h as u8).min(22);
+                }
+                if let Some(h) = args["autoReplyEndHour"].as_u64() {
+                    next.auto_reply_end_hour = (h as u8).clamp(1, 24);
+                }
+                if let Some(m) = args["autoReplyMinDelayMin"].as_i64() {
+                    next.auto_reply_min_delay_min = m.clamp(1, 720);
+                }
+                if let Some(m) = args["autoReplyMaxDelayMin"].as_i64() {
+                    next.auto_reply_max_delay_min = m.clamp(next.auto_reply_min_delay_min, 1440);
+                }
+                if let Some(s) = args["aiAnalysisFocus"].as_str() {
+                    next.ai_analysis_focus = s.to_string();
+                }
+                if let Some(s) = args["aiReplyInstructions"].as_str() {
+                    next.ai_reply_instructions = s.to_string();
+                }
+                if let Some(s) = args["companySignature"].as_str() {
+                    next.company_signature = s.to_string();
+                }
+                match db.save_settings(&next) {
+                    Ok(_) => {
+                        data_changed = true;
+                        action_logs.push(AssistantActionLog {
+                            tool: "update_settings".into(),
+                            summary: "Beállítások frissítve".into(),
+                            ok: true,
+                        });
+                    }
+                    Err(e) => action_logs.push(AssistantActionLog {
+                        tool: "update_settings".into(),
+                        summary: format!("Hiba: {}", e),
+                        ok: false,
+                    }),
+                }
+            }
             "create_project" => {
                 let name = args["name"].as_str().unwrap_or("Új Projekt").to_string();
                 match db.save_project(ProjectInput {
@@ -1265,7 +1892,12 @@ Kizárólag érvényes JSON-t adj vissza!"#;
                 }
             }
             "create_campaign" => {
-                let pid = resolve_id(args["projectId"].as_str(), &last_project_id);
+                let offer_id = args["offerId"].as_str().map(|s| s.to_string()).filter(|s| !s.is_empty());
+                let resolved_offer = offer_id.as_deref().and_then(|oid| db.get_offer(oid).ok().flatten());
+                let pid = resolved_offer
+                    .as_ref()
+                    .map(|o| o.project_id.clone())
+                    .unwrap_or_else(|| resolve_id(args["projectId"].as_str(), &last_project_id));
                 let sid = args["searchId"].as_str().map(|s| resolve_id(Some(s), &last_search_id)).filter(|s| !s.is_empty());
                 let lead_ids: Vec<String> = args["leadIds"]
                     .as_array()
@@ -1280,13 +1912,13 @@ Kizárólag érvényes JSON-t adj vissza!"#;
                     id: None,
                     name: args["name"].as_str().unwrap_or("AI Kampány").to_string(),
                     project_id: pid.clone(),
-                    offer_id: args["offerId"].as_str().map(|s| s.to_string()).filter(|s| !s.is_empty()),
+                    offer_id,
                     search_id: sid.clone(),
                     sender_account_id: sender_id,
-                    tone: args["tone"].as_str().unwrap_or("professional_formal").to_string(),
+                    tone: args["tone"].as_str().unwrap_or(&settings.default_tone).to_string(),
                     language: "hu".into(),
                     auto_reply_mode: args["autoReplyMode"].as_str().unwrap_or("draft").to_string(),
-                    daily_limit: 35,
+                    daily_limit: settings.default_daily_limit,
                     min_delay_sec: 45,
                     follow_up_days: 3,
                     include_booking_link: args["includeBookingLink"].as_bool().unwrap_or(false),
@@ -1295,13 +1927,14 @@ Kizárólag érvényes JSON-t adj vissza!"#;
                 };
 
                 if let (Ok(proj), Ok(camp)) = (db.get_project(&pid), db.create_campaign(&input)) {
-                    let offer = input.offer_id.as_deref().and_then(|oid| db.get_offer(oid).ok().flatten());
+                    let offer = resolved_offer.or_else(|| proj.offers.first().cloned());
+                    let min_sc = args["minScore"].as_i64().unwrap_or(70);
                     let targets: Vec<Lead> = if !lead_ids.is_empty() {
                         lead_ids.iter().filter_map(|id| db.get_lead(id).ok()).filter(|l| !l.primary_email.is_empty()).collect()
                     } else if let Some(ref s) = sid {
                         db.list_leads(Some(s), None, None, None).unwrap_or_default().into_iter().filter(|l| !l.primary_email.is_empty()).collect()
                     } else {
-                        db.list_leads(None, None, Some(70), None).unwrap_or_default().into_iter().filter(|l| !l.primary_email.is_empty()).take(10).collect()
+                        db.list_leads(None, None, Some(min_sc), None).unwrap_or_default().into_iter().filter(|l| !l.primary_email.is_empty()).take(15).collect()
                     };
                     let target_count = targets.len();
                     let camp_id = camp.id.clone();
@@ -1365,7 +1998,7 @@ Kizárólag érvényes JSON-t adj vissza!"#;
                 if let Some(lid) = args["leadId"].as_str() {
                     let res = db.update_lead_fields(LeadUpdateInput {
                         id: lid.to_string(),
-                        status: args["status"].as_str().map(|s| s.to_string()),
+                        status: args["status"].as_str().map(normalize_lead_status),
                         notes: args["notes"].as_str().map(|s| s.to_string()),
                         ..Default::default()
                     });
@@ -1400,12 +2033,17 @@ Kizárólag érvényes JSON-t adj vissza!"#;
 
     emit_assistant_status(app, "done", "Kész!");
 
+    let mut final_reply = if planned.reply.trim().is_empty() {
+        "A kért műveleteket elindítottam.".to_string()
+    } else {
+        planned.reply
+    };
+    if !extra_reply_lines.is_empty() {
+        final_reply.push_str(&extra_reply_lines.join("\n"));
+    }
+
     Ok(AssistantResponse {
-        reply: if planned.reply.trim().is_empty() {
-            "A kért műveleteket elindítottam.".to_string()
-        } else {
-            planned.reply
-        },
+        reply: final_reply,
         actions: action_logs,
         navigate_to: planned.navigate_to.filter(|s| !s.is_empty() && s != "null"),
         open_search_id,
@@ -1423,6 +2061,20 @@ fn fallback_plan(
     active_search_id: Option<&str>,
 ) -> PlannedAssistantOutput {
     let lower = msg.to_lowercase();
+    if (lower.contains("töröl") || lower.contains("torol")) && (lower.contains("alatt") || lower.contains("lead")) {
+        if let Some(cap) = regex::Regex::new(r"(\d{1,3})\s*(?:pont\s*)?alatt").ok().and_then(|re| re.captures(&lower)) {
+            if let Ok(thresh) = cap[1].parse::<i64>() {
+                return PlannedAssistantOutput {
+                    reply: format!("Törlöm a {} pont alatti leadeket az adatbázisból.", thresh),
+                    actions: vec![PlannedAction {
+                        tool: "delete_leads".into(),
+                        args: serde_json::json!({ "belowScore": thresh }),
+                    }],
+                    navigate_to: Some("leads".into()),
+                };
+            }
+        }
+    }
     if lower.contains("minta") && lower.contains("betölt") {
         return PlannedAssistantOutput {
             reply: "Betöltöm a minta B2B munkaterületet.".into(),
@@ -2061,4 +2713,56 @@ pub async fn evaluate_lead_ids_in_batches(
         batch_num,
         false,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_assistant_output_handles_hungarian_broken_quote() {
+        let broken = r#"{"reply":"Sajnos nem tudom törölni a leadeket — nincs ilyen eszköz. Amit meg tudok tenni: az update_lead_status eszközzel „rejected"/archivált státuszra állítom őket.","actions":[],"navigate_to":"leads"}"#;
+        let parsed = parse_assistant_output(broken).expect("should repair and parse broken HU quote");
+        assert!(parsed.reply.contains("Sajnos nem tudom törölni"));
+        assert!(!parsed.reply.starts_with('{'));
+        assert_eq!(parsed.navigate_to.as_deref(), Some("leads"));
+    }
+
+    #[test]
+    fn test_select_leads_by_below_score() {
+        let make_lead = |id: &str, score: i64| Lead {
+            id: id.into(),
+            company_name: format!("Cég {}", id),
+            domain: String::new(),
+            website_url: String::new(),
+            industry: String::new(),
+            location: String::new(),
+            address: String::new(),
+            phone: String::new(),
+            primary_email: "a@b.hu".into(),
+            employee_estimate: String::new(),
+            google_rating: None,
+            google_reviews: None,
+            source: String::new(),
+            status: "new".into(),
+            fit_score: score,
+            enriched: false,
+            company_summary: String::new(),
+            pain_points: vec![],
+            how_we_can_help: String::new(),
+            recommended_pitch: String::new(),
+            tech_stack: vec![],
+            contacts: vec![],
+            audit: None,
+            tags: vec![],
+            notes: String::new(),
+            searches: vec![],
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let leads = vec![make_lead("1", 18), make_lead("2", 31), make_lead("3", 32), make_lead("4", 89)];
+        let matched = select_leads_by_args(&leads, &serde_json::json!({ "belowScore": 32 }));
+        let ids: Vec<String> = matched.into_iter().map(|l| l.id).collect();
+        assert_eq!(ids, vec!["1", "2"]);
+    }
 }

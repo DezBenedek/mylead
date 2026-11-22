@@ -26,6 +26,8 @@ import {
   IconMapPin,
   IconPhone,
   IconRefresh,
+  IconSend,
+  IconTrash,
   IconUsers,
   IconWorld,
   IconX,
@@ -39,6 +41,9 @@ interface Props {
   liveWorker?: SearchLiveEvent | null;
   onClose: () => void;
   onUpdated: (lead: Lead) => void;
+  onDeleted?: (leadId: string) => void;
+  onSendMessage?: (lead: Lead) => void;
+  onAddToCampaign?: (lead: Lead) => void;
   onStartCampaignForLead: (lead: Lead) => void;
 }
 
@@ -48,6 +53,9 @@ export function LeadDrawer({
   liveWorker,
   onClose,
   onUpdated,
+  onDeleted,
+  onSendMessage,
+  onAddToCampaign,
   onStartCampaignForLead,
 }: Props) {
   const [companyName, setCompanyName] = useState("");
@@ -253,28 +261,61 @@ export function LeadDrawer({
         )}
 
         {/* Primary Action Strip */}
-        <Group gap="xs">
+        <Group gap="xs" wrap="wrap">
           <Button
+            size="xs"
             variant="filled"
-            leftSection={<IconRefresh size={15} />}
+            leftSection={<IconRefresh size={14} />}
             loading={enriching}
             onClick={handleDeepEnrich}
           >
             Mély adatlap gazdagítása
           </Button>
+          {onSendMessage && (
+            <Button
+              size="xs"
+              variant="light"
+              color="forest"
+              leftSection={<IconMail size={14} />}
+              disabled={!lead.primaryEmail}
+              onClick={() => onSendMessage(lead)}
+            >
+              Üzenet küldése
+            </Button>
+          )}
           <Button
+            size="xs"
             variant="default"
-            leftSection={<IconMail size={15} />}
+            leftSection={<IconSend size={14} />}
             disabled={!lead.primaryEmail}
-            onClick={() => onStartCampaignForLead(lead)}
+            onClick={() => (onAddToCampaign ? onAddToCampaign(lead) : onStartCampaignForLead(lead))}
           >
-            Kampány indítása
+            Kampányba vétel
           </Button>
+          {onDeleted && (
+            <ActionIcon
+              size="md"
+              variant="subtle"
+              color="red"
+              title="Lead törlése"
+              onClick={async () => {
+                try {
+                  await api.deleteLeads([lead.id]);
+                  onDeleted(lead.id);
+                  notifications.show({ title: "Lead törölve", message: lead.companyName, color: "gray" });
+                } catch (e) {
+                  notifications.show({ title: "Törlési hiba", message: String(e), color: "red" });
+                }
+              }}
+            >
+              <IconTrash size={15} />
+            </ActionIcon>
+          )}
         </Group>
 
         <Tabs defaultValue="intel">
           <Tabs.List>
-            <Tabs.Tab value="intel">Cégprofil & Segítség</Tabs.Tab>
+            <Tabs.Tab value="intel">Áttekintés & Okosűrlap</Tabs.Tab>
             <Tabs.Tab value="audit">Weboldal-audit</Tabs.Tab>
             <Tabs.Tab value="contacts">Kapcsolatok ({lead.contacts.length})</Tabs.Tab>
             <Tabs.Tab value="edit">Szerkesztés & Jegyzet</Tabs.Tab>
@@ -284,9 +325,18 @@ export function LeadDrawer({
             <Stack gap="sm">
               <Paper p="sm">
                 <Text className="ml-section-label" mb={4}>
-                  Összefoglaló a cégről
+                  Rövid cégáttekintés
                 </Text>
                 <Text size="sm">{lead.companySummary || "Még nincs feldolgozott összefoglaló."}</Text>
+              </Paper>
+
+              <Paper p="sm" style={{ borderColor: "#166534" }}>
+                <Text className="ml-section-label" mb={6} c="forest.9">
+                  Nagyságrendi áttekintés — Mit tehet az okosűrlap / megoldásunk ezért a cégért
+                </Text>
+                <Text size="sm" style={{ whiteSpace: "pre-line", lineHeight: 1.55 }}>
+                  {lead.howWeCanHelp || "Futtass mély gazdagítást az okosűrlap-értékeléshez."}
+                </Text>
               </Paper>
 
               <Paper p="sm">
@@ -309,20 +359,6 @@ export function LeadDrawer({
                     ))}
                   </Stack>
                 )}
-              </Paper>
-
-              <Paper p="sm">
-                <Text className="ml-section-label" mb={4}>
-                  Miben tudunk nekik segíteni
-                </Text>
-                <Text size="sm">{lead.howWeCanHelp || "Nincs még elemzés."}</Text>
-              </Paper>
-
-              <Paper p="sm">
-                <Text className="ml-section-label" mb={4}>
-                  Javasolt megszólítási szög (Pitch Hook)
-                </Text>
-                <Text size="sm">{lead.recommendedPitch || "Nincs még javaslat."}</Text>
               </Paper>
 
               {lead.techStack.length > 0 && (

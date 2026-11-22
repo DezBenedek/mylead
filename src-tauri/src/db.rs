@@ -220,6 +220,22 @@ impl Database {
             "#,
         )
         .map_err(|e| format!("Séma inicializálási hiba: {}", e))?;
+
+        // Safe additive migrations for existing SQLite databases
+        let migrations = [
+            "ALTER TABLE email_messages ADD COLUMN scheduled_send_at TEXT",
+            "ALTER TABLE email_messages ADD COLUMN auto_send_status TEXT",
+            "ALTER TABLE email_messages ADD COLUMN ai_summary TEXT",
+            "ALTER TABLE email_messages ADD COLUMN ai_rewrite_note TEXT",
+        ];
+        for sql in migrations {
+            let _ = conn.execute(sql, []);
+        }
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_scheduled ON email_messages(status, auto_send_status, scheduled_send_at)",
+            [],
+        );
+
         Ok(())
     }
 
@@ -962,6 +978,22 @@ impl Database {
         Ok(())
     }
 
+    pub fn bulk_update_lead_status(&self, ids: &[String], status: &str) -> Result<usize, String> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        let mut count = 0usize;
+        for id in ids {
+            let n = conn
+                .execute(
+                    "UPDATE leads SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![status, &now, id],
+                )
+                .map_err(|e| e.to_string())?;
+            count += n;
+        }
+        Ok(count)
+    }
+
     pub fn find_lead_by_email(&self, email: &str) -> Result<Option<Lead>, String> {
         let id_opt: Option<String> = {
             let conn = self.conn.lock().unwrap();
@@ -1191,6 +1223,43 @@ impl Database {
         self.get_campaign(&id)
     }
 
+    pub fn update_campaign(&self, input: &CampaignUpdateInput) -> Result<Campaign, String> {
+        let now = Utc::now().to_rfc3339();
+        {
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE campaigns SET name=COALESCE(?1, name), project_id=COALESCE(?2, project_id), offer_id=COALESCE(?3, offer_id), sender_account_id=COALESCE(?4, sender_account_id), status=COALESCE(?5, status), tone=COALESCE(?6, tone), auto_reply_mode=COALESCE(?7, auto_reply_mode), daily_limit=COALESCE(?8, daily_limit), include_booking_link=COALESCE(?9, include_booking_link), custom_instructions=COALESCE(?10, custom_instructions), updated_at=?11 WHERE id=?12",
+                params![
+                    input.name,
+                    input.project_id,
+                    input.offer_id.as_ref().filter(|s| !s.is_empty()),
+                    input.sender_account_id.as_ref().filter(|s| !s.is_empty()),
+                    input.status,
+                    input.tone,
+                    input.auto_reply_mode,
+                    input.daily_limit,
+                    input.include_booking_link.map(|b| if b { 1i64 } else { 0i64 }),
+                    input.custom_instructions,
+                    &now,
+                    &input.id
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        self.get_campaign(&input.id)
+    }
+
+    pub fn campaign_has_lead(&self, campaign_id: &str, lead_id: &str) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM email_messages WHERE campaign_id = ?1 AND lead_id = ?2 AND direction = 'outbound'",
+            params![campaign_id, lead_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+            > 0
+    }
+
     pub fn update_campaign_status(&self, id: &str, status: &str) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -1224,11 +1293,53 @@ impl Database {
         booking_link_sent: bool,
         sent_at: Option<&str>,
     ) -> Result<String, String> {
+        self.insert_email_message_full(
+            campaign_id,
+            lead_id,
+            direction,
+            status,
+            step_number,
+            subject,
+            body,
+            message_id_header,
+            in_reply_to,
+            ai_intent,
+            ai_suggested_reply,
+            booking_link_sent,
+            sent_at,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_email_message_full(
+        &self,
+        campaign_id: Option<&str>,
+        lead_id: &str,
+        direction: &str,
+        status: &str,
+        step_number: i64,
+        subject: &str,
+        body: &str,
+        message_id_header: Option<&str>,
+        in_reply_to: Option<&str>,
+        ai_intent: Option<&str>,
+        ai_suggested_reply: Option<&str>,
+        booking_link_sent: bool,
+        sent_at: Option<&str>,
+        scheduled_send_at: Option<&str>,
+        auto_send_status: Option<&str>,
+        ai_summary: Option<&str>,
+        ai_rewrite_note: Option<&str>,
+    ) -> Result<String, String> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO email_messages (id, campaign_id, lead_id, direction, status, step_number, subject, body, message_id_header, in_reply_to, ai_intent, ai_suggested_reply, booking_link_sent, sent_at, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+            "INSERT INTO email_messages (id, campaign_id, lead_id, direction, status, step_number, subject, body, message_id_header, in_reply_to, ai_intent, ai_suggested_reply, booking_link_sent, sent_at, created_at, scheduled_send_at, auto_send_status, ai_summary, ai_rewrite_note) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             params![
                 &id,
                 campaign_id,
@@ -1244,11 +1355,61 @@ impl Database {
                 ai_suggested_reply,
                 if booking_link_sent { 1 } else { 0 },
                 sent_at,
-                &now
+                &now,
+                scheduled_send_at,
+                auto_send_status,
+                ai_summary,
+                ai_rewrite_note,
             ],
         )
         .map_err(|e| e.to_string())?;
         Ok(id)
+    }
+
+    pub fn get_email_message(&self, id: &str) -> Result<EmailMessage, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            r#"
+            SELECT em.id, em.campaign_id, c.name, em.lead_id, l.company_name, l.primary_email,
+                   em.direction, em.status, em.step_number, em.subject, em.body,
+                   em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
+                   em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
+                   em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note
+            FROM email_messages em
+            JOIN leads l ON l.id = em.lead_id
+            LEFT JOIN campaigns c ON c.id = em.campaign_id
+            WHERE em.id = ?1
+            "#,
+            params![id],
+            |r| {
+                Ok(EmailMessage {
+                    id: r.get(0)?,
+                    campaign_id: r.get(1)?,
+                    campaign_name: r.get(2)?,
+                    lead_id: r.get(3)?,
+                    lead_company: r.get(4)?,
+                    lead_email: r.get(5)?,
+                    direction: r.get(6)?,
+                    status: r.get(7)?,
+                    step_number: r.get(8)?,
+                    subject: r.get(9)?,
+                    body: r.get(10)?,
+                    message_id_header: r.get(11)?,
+                    in_reply_to: r.get(12)?,
+                    ai_intent: r.get(13)?,
+                    ai_suggested_reply: r.get(14)?,
+                    booking_link_sent: r.get::<_, i64>(15)? != 0,
+                    error_message: r.get(16)?,
+                    sent_at: r.get(17)?,
+                    created_at: r.get(18)?,
+                    scheduled_send_at: r.get(19)?,
+                    auto_send_status: r.get(20)?,
+                    ai_summary: r.get(21)?,
+                    ai_rewrite_note: r.get(22)?,
+                })
+            },
+        )
+        .map_err(|_| "Üzenet nem található".to_string())
     }
 
     pub fn update_email_draft(&self, id: &str, subject: &str, body: &str) -> Result<(), String> {
@@ -1261,11 +1422,168 @@ impl Database {
         Ok(())
     }
 
+    pub fn update_email_message_content(
+        &self,
+        id: &str,
+        subject: &str,
+        body: &str,
+        ai_rewrite_note: Option<&str>,
+    ) -> Result<EmailMessage, String> {
+        {
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE email_messages SET subject = ?1, body = ?2, ai_rewrite_note = COALESCE(?3, ai_rewrite_note) WHERE id = ?4",
+                params![subject, body, ai_rewrite_note, id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        self.get_email_message(id)
+    }
+
+    pub fn update_email_schedule(
+        &self,
+        id: &str,
+        status: &str,
+        auto_send_status: Option<&str>,
+        scheduled_send_at: Option<&str>,
+        error_message: Option<&str>,
+    ) -> Result<EmailMessage, String> {
+        {
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE email_messages SET status = ?1, auto_send_status = ?2, scheduled_send_at = ?3, error_message = ?4 WHERE id = ?5",
+                params![status, auto_send_status, scheduled_send_at, error_message, id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        self.get_email_message(id)
+    }
+
+    pub fn delete_email_message(&self, id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM email_messages WHERE id = ?1", params![id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn list_lead_messages(&self, lead_id: &str) -> Result<Vec<EmailMessage>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT em.id, em.campaign_id, c.name, em.lead_id, l.company_name, l.primary_email,
+                       em.direction, em.status, em.step_number, em.subject, em.body,
+                       em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
+                       em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
+                       em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note
+                FROM email_messages em
+                JOIN leads l ON l.id = em.lead_id
+                LEFT JOIN campaigns c ON c.id = em.campaign_id
+                WHERE em.lead_id = ?1
+                ORDER BY COALESCE(em.sent_at, em.created_at) ASC
+                "#,
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![lead_id], |r| {
+                Ok(EmailMessage {
+                    id: r.get(0)?,
+                    campaign_id: r.get(1)?,
+                    campaign_name: r.get(2)?,
+                    lead_id: r.get(3)?,
+                    lead_company: r.get(4)?,
+                    lead_email: r.get(5)?,
+                    direction: r.get(6)?,
+                    status: r.get(7)?,
+                    step_number: r.get(8)?,
+                    subject: r.get(9)?,
+                    body: r.get(10)?,
+                    message_id_header: r.get(11)?,
+                    in_reply_to: r.get(12)?,
+                    ai_intent: r.get(13)?,
+                    ai_suggested_reply: r.get(14)?,
+                    booking_link_sent: r.get::<_, i64>(15)? != 0,
+                    error_message: r.get(16)?,
+                    sent_at: r.get(17)?,
+                    created_at: r.get(18)?,
+                    scheduled_send_at: r.get(19)?,
+                    auto_send_status: r.get(20)?,
+                    ai_summary: r.get(21)?,
+                    ai_rewrite_note: r.get(22)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| e.to_string())?);
+        }
+        Ok(out)
+    }
+
+    pub fn list_due_scheduled_messages(&self) -> Result<Vec<EmailMessage>, String> {
+        let conn = self.conn.lock().unwrap();
+        let now_utc = Utc::now().to_rfc3339();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT em.id, em.campaign_id, c.name, em.lead_id, l.company_name, l.primary_email,
+                       em.direction, em.status, em.step_number, em.subject, em.body,
+                       em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
+                       em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
+                       em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note
+                FROM email_messages em
+                JOIN leads l ON l.id = em.lead_id
+                LEFT JOIN campaigns c ON c.id = em.campaign_id
+                WHERE em.direction = 'outbound'
+                  AND em.status = 'queued'
+                  AND em.auto_send_status = 'scheduled'
+                  AND em.scheduled_send_at IS NOT NULL
+                  AND em.scheduled_send_at <= ?1
+                ORDER BY em.scheduled_send_at ASC
+                "#,
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![&now_utc], |r| {
+                Ok(EmailMessage {
+                    id: r.get(0)?,
+                    campaign_id: r.get(1)?,
+                    campaign_name: r.get(2)?,
+                    lead_id: r.get(3)?,
+                    lead_company: r.get(4)?,
+                    lead_email: r.get(5)?,
+                    direction: r.get(6)?,
+                    status: r.get(7)?,
+                    step_number: r.get(8)?,
+                    subject: r.get(9)?,
+                    body: r.get(10)?,
+                    message_id_header: r.get(11)?,
+                    in_reply_to: r.get(12)?,
+                    ai_intent: r.get(13)?,
+                    ai_suggested_reply: r.get(14)?,
+                    booking_link_sent: r.get::<_, i64>(15)? != 0,
+                    error_message: r.get(16)?,
+                    sent_at: r.get(17)?,
+                    created_at: r.get(18)?,
+                    scheduled_send_at: r.get(19)?,
+                    auto_send_status: r.get(20)?,
+                    ai_summary: r.get(21)?,
+                    ai_rewrite_note: r.get(22)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| e.to_string())?);
+        }
+        Ok(out)
+    }
+
     pub fn mark_email_sent(&self, id: &str, msg_id_header: &str, booking_link_sent: bool) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
         conn.execute(
-            "UPDATE email_messages SET status='sent', message_id_header=?1, booking_link_sent=CASE WHEN ?2=1 THEN 1 ELSE booking_link_sent END, error_message=NULL, sent_at=?3 WHERE id=?4",
+            "UPDATE email_messages SET status='sent', auto_send_status=CASE WHEN auto_send_status IS NOT NULL THEN 'sent' ELSE NULL END, message_id_header=?1, booking_link_sent=CASE WHEN ?2=1 THEN 1 ELSE booking_link_sent END, error_message=NULL, sent_at=?3 WHERE id=?4",
             params![msg_id_header, if booking_link_sent { 1 } else { 0 }, now, id],
         )
         .map_err(|e| e.to_string())?;
@@ -1275,7 +1593,7 @@ impl Database {
     pub fn mark_email_failed(&self, id: &str, error: &str) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE email_messages SET status='failed', error_message=?1 WHERE id=?2",
+            "UPDATE email_messages SET status='failed', auto_send_status=CASE WHEN auto_send_status='scheduled' THEN 'failed' ELSE auto_send_status END, error_message=?1 WHERE id=?2",
             params![error, id],
         )
         .map_err(|e| e.to_string())?;
@@ -1301,7 +1619,8 @@ impl Database {
                 SELECT em.id, em.campaign_id, c.name, em.lead_id, l.company_name, l.primary_email,
                        em.direction, em.status, em.step_number, em.subject, em.body,
                        em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
-                       em.booking_link_sent, em.error_message, em.sent_at, em.created_at
+                       em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
+                       em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note
                 FROM email_messages em
                 JOIN leads l ON l.id = em.lead_id
                 LEFT JOIN campaigns c ON c.id = em.campaign_id
@@ -1332,6 +1651,10 @@ impl Database {
                     error_message: r.get(16)?,
                     sent_at: r.get(17)?,
                     created_at: r.get(18)?,
+                    scheduled_send_at: r.get(19)?,
+                    auto_send_status: r.get(20)?,
+                    ai_summary: r.get(21)?,
+                    ai_rewrite_note: r.get(22)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -1347,15 +1670,17 @@ impl Database {
         let mut stmt = conn
             .prepare(
                 r#"
-                SELECT em.id, em.campaign_id, c.name, em.lead_id, l.company_name, l.primary_email,
+                SELECT em.id, em.campaign_id, c.name, o.title, em.lead_id, l.company_name, l.primary_email,
                        em.direction, em.status, em.step_number, em.subject, em.body,
                        em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
                        em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
+                       em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note,
                        l.status, l.fit_score
                 FROM email_messages em
                 JOIN leads l ON l.id = em.lead_id
                 LEFT JOIN campaigns c ON c.id = em.campaign_id
-                WHERE em.status IN ('sent', 'received', 'draft')
+                LEFT JOIN offers o ON o.id = c.offer_id
+                WHERE em.status IN ('sent', 'received', 'queued', 'draft')
                 ORDER BY COALESCE(em.sent_at, em.created_at) ASC
                 "#,
             )
@@ -1367,30 +1692,39 @@ impl Database {
                     id: r.get(0)?,
                     campaign_id: r.get(1)?,
                     campaign_name: r.get(2)?,
-                    lead_id: r.get(3)?,
-                    lead_company: r.get(4)?,
-                    lead_email: r.get(5)?,
-                    direction: r.get(6)?,
-                    status: r.get(7)?,
-                    step_number: r.get(8)?,
-                    subject: r.get(9)?,
-                    body: r.get(10)?,
-                    message_id_header: r.get(11)?,
-                    in_reply_to: r.get(12)?,
-                    ai_intent: r.get(13)?,
-                    ai_suggested_reply: r.get(14)?,
-                    booking_link_sent: r.get::<_, i64>(15)? != 0,
-                    error_message: r.get(16)?,
-                    sent_at: r.get(17)?,
-                    created_at: r.get(18)?,
+                    lead_id: r.get(4)?,
+                    lead_company: r.get(5)?,
+                    lead_email: r.get(6)?,
+                    direction: r.get(7)?,
+                    status: r.get(8)?,
+                    step_number: r.get(9)?,
+                    subject: r.get(10)?,
+                    body: r.get(11)?,
+                    message_id_header: r.get(12)?,
+                    in_reply_to: r.get(13)?,
+                    ai_intent: r.get(14)?,
+                    ai_suggested_reply: r.get(15)?,
+                    booking_link_sent: r.get::<_, i64>(16)? != 0,
+                    error_message: r.get(17)?,
+                    sent_at: r.get(18)?,
+                    created_at: r.get(19)?,
+                    scheduled_send_at: r.get(20)?,
+                    auto_send_status: r.get(21)?,
+                    ai_summary: r.get(22)?,
+                    ai_rewrite_note: r.get(23)?,
                 };
-                Ok((msg, r.get::<_, String>(19)?, r.get::<_, i64>(20)?))
+                Ok((
+                    msg,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, String>(24)?,
+                    r.get::<_, i64>(25)?,
+                ))
             })
             .map_err(|e| e.to_string())?;
 
         let mut map: HashMap<String, InboxThread> = HashMap::new();
         for row in rows {
-            let (msg, lead_status, fit_score) = row.map_err(|e| e.to_string())?;
+            let (msg, offer_title, lead_status, fit_score) = row.map_err(|e| e.to_string())?;
             let ts = msg.sent_at.clone().unwrap_or_else(|| msg.created_at.clone());
             let entry = map.entry(msg.lead_id.clone()).or_insert_with(|| InboxThread {
                 lead_id: msg.lead_id.clone(),
@@ -1400,10 +1734,14 @@ impl Database {
                 fit_score,
                 campaign_id: msg.campaign_id.clone(),
                 campaign_name: msg.campaign_name.clone(),
+                offer_title: offer_title.clone(),
                 last_message_at: ts.clone(),
                 last_direction: msg.direction.clone(),
                 latest_intent: msg.ai_intent.clone(),
                 has_pending_draft: false,
+                pending_reply_id: None,
+                scheduled_send_at: None,
+                auto_send_status: None,
                 booking_link_sent: false,
                 message_count: 0,
                 messages: vec![],
@@ -1413,11 +1751,22 @@ impl Database {
             if msg.ai_intent.is_some() {
                 entry.latest_intent = msg.ai_intent.clone();
             }
-            if msg.ai_suggested_reply.as_ref().is_some_and(|s| !s.is_empty()) && msg.direction == "inbound" {
+            if offer_title.is_some() {
+                entry.offer_title = offer_title;
+            }
+            if msg.direction == "outbound" && (msg.status == "queued" || (msg.status == "draft" && (msg.step_number >= 2 || msg.auto_send_status.is_some()))) {
+                entry.has_pending_draft = true;
+                entry.pending_reply_id = Some(msg.id.clone());
+                entry.scheduled_send_at = msg.scheduled_send_at.clone();
+                entry.auto_send_status = msg.auto_send_status.clone();
+            } else if msg.direction == "inbound" && msg.ai_suggested_reply.as_ref().is_some_and(|s| !s.is_empty()) {
                 entry.has_pending_draft = true;
             }
             if msg.direction == "outbound" && msg.status == "sent" {
                 entry.has_pending_draft = false;
+                entry.pending_reply_id = None;
+                entry.scheduled_send_at = None;
+                entry.auto_send_status = None;
             }
             if msg.booking_link_sent {
                 entry.booking_link_sent = true;
@@ -1432,7 +1781,14 @@ impl Database {
 
         let mut threads: Vec<InboxThread> = map
             .into_values()
-            .filter(|t| t.messages.iter().any(|m| m.status == "sent" || m.status == "received"))
+            .filter(|t| {
+                t.messages.iter().any(|m| {
+                    m.status == "sent"
+                        || m.status == "received"
+                        || m.status == "queued"
+                        || (m.status == "draft" && (m.step_number >= 2 || m.auto_send_status.is_some()))
+                })
+            })
             .collect();
         threads.sort_by(|a, b| b.last_message_at.cmp(&a.last_message_at));
         Ok(threads)

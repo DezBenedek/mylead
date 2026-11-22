@@ -7,7 +7,7 @@ use crate::mailer;
 use crate::models::*;
 use crate::seed;
 use chrono::Utc;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 fn emit_progress(app: &AppHandle, job_type: &str, job_id: &str, current: usize, total: usize, message: String) {
     let _ = app.emit(
@@ -302,6 +302,75 @@ pub fn delete_leads(db: State<Database>, ids: Vec<String>) -> Result<(), String>
 }
 
 #[tauri::command]
+pub fn bulk_update_lead_status(db: State<Database>, ids: Vec<String>, status: String) -> Result<usize, String> {
+    db.bulk_update_lead_status(&ids, &status)
+}
+
+#[tauri::command]
+pub async fn create_manual_lead(
+    app: AppHandle,
+    db: State<'_, Database>,
+    input: CreateLeadInput,
+) -> Result<Lead, String> {
+    if input.company_name.trim().is_empty() {
+        return Err("Add meg a cég nevét!".to_string());
+    }
+    let lead_id = db.upsert_discovered_lead(
+        None,
+        input.company_name.trim(),
+        input.website_url.trim(),
+        if input.industry.trim().is_empty() { "B2B" } else { input.industry.trim() },
+        input.location.trim(),
+        "",
+        input.phone.trim(),
+        input.primary_email.trim(),
+        None,
+        None,
+        "Kézi felvétel",
+    )?;
+    if !input.notes.trim().is_empty() {
+        let _ = db.update_lead_fields(LeadUpdateInput {
+            id: lead_id.clone(),
+            notes: Some(input.notes.trim().to_string()),
+            ..Default::default()
+        });
+    }
+    if input.run_audit && !input.website_url.trim().is_empty() {
+        let settings = db.get_settings()?;
+        if let Some(proj) = db.list_projects()?.into_iter().next() {
+            let lead = db.get_lead(&lead_id)?;
+            emit_progress(&app, "import", &lead_id, 1, 2, format!("Weboldal audit: {}", lead.company_name));
+            let crawled = crawler::crawl_website(&input.website_url, 3).await.ok();
+            let audit_ref = crawled.as_ref().map(|c| &c.audit);
+            let text = crawled.as_ref().map(|c| c.combined_text.as_str()).unwrap_or("");
+            let analysis = ai::audit_and_score_lead(&settings, &proj, proj.offers.first(), None, &lead, audit_ref, text).await;
+            let first_email = audit_ref.and_then(|a| a.extracted_emails.first().cloned());
+            let first_phone = audit_ref.and_then(|a| a.extracted_phones.first().cloned());
+            let tech = audit_ref.map(|a| a.tech_stack.clone()).unwrap_or_default();
+            let _ = db.update_lead_enrichment(
+                &lead_id,
+                analysis.fit_score,
+                if analysis.fit_score >= 70 { "promising" } else { "new" },
+                crawled.is_some(),
+                &analysis.employee_estimate,
+                &analysis.company_summary,
+                &analysis.pain_points,
+                &analysis.how_we_can_help,
+                &analysis.recommended_pitch,
+                &tech,
+                &lead.contacts,
+                first_email.as_deref(),
+                first_phone.as_deref(),
+                audit_ref,
+            );
+            emit_progress(&app, "import", &lead_id, 2, 2, format!("Kész: {}", lead.company_name));
+        }
+    }
+    db.log_activity("search", "Új lead manuálisan felvéve", input.company_name.trim(), Some(&lead_id));
+    db.get_lead(&lead_id)
+}
+
+#[tauri::command]
 pub async fn enrich_leads(
     app: AppHandle,
     db: State<'_, Database>,
@@ -503,14 +572,22 @@ pub fn list_campaign_messages(db: State<Database>, campaign_id: String) -> Resul
 pub async fn create_campaign_with_drafts(
     app: AppHandle,
     db: State<'_, Database>,
-    input: CampaignInput,
+    mut input: CampaignInput,
 ) -> Result<Campaign, String> {
     let settings = db.get_settings()?;
-    let project = db.get_project(&input.project_id)?;
     let offer = match &input.offer_id {
         Some(oid) if !oid.is_empty() => db.get_offer(oid)?,
         _ => None,
     };
+    // Resolve project automatically from Offer if project_id was omitted!
+    if input.project_id.trim().is_empty() {
+        if let Some(ref o) = offer {
+            input.project_id = o.project_id.clone();
+        } else if let Some(first_p) = db.list_projects()?.into_iter().next() {
+            input.project_id = first_p.id;
+        }
+    }
+    let project = db.get_project(&input.project_id)?;
 
     // Determine target leads: explicit lead_ids OR all leads with email from search_id
     let target_leads: Vec<Lead> = if !input.lead_ids.is_empty() {
@@ -585,6 +662,310 @@ pub async fn create_campaign_with_drafts(
         None,
     );
     db.get_campaign(&campaign.id)
+}
+
+#[tauri::command]
+pub fn update_campaign(db: State<Database>, mut input: CampaignUpdateInput) -> Result<Campaign, String> {
+    if let Some(ref oid) = input.offer_id {
+        if !oid.trim().is_empty() {
+            if let Ok(Some(off)) = db.get_offer(oid) {
+                input.project_id = Some(off.project_id);
+            }
+        }
+    }
+    db.update_campaign(&input)
+}
+
+#[tauri::command]
+pub async fn add_leads_to_campaign(
+    app: AppHandle,
+    db: State<'_, Database>,
+    campaign_id: String,
+    lead_ids: Vec<String>,
+    generate_drafts: bool,
+) -> Result<Campaign, String> {
+    let campaign = db.get_campaign(&campaign_id)?;
+    let project = db.get_project(&campaign.project_id)?;
+    let offer = match &campaign.offer_id {
+        Some(oid) if !oid.is_empty() => db.get_offer(oid)?,
+        _ => project.offers.first().cloned(),
+    };
+    let settings = db.get_settings()?;
+
+    let mut targets = Vec::new();
+    for lid in &lead_ids {
+        if db.campaign_has_lead(&campaign_id, lid) {
+            continue;
+        }
+        if let Ok(l) = db.get_lead(lid) {
+            if !l.primary_email.trim().is_empty() && !db.is_suppressed(&l.primary_email) {
+                targets.push(l);
+            }
+        }
+    }
+
+    let total = targets.len().max(1);
+    for (idx, lead) in targets.iter().enumerate() {
+        emit_progress(
+            &app,
+            "campaign_draft",
+            &campaign.id,
+            idx + 1,
+            total,
+            format!("Lead hozzáadása a kampányhoz ({}/{}): {}", idx + 1, total, lead.company_name),
+        );
+
+        let (subject, body) = if generate_drafts {
+            let gen = ai::generate_cold_email(
+                &settings,
+                &project,
+                offer.as_ref(),
+                lead,
+                &campaign.tone,
+                &campaign.language,
+                campaign.include_booking_link,
+                &campaign.custom_instructions,
+            )
+            .await;
+            (gen.subject, gen.body)
+        } else {
+            (
+                format!("{} — megkeresés", lead.company_name),
+                format!("Tisztelt {}!\n\n\n\n{}", lead.company_name, settings.company_signature),
+            )
+        };
+
+        let booking_included = !project.booking_url.is_empty() && body.contains(&project.booking_url);
+        db.insert_email_message(
+            Some(&campaign.id),
+            &lead.id,
+            "outbound",
+            "draft",
+            1,
+            &subject,
+            &body,
+            None,
+            None,
+            None,
+            None,
+            booking_included,
+            None,
+        )?;
+    }
+
+    db.log_activity(
+        "campaign",
+        "Leadek manuálisan kampányba véve",
+        &format!("{} — {} új cég hozzáadva", campaign.name, targets.len()),
+        None,
+    );
+    db.get_campaign(&campaign.id)
+}
+
+#[tauri::command]
+pub async fn regenerate_email_draft(
+    db: State<'_, Database>,
+    message_id: String,
+    instruction: Option<String>,
+) -> Result<EmailMessage, String> {
+    let msg = db.get_email_message(&message_id)?;
+    let lead = db.get_lead(&msg.lead_id)?;
+    let settings = db.get_settings()?;
+    let campaign = msg.campaign_id.as_deref().and_then(|cid| db.get_campaign(cid).ok());
+    let project = match &campaign {
+        Some(c) => db.get_project(&c.project_id).ok(),
+        None => db.list_projects()?.into_iter().next(),
+    };
+    let offer = campaign
+        .as_ref()
+        .and_then(|c| c.offer_id.as_deref())
+        .and_then(|oid| db.get_offer(oid).ok().flatten())
+        .or_else(|| project.as_ref().and_then(|p| p.offers.first().cloned()));
+
+    let updated = if let Some(instr) = instruction.as_deref().filter(|s| !s.trim().is_empty()) {
+        let history = db.list_lead_messages(&lead.id).unwrap_or_default();
+        ai::rewrite_email_with_instruction(
+            &settings,
+            project.as_ref(),
+            offer.as_ref(),
+            &lead,
+            &history,
+            &msg.subject,
+            &msg.body,
+            instr,
+        )
+        .await?
+    } else if let Some(ref proj) = project {
+        ai::generate_cold_email(
+            &settings,
+            proj,
+            offer.as_ref(),
+            &lead,
+            campaign.as_ref().map(|c| c.tone.as_str()).unwrap_or(&settings.default_tone),
+            &settings.default_language,
+            campaign.as_ref().is_some_and(|c| c.include_booking_link),
+            campaign.as_ref().map(|c| c.custom_instructions.as_str()).unwrap_or(""),
+        )
+        .await
+    } else {
+        return Err("Nincs projekt az újrageneráláshoz.".to_string());
+    };
+
+    db.update_email_message_content(&message_id, &updated.subject, &updated.body, instruction.as_deref())
+}
+
+#[tauri::command]
+pub async fn generate_direct_email_draft(
+    db: State<'_, Database>,
+    lead_id: String,
+    offer_id: Option<String>,
+    tone: String,
+    instruction: String,
+) -> Result<ai::GeneratedEmail, String> {
+    let lead = db.get_lead(&lead_id)?;
+    let settings = db.get_settings()?;
+    let offer = match offer_id.as_deref().filter(|s| !s.is_empty()) {
+        Some(oid) => db.get_offer(oid)?,
+        None => None,
+    };
+    let project = match &offer {
+        Some(o) => db.get_project(&o.project_id)?,
+        None => db
+            .list_projects()?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "Hozz létre legalább egy Projektet / Ajánlatot az AI levélíráshoz!".to_string())?,
+    };
+    let resolved_offer = offer.or_else(|| project.offers.first().cloned());
+
+    Ok(ai::generate_cold_email(
+        &settings,
+        &project,
+        resolved_offer.as_ref(),
+        &lead,
+        if tone.is_empty() { &settings.default_tone } else { &tone },
+        &settings.default_language,
+        true,
+        &instruction,
+    )
+    .await)
+}
+
+#[tauri::command]
+pub async fn send_direct_email(
+    app: AppHandle,
+    db: State<'_, Database>,
+    input: DirectEmailInput,
+) -> Result<InboxThread, String> {
+    let lead = db.get_lead(&input.lead_id)?;
+    if lead.primary_email.trim().is_empty() {
+        return Err("Ennek a leadnek nincs megadott e-mail címe!".to_string());
+    }
+    if db.is_suppressed(&lead.primary_email) {
+        return Err("Ez az e-mail cím a tiltólistán (leiratkozott) szerepel!".to_string());
+    }
+    let settings = db.get_settings()?;
+    let offer = match input.offer_id.as_deref().filter(|s| !s.is_empty()) {
+        Some(oid) => db.get_offer(oid).ok().flatten(),
+        None => None,
+    };
+    let project = match &offer {
+        Some(o) => db.get_project(&o.project_id).ok(),
+        None => db.list_projects()?.into_iter().next(),
+    };
+    let booking_sent = project
+        .as_ref()
+        .is_some_and(|p| !p.booking_url.is_empty() && input.body.contains(&p.booking_url));
+
+    if input.schedule_mode == "auto_random" || input.schedule_mode == "custom" {
+        let scheduled_at = if input.schedule_mode == "custom" {
+            input
+                .scheduled_send_at
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| ai::compute_random_business_send_time(&settings))
+        } else {
+            ai::compute_random_business_send_time(&settings)
+        };
+        db.insert_email_message_full(
+            None,
+            &lead.id,
+            "outbound",
+            "queued",
+            2,
+            &input.subject,
+            &input.body,
+            None,
+            None,
+            None,
+            None,
+            booking_sent,
+            None,
+            Some(&scheduled_at),
+            Some("scheduled"),
+            None,
+            None,
+        )?;
+        db.log_activity(
+            "campaign",
+            "Közvetlen üzenet időzítve",
+            &format!("{} ({}) — kiküldés időzítve", lead.company_name, lead.primary_email),
+            Some(&lead.id),
+        );
+    } else {
+        let msg_id = if input.dry_run {
+            format!("<direct-sim-{}.mylead@local>", uuid::Uuid::new_v4())
+        } else {
+            let accounts = db.list_sender_accounts()?;
+            let account = input
+                .sender_account_id
+                .as_deref()
+                .and_then(|aid| accounts.iter().find(|a| a.id == aid))
+                .or_else(|| accounts.iter().find(|a| a.is_default))
+                .or_else(|| accounts.first())
+                .ok_or_else(|| "Nincs beállított SMTP vagy Amazon SES fiók a küldéshez!".to_string())?;
+            let id = mailer::send_email(account, &lead.primary_email, &input.subject, &input.body, None).await?;
+            db.increment_sender_sent_today(&account.id);
+            id
+        };
+        db.insert_email_message_full(
+            None,
+            &lead.id,
+            "outbound",
+            "sent",
+            1,
+            &input.subject,
+            &input.body,
+            Some(&msg_id),
+            None,
+            None,
+            None,
+            booking_sent,
+            Some(&Utc::now().to_rfc3339()),
+            None,
+            None,
+            None,
+            None,
+        )?;
+        if matches!(lead.status.as_str(), "new" | "promising" | "enriched") {
+            let _ = db.update_lead_fields(LeadUpdateInput {
+                id: lead.id.clone(),
+                status: Some("in_campaign".to_string()),
+                ..Default::default()
+            });
+        }
+        db.log_activity(
+            "campaign",
+            if input.dry_run { "Szimulált közvetlen üzenet" } else { "Közvetlen üzenet elküldve" },
+            &format!("{} ({})", lead.company_name, lead.primary_email),
+            Some(&lead.id),
+        );
+    }
+
+    let _ = app.emit("inbox-updated", ());
+    db.list_inbox_threads()?
+        .into_iter()
+        .find(|t| t.lead_id == lead.id)
+        .ok_or_else(|| "Beszélgetés nem található".to_string())
 }
 
 #[tauri::command]
@@ -689,7 +1070,16 @@ pub fn list_inbox_threads(db: State<Database>) -> Result<Vec<InboxThread>, Strin
 }
 
 #[tauri::command]
-pub async fn sync_imap_inbox(db: State<'_, Database>, sender_account_id: Option<String>) -> Result<usize, String> {
+pub async fn sync_imap_inbox(app: AppHandle, db: State<'_, Database>, sender_account_id: Option<String>) -> Result<usize, String> {
+    let count = sync_imap_inbox_inner(&app, &db, sender_account_id.as_deref()).await?;
+    Ok(count)
+}
+
+pub(crate) async fn sync_imap_inbox_inner(
+    app: &AppHandle,
+    db: &Database,
+    sender_account_id: Option<&str>,
+) -> Result<usize, String> {
     let accounts = db.list_sender_accounts()?;
     let target = match sender_account_id {
         Some(id) if !id.is_empty() => accounts.into_iter().find(|a| a.id == id),
@@ -708,7 +1098,7 @@ pub async fn sync_imap_inbox(db: State<'_, Database>, sender_account_id: Option<
             continue;
         }
         if let Some(lead) = db.find_lead_by_email(&mail.from_email)? {
-            process_inbound_reply(&db, &lead, None, &mail.subject, &mail.body, Some(&mail.message_id), mail.in_reply_to.as_deref(), true).await?;
+            process_inbound_reply(app, db, &lead, None, &mail.subject, &mail.body, Some(&mail.message_id), mail.in_reply_to.as_deref()).await?;
             new_replies += 1;
         }
     }
@@ -717,6 +1107,7 @@ pub async fn sync_imap_inbox(db: State<'_, Database>, sender_account_id: Option<
 
 #[tauri::command]
 pub async fn simulate_inbound_reply(
+    app: AppHandle,
     db: State<'_, Database>,
     lead_id: String,
     campaign_id: Option<String>,
@@ -724,14 +1115,16 @@ pub async fn simulate_inbound_reply(
 ) -> Result<InboxThread, String> {
     let lead = db.get_lead(&lead_id)?;
     let subject = format!("Re: {} — megkeresés", lead.company_name);
-    process_inbound_reply(&db, &lead, campaign_id.as_deref(), &subject, &body, None, None, false).await?;
+    process_inbound_reply(&app, &db, &lead, campaign_id.as_deref(), &subject, &body, None, None).await?;
     db.list_inbox_threads()?
         .into_iter()
         .find(|t| t.lead_id == lead_id)
         .ok_or_else(|| "Beszélgetés nem található".to_string())
 }
 
-async fn process_inbound_reply(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn process_inbound_reply(
+    app: &AppHandle,
     db: &Database,
     lead: &Lead,
     campaign_id_opt: Option<&str>,
@@ -739,7 +1132,6 @@ async fn process_inbound_reply(
     body: &str,
     msg_id: Option<&str>,
     in_reply_to: Option<&str>,
-    allow_live_autopilot: bool,
 ) -> Result<(), String> {
     let settings = db.get_settings()?;
     let campaign = match campaign_id_opt {
@@ -758,11 +1150,12 @@ async fn process_inbound_reply(
         Some(oid) => db.get_offer(oid)?,
         None => project.offers.first().cloned(),
     };
+    let thread_history = db.list_lead_messages(&lead.id).unwrap_or_default();
 
-    let classification = ai::classify_and_draft_reply(&settings, &project, offer.as_ref(), lead, body).await;
+    let classification = ai::classify_and_draft_reply(&settings, &project, offer.as_ref(), lead, body, &thread_history).await;
 
     let now = Utc::now().to_rfc3339();
-    db.insert_email_message(
+    db.insert_email_message_full(
         campaign.as_ref().map(|c| c.id.as_str()),
         &lead.id,
         "inbound",
@@ -780,6 +1173,10 @@ async fn process_inbound_reply(
         },
         false,
         Some(&now),
+        None,
+        None,
+        Some(&classification.summary),
+        None,
     )?;
 
     // Update lead status & suppression list based on AI intent
@@ -806,66 +1203,437 @@ async fn process_inbound_reply(
         Some(&lead.id),
     );
 
-    // Autopilot auto-send if enabled and intent is positive/booking/question
-    if let Some(ref camp) = campaign {
-        if camp.auto_reply_mode == "autopilot"
-            && !classification.suggested_reply.is_empty()
-            && matches!(classification.intent.as_str(), "interested" | "booking_request" | "question")
-        {
-            let sent_ok = if allow_live_autopilot {
-                if let Some(ref aid) = camp.sender_account_id {
-                    if let Ok(acc) = db.get_sender_account(aid) {
-                        mailer::send_email(&acc, &lead.primary_email, subject, &classification.suggested_reply, msg_id).await.ok()
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                Some(format!("<autopilot-{}.mylead@local>", uuid::Uuid::new_v4()))
-            };
+    // ALWAYS generate & schedule AI reply for questions / interested / booking_request / objection
+    // within business hours (default Mon-Sat 08:00-18:00, random 20min-2h delay).
+    // User can stop/pause, manually edit, or ask AI to rewrite with a note before send time!
+    let should_auto_prepare = !classification.suggested_reply.trim().is_empty()
+        && matches!(
+            classification.intent.as_str(),
+            "interested" | "booking_request" | "question" | "objection"
+        );
 
-            if let Some(sent_msg_id) = sent_ok {
-                let booking_sent = classification.should_include_booking_link
-                    || (!project.booking_url.is_empty() && classification.suggested_reply.contains(&project.booking_url));
-                db.insert_email_message(
-                    Some(&camp.id),
-                    &lead.id,
-                    "outbound",
-                    "sent",
-                    2,
-                    subject,
-                    &classification.suggested_reply,
-                    Some(&sent_msg_id),
-                    msg_id,
-                    None,
-                    None,
-                    booking_sent,
-                    Some(&Utc::now().to_rfc3339()),
-                )?;
-                db.log_activity(
-                    if booking_sent { "booking" } else { "campaign" },
-                    if booking_sent { "AI automatikusan küldte a foglalási linket" } else { "AI autopilóta válasz elküldve" },
-                    &lead.company_name,
-                    Some(&lead.id),
-                );
-            }
-        }
+    if should_auto_prepare {
+        let campaign_allows_auto = campaign
+            .as_ref()
+            .map(|c| c.auto_reply_mode != "manual")
+            .unwrap_or(true);
+        let auto_schedule = settings.auto_reply_enabled && campaign_allows_auto;
+        let scheduled_at = ai::compute_random_business_send_time(&settings);
+        let reply_subject = if subject.to_lowercase().starts_with("re:") {
+            subject.to_string()
+        } else {
+            format!("Re: {}", subject)
+        };
+        let booking_link_included = classification.should_include_booking_link
+            || (!project.booking_url.is_empty() && classification.suggested_reply.contains(&project.booking_url));
+
+        db.insert_email_message_full(
+            campaign.as_ref().map(|c| c.id.as_str()),
+            &lead.id,
+            "outbound",
+            if auto_schedule { "queued" } else { "draft" },
+            2,
+            &reply_subject,
+            &classification.suggested_reply,
+            None,
+            msg_id,
+            None,
+            None,
+            booking_link_included,
+            None,
+            if auto_schedule { Some(scheduled_at.as_str()) } else { None },
+            Some(if auto_schedule { "scheduled" } else { "paused" }),
+            Some(&classification.summary),
+            None,
+        )?;
+
+        db.log_activity(
+            "reply",
+            if auto_schedule {
+                "AI auto-válasz előkészítve és időzítve"
+            } else {
+                "AI választervezet elkészült (jóváhagyásra vár)"
+            },
+            &format!("{} — bármikor megállítható vagy átírható a Beérkező oldalon", lead.company_name),
+            Some(&lead.id),
+        );
     }
 
+    let _ = app.emit("inbox-updated", ());
     Ok(())
+}
+
+/// Dispatches a single scheduled outbound message (live SMTP/SES or dry-run)
+pub(crate) async fn execute_send_for_message(
+    db: &Database,
+    msg: &EmailMessage,
+    dry_run: bool,
+) -> Result<String, String> {
+    if db.is_suppressed(&msg.lead_email) {
+        let _ = db.update_email_schedule(
+            &msg.id,
+            "draft",
+            Some("cancelled"),
+            None,
+            Some("Címzett tiltólistán szerepel — automatikus küldés leállítva"),
+        );
+        return Err("Címzett a tiltólistán szerepel.".to_string());
+    }
+
+    let campaign = msg.campaign_id.as_deref().and_then(|cid| db.get_campaign(cid).ok());
+    let project = match &campaign {
+        Some(c) => db.get_project(&c.project_id).ok(),
+        None => db.list_projects()?.into_iter().next(),
+    };
+    let booking_sent = project
+        .as_ref()
+        .is_some_and(|p| !p.booking_url.is_empty() && msg.body.contains(&p.booking_url));
+
+    let sent_msg_id = if dry_run {
+        format!("<auto-sim-{}.mylead@local>", uuid::Uuid::new_v4())
+    } else {
+        let accounts = db.list_sender_accounts()?;
+        let account = campaign
+            .as_ref()
+            .and_then(|c| c.sender_account_id.as_ref())
+            .and_then(|aid| accounts.iter().find(|a| &a.id == aid))
+            .or_else(|| accounts.iter().find(|a| a.is_default))
+            .or_else(|| accounts.first())
+            .ok_or_else(|| "Nincs beállított SMTP vagy Amazon SES fiók a küldéshez!".to_string())?;
+        let id = mailer::send_email(
+            account,
+            &msg.lead_email,
+            &msg.subject,
+            &msg.body,
+            msg.in_reply_to.as_deref(),
+        )
+        .await?;
+        db.increment_sender_sent_today(&account.id);
+        id
+    };
+
+    db.mark_email_sent(&msg.id, &sent_msg_id, booking_sent)?;
+
+    if booking_sent {
+        let _ = db.update_lead_fields(LeadUpdateInput {
+            id: msg.lead_id.clone(),
+            status: Some("booked".to_string()),
+            ..Default::default()
+        });
+        db.log_activity("booking", "Időpontfoglaló link kiküldve", &msg.lead_company, Some(&msg.lead_id));
+    } else {
+        db.log_activity(
+            "campaign",
+            if dry_run { "Időzített válasz (szimulált) elküldve" } else { "Időzített AI válasz elküldve" },
+            &msg.lead_company,
+            Some(&msg.lead_id),
+        );
+    }
+
+    Ok(sent_msg_id)
+}
+
+/// Called periodically by the background scheduler in lib.rs to fire due auto-replies!
+pub(crate) async fn dispatch_due_scheduled_messages(app: &AppHandle) {
+    let db = app.state::<Database>();
+    let settings = match db.get_settings() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let due = match db.list_due_scheduled_messages() {
+        Ok(list) => list,
+        Err(_) => return,
+    };
+    if due.is_empty() {
+        return;
+    }
+
+    let mut changed = false;
+    for msg in due {
+        let res = execute_send_for_message(&db, &msg, settings.auto_reply_default_dry_run).await;
+        if let Err(err) = res {
+            // Pause on missing account / SMTP error so user sees why and can fix & retry
+            let _ = db.update_email_schedule(&msg.id, "draft", Some("paused"), None, Some(&err));
+            db.log_activity("reply", "Auto-válasz küldése megállítva (hiba)", &format!("{}: {}", msg.lead_company, err), Some(&msg.lead_id));
+        }
+        changed = true;
+    }
+
+    if changed {
+        let _ = app.emit("inbox-updated", ());
+    }
+}
+
+#[tauri::command]
+pub fn save_inbox_reply_draft(
+    app: AppHandle,
+    db: State<Database>,
+    message_id: Option<String>,
+    lead_id: String,
+    campaign_id: Option<String>,
+    subject: String,
+    body: String,
+    keep_scheduled: bool,
+) -> Result<InboxThread, String> {
+    let settings = db.get_settings()?;
+    if let Some(mid) = message_id.filter(|s| !s.trim().is_empty()) {
+        db.update_email_message_content(&mid, &subject, &body, None)?;
+        if !keep_scheduled {
+            db.update_email_schedule(&mid, "draft", Some("paused"), None, None)?;
+        }
+    } else {
+        let scheduled_at = if keep_scheduled {
+            Some(ai::compute_random_business_send_time(&settings))
+        } else {
+            None
+        };
+        db.insert_email_message_full(
+            campaign_id.as_deref(),
+            &lead_id,
+            "outbound",
+            if keep_scheduled { "queued" } else { "draft" },
+            2,
+            &subject,
+            &body,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            scheduled_at.as_deref(),
+            Some(if keep_scheduled { "scheduled" } else { "paused" }),
+            None,
+            None,
+        )?;
+    }
+
+    let _ = app.emit("inbox-updated", ());
+    db.list_inbox_threads()?
+        .into_iter()
+        .find(|t| t.lead_id == lead_id)
+        .ok_or_else(|| "Beszélgetés nem található".to_string())
+}
+
+#[tauri::command]
+pub async fn control_scheduled_reply(
+    app: AppHandle,
+    db: State<'_, Database>,
+    message_id: String,
+    action: String,
+    custom_send_at: Option<String>,
+    dry_run: Option<bool>,
+) -> Result<InboxThread, String> {
+    let msg = db.get_email_message(&message_id)?;
+    let lead_id = msg.lead_id.clone();
+    let settings = db.get_settings()?;
+
+    match action.as_str() {
+        "pause" | "stop" => {
+            db.update_email_schedule(&message_id, "draft", Some("paused"), None, None)?;
+            db.log_activity("reply", "Automatikus válasz megállítva", &msg.lead_company, Some(&lead_id));
+        }
+        "cancel" | "delete" => {
+            db.delete_email_message(&message_id)?;
+            db.log_activity("reply", "Időzített válasz törölve", &msg.lead_company, Some(&lead_id));
+        }
+        "resume" | "reschedule_random" => {
+            let next_at = ai::compute_random_business_send_time(&settings);
+            db.update_email_schedule(&message_id, "queued", Some("scheduled"), Some(&next_at), None)?;
+            db.log_activity("reply", "AI válasz újra időzítve (munkaidőben)", &msg.lead_company, Some(&lead_id));
+        }
+        "reschedule_custom" => {
+            let target_at = custom_send_at
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| "Adj meg egy érvényes időpontot!".to_string())?;
+            db.update_email_schedule(&message_id, "queued", Some("scheduled"), Some(&target_at), None)?;
+            db.log_activity("reply", "Válasz egyedi időpontra ütemezve", &msg.lead_company, Some(&lead_id));
+        }
+        "send_now" => {
+            execute_send_for_message(&db, &msg, dry_run.unwrap_or(false)).await?;
+        }
+        _ => return Err(format!("Ismeretlen művelet: {}", action)),
+    }
+
+    let _ = app.emit("inbox-updated", ());
+    db.list_inbox_threads()?
+        .into_iter()
+        .find(|t| t.lead_id == lead_id)
+        .ok_or_else(|| "Beszélgetés nem található".to_string())
+}
+
+#[tauri::command]
+pub async fn rewrite_inbox_reply_with_ai(
+    app: AppHandle,
+    db: State<'_, Database>,
+    lead_id: String,
+    message_id: Option<String>,
+    current_subject: String,
+    current_body: String,
+    instruction: String,
+) -> Result<ai::GeneratedEmail, String> {
+    if instruction.trim().is_empty() {
+        return Err("Írj megjegyzést vagy instrukciót az AI-nak az átíráshoz!".to_string());
+    }
+    let lead = db.get_lead(&lead_id)?;
+    let settings = db.get_settings()?;
+    let history = db.list_lead_messages(&lead_id).unwrap_or_default();
+    let camp_id = message_id
+        .as_deref()
+        .and_then(|mid| db.get_email_message(mid).ok())
+        .and_then(|m| m.campaign_id)
+        .or_else(|| history.iter().rev().find_map(|m| m.campaign_id.clone()));
+    let campaign = camp_id.as_deref().and_then(|cid| db.get_campaign(cid).ok());
+    let project = match &campaign {
+        Some(c) => db.get_project(&c.project_id).ok(),
+        None => db.list_projects()?.into_iter().next(),
+    };
+    let offer = campaign
+        .as_ref()
+        .and_then(|c| c.offer_id.as_deref())
+        .and_then(|oid| db.get_offer(oid).ok().flatten())
+        .or_else(|| project.as_ref().and_then(|p| p.offers.first().cloned()));
+
+    let rewritten = ai::rewrite_email_with_instruction(
+        &settings,
+        project.as_ref(),
+        offer.as_ref(),
+        &lead,
+        &history,
+        &current_subject,
+        &current_body,
+        instruction.trim(),
+    )
+    .await?;
+
+    if let Some(mid) = message_id.filter(|s| !s.trim().is_empty()) {
+        let _ = db.update_email_message_content(&mid, &rewritten.subject, &rewritten.body, Some(instruction.trim()));
+        let _ = app.emit("inbox-updated", ());
+    }
+    Ok(rewritten)
+}
+
+#[tauri::command]
+pub async fn generate_inbox_reply_with_ai(
+    app: AppHandle,
+    db: State<'_, Database>,
+    lead_id: String,
+    campaign_id: Option<String>,
+) -> Result<InboxThread, String> {
+    let lead = db.get_lead(&lead_id)?;
+    let settings = db.get_settings()?;
+    let history = db.list_lead_messages(&lead_id).unwrap_or_default();
+    let last_inbound = history.iter().rev().find(|m| m.direction == "inbound");
+
+    let camp = campaign_id
+        .as_deref()
+        .or_else(|| history.iter().rev().find_map(|m| m.campaign_id.as_deref()))
+        .and_then(|cid| db.get_campaign(cid).ok());
+    let project = match &camp {
+        Some(c) => db.get_project(&c.project_id)?,
+        None => db
+            .list_projects()?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "Nincs aktív projekt az AI válasz generálásához!".to_string())?,
+    };
+    let offer = camp
+        .as_ref()
+        .and_then(|c| c.offer_id.as_deref())
+        .and_then(|oid| db.get_offer(oid).ok().flatten())
+        .or_else(|| project.offers.first().cloned());
+
+    let inbound_text = last_inbound
+        .map(|m| m.body.as_str())
+        .unwrap_or("Kérem küldjenek bővebb tájékoztatást a megoldásról és a következő lépésekről.");
+    let base_subj = last_inbound
+        .map(|m| m.subject.as_str())
+        .or_else(|| history.last().map(|m| m.subject.as_str()))
+        .unwrap_or("Megkeresés");
+    let reply_subject = if base_subj.to_lowercase().starts_with("re:") {
+        base_subj.to_string()
+    } else {
+        format!("Re: {}", base_subj)
+    };
+
+    let classification = ai::classify_and_draft_reply(&settings, &project, offer.as_ref(), &lead, inbound_text, &history).await;
+    let body = if classification.suggested_reply.trim().is_empty() {
+        format!(
+            "Köszönöm a megkeresést!\n\nSzívesen egyeztetünk a(z) {} kapcsán. {}\n\n{}",
+            lead.company_name,
+            if !project.booking_url.is_empty() {
+                format!("Itt tud közvetlenül időpontot választani: {}", project.booking_url)
+            } else {
+                String::new()
+            },
+            settings.company_signature
+        )
+    } else {
+        classification.suggested_reply
+    };
+
+    // If an existing pending/paused outbound reply exists, update it; otherwise insert new scheduled reply
+    let existing_pending = history.iter().rev().find(|m| {
+        m.direction == "outbound" && (m.status == "queued" || (m.status == "draft" && (m.step_number >= 2 || m.auto_send_status.is_some())))
+    });
+    let scheduled_at = ai::compute_random_business_send_time(&settings);
+    if let Some(pend) = existing_pending {
+        db.update_email_message_content(&pend.id, &reply_subject, &body, None)?;
+        if settings.auto_reply_enabled {
+            db.update_email_schedule(&pend.id, "queued", Some("scheduled"), Some(&scheduled_at), None)?;
+        }
+    } else {
+        db.insert_email_message_full(
+            camp.as_ref().map(|c| c.id.as_str()),
+            &lead_id,
+            "outbound",
+            if settings.auto_reply_enabled { "queued" } else { "draft" },
+            2,
+            &reply_subject,
+            &body,
+            None,
+            last_inbound.and_then(|m| m.message_id_header.as_deref()),
+            None,
+            None,
+            classification.should_include_booking_link,
+            None,
+            if settings.auto_reply_enabled { Some(scheduled_at.as_str()) } else { None },
+            Some(if settings.auto_reply_enabled { "scheduled" } else { "paused" }),
+            Some(&classification.summary),
+            None,
+        )?;
+    }
+
+    let _ = app.emit("inbox-updated", ());
+    db.list_inbox_threads()?
+        .into_iter()
+        .find(|t| t.lead_id == lead_id)
+        .ok_or_else(|| "Beszélgetés nem található".to_string())
 }
 
 #[tauri::command]
 pub async fn send_inbox_reply(
+    app: AppHandle,
     db: State<'_, Database>,
     lead_id: String,
     campaign_id: Option<String>,
     subject: String,
     body: String,
     dry_run: bool,
+    pending_message_id: Option<String>,
 ) -> Result<InboxThread, String> {
+    if let Some(pid) = pending_message_id.filter(|s| !s.trim().is_empty()) {
+        db.update_email_message_content(&pid, &subject, &body, None)?;
+        let msg = db.get_email_message(&pid)?;
+        execute_send_for_message(&db, &msg, dry_run).await?;
+        let _ = app.emit("inbox-updated", ());
+        return db
+            .list_inbox_threads()?
+            .into_iter()
+            .find(|t| t.lead_id == lead_id)
+            .ok_or_else(|| "Beszélgetés nem található".to_string());
+    }
+
     let lead = db.get_lead(&lead_id)?;
     let campaign = match &campaign_id {
         Some(cid) => db.get_campaign(cid).ok(),
@@ -888,6 +1656,7 @@ pub async fn send_inbox_reply(
             .as_ref()
             .and_then(|c| c.sender_account_id.as_ref())
             .and_then(|aid| accounts.iter().find(|a| &a.id == aid))
+            .or_else(|| accounts.iter().find(|a| a.is_default))
             .or_else(|| accounts.first())
             .ok_or_else(|| "Nincs beállított SMTP vagy Amazon SES fiók a küldéshez!".to_string())?;
         let id = mailer::send_email(account, &lead.primary_email, &subject, &body, None).await?;
@@ -920,6 +1689,7 @@ pub async fn send_inbox_reply(
         db.log_activity("booking", "Időpontfoglaló link kiküldve", &lead.company_name, Some(&lead.id));
     }
 
+    let _ = app.emit("inbox-updated", ());
     db.list_inbox_threads()?
         .into_iter()
         .find(|t| t.lead_id == lead_id)

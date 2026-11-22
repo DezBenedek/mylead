@@ -69,7 +69,7 @@ export function AssistantDrawer({
       id: "welcome",
       role: "assistant",
       content:
-        "Szia! Írd le mit csináljak meg, vagy tölts fel egy CSV fájlt leadekkel (kattints a CSV gombra vagy húzd ide a fájlt), és azonnal betöltöm és elindítom az 5-ös párhuzamos kiértékelésüket.",
+        "Szia! Teljes hozzáférésem van a munkaterülethez: tudok leadeket törölni/szűrni/státuszt váltani, manuálisan kampányba venni, üzenetet küldeni vagy időzíteni, időzített auto-válaszokat megállítani vagy átírni, kereséseket futtatni és CSV-t kiértékelni. Írd le mit csináljak meg!",
     },
   ]);
   const [input, setInput] = useState("");
@@ -230,10 +230,10 @@ export function AssistantDrawer({
       watchdogTimer = setTimeout(() => {
         reject(
           new Error(
-            `Az AI modell (${settings.aiProvider} / ${settings.aiModel || "alapértelmezett"}) 46 másodpercen belül nem adott választ. Ellenőrizd a modellt vagy válassz másikat a Beállításokban!`
+            `Az AI modell (${settings.aiProvider} / ${settings.aiModel || "alapértelmezett"}) 65 másodpercen belül nem adott választ. Ellenőrizd a modellt vagy válassz másikat a Beállításokban!`
           )
         );
-      }, 46000);
+      }, 65000);
     });
 
     try {

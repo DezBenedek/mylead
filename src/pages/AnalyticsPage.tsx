@@ -209,7 +209,7 @@ export function AnalyticsPage({ analytics, campaigns, senderAccounts }: Props) {
                 <Table.Thead>
                   <Table.Tr>
                     <Table.Th>Kampány</Table.Th>
-                    <Table.Th>Projekt / Ajánlat</Table.Th>
+                    <Table.Th>Ajánlat</Table.Th>
                     <Table.Th ta="right">Címzett</Table.Th>
                     <Table.Th ta="right">Elküldve</Table.Th>
                     <Table.Th ta="right">Hiba</Table.Th>
@@ -226,9 +226,9 @@ export function AnalyticsPage({ analytics, campaigns, senderAccounts }: Props) {
                       <Table.Tr key={c.id}>
                         <Table.Td fw={500}>{c.name}</Table.Td>
                         <Table.Td>
-                          <Text size="xs">{c.projectName}</Text>
+                          <Text size="xs" fw={500}>{c.offerTitle || "Egyedi ajánlat"}</Text>
                           <Text size="11px" c="dimmed">
-                            {c.offerTitle || "—"}
+                            {c.projectName}
                           </Text>
                         </Table.Td>
                         <Table.Td ta="right" className="ml-tabular">

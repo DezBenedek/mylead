@@ -377,6 +377,14 @@ pub struct EmailMessage {
     pub error_message: Option<String>,
     pub sent_at: Option<String>,
     pub created_at: String,
+    #[serde(default)]
+    pub scheduled_send_at: Option<String>,
+    #[serde(default)]
+    pub auto_send_status: Option<String>, // scheduled | paused | cancelled | sent | failed
+    #[serde(default)]
+    pub ai_summary: Option<String>,
+    #[serde(default)]
+    pub ai_rewrite_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -389,13 +397,76 @@ pub struct InboxThread {
     pub fit_score: i64,
     pub campaign_id: Option<String>,
     pub campaign_name: Option<String>,
+    #[serde(default)]
+    pub offer_title: Option<String>,
     pub last_message_at: String,
     pub last_direction: String,
     pub latest_intent: Option<String>,
     pub has_pending_draft: bool,
+    #[serde(default)]
+    pub pending_reply_id: Option<String>,
+    #[serde(default)]
+    pub scheduled_send_at: Option<String>,
+    #[serde(default)]
+    pub auto_send_status: Option<String>,
     pub booking_link_sent: bool,
     pub message_count: i64,
     pub messages: Vec<EmailMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectEmailInput {
+    pub lead_id: String,
+    pub sender_account_id: Option<String>,
+    pub offer_id: Option<String>,
+    pub subject: String,
+    pub body: String,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default = "default_schedule_mode")]
+    pub schedule_mode: String, // now | auto_random | custom
+    pub scheduled_send_at: Option<String>,
+}
+
+fn default_schedule_mode() -> String {
+    "now".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateLeadInput {
+    pub company_name: String,
+    #[serde(default)]
+    pub website_url: String,
+    #[serde(default)]
+    pub industry: String,
+    #[serde(default)]
+    pub location: String,
+    #[serde(default)]
+    pub phone: String,
+    #[serde(default)]
+    pub primary_email: String,
+    #[serde(default)]
+    pub notes: String,
+    #[serde(default)]
+    pub run_audit: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CampaignUpdateInput {
+    pub id: String,
+    pub name: Option<String>,
+    pub project_id: Option<String>,
+    pub offer_id: Option<String>,
+    pub sender_account_id: Option<String>,
+    pub status: Option<String>,
+    pub tone: Option<String>,
+    pub auto_reply_mode: Option<String>,
+    pub daily_limit: Option<i64>,
+    pub include_booking_link: Option<bool>,
+    pub custom_instructions: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -418,10 +489,60 @@ pub struct AppSettings {
     pub default_language: String,
     pub company_signature: String,
     pub imap_poll_minutes: i64,
+    // Auto-reply scheduling & customization
+    #[serde(default = "default_true")]
+    pub auto_reply_enabled: bool,
+    #[serde(default = "default_workdays")]
+    pub auto_reply_workdays: Vec<u8>, // 1=Mon .. 7=Sun (default Mon-Sat: 1..=6)
+    #[serde(default = "default_start_hour")]
+    pub auto_reply_start_hour: u8, // default 8 (08:00)
+    #[serde(default = "default_end_hour")]
+    pub auto_reply_end_hour: u8, // default 18 (18:00)
+    #[serde(default = "default_min_delay_min")]
+    pub auto_reply_min_delay_min: i64, // default 20 minutes
+    #[serde(default = "default_max_delay_min")]
+    pub auto_reply_max_delay_min: i64, // default 120 minutes (2 hours)
+    #[serde(default)]
+    pub auto_reply_default_dry_run: bool,
+    #[serde(default = "default_ai_analysis_focus")]
+    pub ai_analysis_focus: String,
+    #[serde(default)]
+    pub ai_reply_instructions: String,
+    #[serde(default = "default_tone")]
+    pub default_tone: String,
+    #[serde(default = "default_daily_limit")]
+    pub default_daily_limit: i64,
 }
 
 fn default_cli_search_engine() -> String {
     "auto".to_string()
+}
+fn default_true() -> bool {
+    true
+}
+fn default_workdays() -> Vec<u8> {
+    vec![1, 2, 3, 4, 5, 6]
+}
+fn default_start_hour() -> u8 {
+    8
+}
+fn default_end_hour() -> u8 {
+    18
+}
+fn default_min_delay_min() -> i64 {
+    20
+}
+fn default_max_delay_min() -> i64 {
+    120
+}
+fn default_ai_analysis_focus() -> String {
+    "Fókuszálj konkrétan arra, hogy egy okosűrlap (intelligens, többlépcsős ajánlatkérő / előszűrő / kalkulátor / időpontfoglaló űrlap) mit tehet ennek a cégnek a saját szolgáltatásai alapján: milyen kérdéseket válthat ki, hogyan gyorsítja az ajánlatadást/időpontfoglalást, és milyen nagyságrendű konverzió- vagy időnyereséget hozhat.".to_string()
+}
+fn default_tone() -> String {
+    "professional_formal".to_string()
+}
+fn default_daily_limit() -> i64 {
+    35
 }
 
 impl Default for AppSettings {
@@ -440,6 +561,17 @@ impl Default for AppSettings {
             default_language: "hu".to_string(),
             company_signature: "Üdvözlettel,\nMyLead Csapat".to_string(),
             imap_poll_minutes: 5,
+            auto_reply_enabled: default_true(),
+            auto_reply_workdays: default_workdays(),
+            auto_reply_start_hour: default_start_hour(),
+            auto_reply_end_hour: default_end_hour(),
+            auto_reply_min_delay_min: default_min_delay_min(),
+            auto_reply_max_delay_min: default_max_delay_min(),
+            auto_reply_default_dry_run: false,
+            ai_analysis_focus: default_ai_analysis_focus(),
+            ai_reply_instructions: String::new(),
+            default_tone: default_tone(),
+            default_daily_limit: default_daily_limit(),
         }
     }
 }

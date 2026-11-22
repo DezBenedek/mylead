@@ -9,9 +9,13 @@ import type {
   AssistantStatusEvent,
   Campaign,
   CampaignInput,
+  CampaignUpdateInput,
+  CreateLeadInput,
   CsvImportResult,
+  DirectEmailInput,
   DiscoveryToolStatus,
   EmailMessage,
+  GeneratedEmail,
   InboxThread,
   JobProgressEvent,
   Lead,
@@ -92,6 +96,9 @@ export const api = {
   getLead: (id: string) => invoke<Lead>("get_lead", { id }),
   updateLead: (input: LeadUpdateInput) => invoke<Lead>("update_lead", { input }),
   deleteLeads: (ids: string[]) => invoke<void>("delete_leads", { ids }),
+  bulkUpdateLeadStatus: (ids: string[], status: string) =>
+    invoke<number>("bulk_update_lead_status", { ids, status }),
+  createManualLead: (input: CreateLeadInput) => invoke<Lead>("create_manual_lead", { input }),
   enrichLeads: (leadIds: string[], projectId?: string | null) =>
     invoke<Lead[]>("enrich_leads", { leadIds, projectId: projectId || null }),
 
@@ -101,11 +108,34 @@ export const api = {
     invoke<EmailMessage[]>("list_campaign_messages", { campaignId }),
   createCampaignWithDrafts: (input: CampaignInput) =>
     invoke<Campaign>("create_campaign_with_drafts", { input }),
+  updateCampaign: (input: CampaignUpdateInput) => invoke<Campaign>("update_campaign", { input }),
+  addLeadsToCampaign: (campaignId: string, leadIds: string[], generateDrafts: boolean) =>
+    invoke<Campaign>("add_leads_to_campaign", { campaignId, leadIds, generateDrafts }),
   updateEmailDraft: (messageId: string, subject: string, body: string) =>
     invoke<void>("update_email_draft", { messageId, subject, body }),
+  regenerateEmailDraft: (messageId: string, instruction?: string | null) =>
+    invoke<EmailMessage>("regenerate_email_draft", {
+      messageId,
+      instruction: instruction || null,
+    }),
   deleteCampaign: (id: string) => invoke<void>("delete_campaign", { id }),
   sendCampaignDrafts: (campaignId: string, dryRun: boolean) =>
     invoke<Campaign>("send_campaign_drafts", { campaignId, dryRun }),
+
+  // Direct Email to Lead
+  generateDirectEmailDraft: (
+    leadId: string,
+    offerId: string | null,
+    tone: string,
+    instruction: string
+  ) =>
+    invoke<GeneratedEmail>("generate_direct_email_draft", {
+      leadId,
+      offerId: offerId || null,
+      tone,
+      instruction,
+    }),
+  sendDirectEmail: (input: DirectEmailInput) => invoke<InboxThread>("send_direct_email", { input }),
 
   // Inbox & AI Auto-Reply
   listInboxThreads: () => invoke<InboxThread[]>("list_inbox_threads"),
@@ -118,8 +148,64 @@ export const api = {
     campaignId: string | null,
     subject: string,
     body: string,
-    dryRun: boolean
-  ) => invoke<InboxThread>("send_inbox_reply", { leadId, campaignId, subject, body, dryRun }),
+    dryRun: boolean,
+    pendingMessageId?: string | null
+  ) =>
+    invoke<InboxThread>("send_inbox_reply", {
+      leadId,
+      campaignId,
+      subject,
+      body,
+      dryRun,
+      pendingMessageId: pendingMessageId || null,
+    }),
+  saveInboxReplyDraft: (
+    messageId: string | null,
+    leadId: string,
+    campaignId: string | null,
+    subject: string,
+    body: string,
+    keepScheduled: boolean
+  ) =>
+    invoke<InboxThread>("save_inbox_reply_draft", {
+      messageId: messageId || null,
+      leadId,
+      campaignId,
+      subject,
+      body,
+      keepScheduled,
+    }),
+  controlScheduledReply: (
+    messageId: string,
+    action: "pause" | "cancel" | "resume" | "reschedule_random" | "reschedule_custom" | "send_now",
+    customSendAt?: string | null,
+    dryRun?: boolean
+  ) =>
+    invoke<InboxThread>("control_scheduled_reply", {
+      messageId,
+      action,
+      customSendAt: customSendAt || null,
+      dryRun: dryRun ?? null,
+    }),
+  rewriteInboxReplyWithAi: (
+    leadId: string,
+    messageId: string | null,
+    currentSubject: string,
+    currentBody: string,
+    instruction: string
+  ) =>
+    invoke<GeneratedEmail>("rewrite_inbox_reply_with_ai", {
+      leadId,
+      messageId: messageId || null,
+      currentSubject,
+      currentBody,
+      instruction,
+    }),
+  generateInboxReplyWithAi: (leadId: string, campaignId?: string | null) =>
+    invoke<InboxThread>("generate_inbox_reply_with_ai", {
+      leadId,
+      campaignId: campaignId || null,
+    }),
 
   // Sender Accounts & Settings
   listSenderAccounts: () => invoke<SenderAccount[]>("list_sender_accounts"),
@@ -153,7 +239,24 @@ export const api = {
     listen<SearchLiveEvent>("search-live-event", (event) => cb(event.payload)),
   onAssistantStatus: (cb: (ev: AssistantStatusEvent) => void): Promise<UnlistenFn> =>
     listen<AssistantStatusEvent>("assistant-status", (event) => cb(event.payload)),
+  onInboxUpdated: (cb: () => void): Promise<UnlistenFn> =>
+    listen("inbox-updated", () => cb()),
 };
+
+export function formatCountdown(iso: string | null | undefined): string {
+  if (!iso) return "";
+  const target = new Date(iso).getTime();
+  if (Number.isNaN(target)) return "";
+  const diffSec = Math.floor((target - Date.now()) / 1000);
+  if (diffSec <= 0) return "hamarosan küldi…";
+  const mins = Math.floor(diffSec / 60);
+  if (mins < 60) return `${mins} perc múlva`;
+  const hrs = Math.floor(mins / 60);
+  const remMins = mins % 60;
+  if (hrs < 24) return `${hrs} ó ${remMins} p múlva`;
+  const days = Math.floor(hrs / 24);
+  return `${days} nap ${hrs % 24} ó múlva`;
+}
 
 export const LEAD_STATUS_META: Record<string, { label: string; color: string }> = {
   new: { label: "Új", color: "gray" },

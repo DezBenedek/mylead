@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 import { notifications } from "@mantine/notifications";
+import { AddToCampaignModal } from "./components/AddToCampaignModal";
 import { AppShellLayout } from "./components/AppShellLayout";
 import { AssistantDrawer } from "./components/AssistantDrawer";
+import { DirectEmailModal } from "./components/DirectEmailModal";
 import { LeadDrawer } from "./components/LeadDrawer";
 import { api } from "./lib/api";
 import { AnalyticsPage } from "./pages/AnalyticsPage";
@@ -41,6 +43,18 @@ const defaultSettings: AppSettings = {
   defaultLanguage: "hu",
   companySignature: "Üdvözlettel,\nMyLead Csapat",
   imapPollMinutes: 5,
+  autoReplyEnabled: true,
+  autoReplyWorkdays: [1, 2, 3, 4, 5, 6],
+  autoReplyStartHour: 8,
+  autoReplyEndHour: 18,
+  autoReplyMinDelayMin: 20,
+  autoReplyMaxDelayMin: 120,
+  autoReplyDefaultDryRun: false,
+  aiAnalysisFocus:
+    "Fókuszálj konkrétan arra, hogy egy okosűrlap (intelligens, többlépcsős ajánlatkérő / előszűrő / kalkulátor / időpontfoglaló űrlap) mit tehet ennek a cégnek a saját szolgáltatásai alapján.",
+  aiReplyInstructions: "",
+  defaultTone: "professional_formal",
+  defaultDailyLimit: 35,
 };
 
 export default function App() {
@@ -72,6 +86,8 @@ export default function App() {
 
   // Global Central AI Assistant drawer (⌘K / Ctrl+K)
   const [assistantOpen, setAssistantOpen] = useState(false);
+  const [drawerEmailLead, setDrawerEmailLead] = useState<Lead | null>(null);
+  const [drawerAddCampLead, setDrawerAddCampLead] = useState<Lead | null>(null);
 
   const refreshAll = useCallback(async () => {
     try {
@@ -114,6 +130,22 @@ export default function App() {
 
   useEffect(() => {
     refreshAll();
+  }, [refreshAll]);
+
+  // Live refresh when background auto-reply scheduler or IMAP poller updates inbox
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    api
+      .onInboxUpdated(() => {
+        refreshAll();
+      })
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch(() => {});
+    return () => {
+      if (unlisten) unlisten();
+    };
   }, [refreshAll]);
 
   // Global ⌘K / Ctrl+K shortcut for Central Assistant
@@ -304,6 +336,9 @@ export default function App() {
             leads={leads}
             searches={searches}
             projects={projects}
+            campaigns={campaigns}
+            senderAccounts={senderAccounts}
+            settings={settings}
             initialSearchFilter={leadsSearchFilter}
             activeLeadWorkers={activeLeadWorkers}
             onSelectLead={setSelectedLead}
@@ -337,6 +372,9 @@ export default function App() {
             threads={threads}
             leads={leads}
             projects={projects}
+            senderAccounts={senderAccounts}
+            settings={settings}
+            onSelectLead={setSelectedLead}
             onRefresh={refreshAll}
           />
         )}
@@ -368,9 +406,43 @@ export default function App() {
           setSelectedLead(updated);
           refreshAll();
         }}
+        onDeleted={() => {
+          setSelectedLead(null);
+          refreshAll();
+        }}
+        onSendMessage={(lead) => {
+          setDrawerEmailLead(lead);
+        }}
+        onAddToCampaign={(lead) => {
+          setDrawerAddCampLead(lead);
+        }}
         onStartCampaignForLead={(lead) => {
           setSelectedLead(null);
           setCampaignPrefillLeads([lead.id]);
+          setSection("campaigns");
+        }}
+      />
+
+      <DirectEmailModal
+        opened={!!drawerEmailLead}
+        lead={drawerEmailLead}
+        projects={projects}
+        senderAccounts={senderAccounts}
+        settings={settings}
+        onClose={() => setDrawerEmailLead(null)}
+        onSent={refreshAll}
+      />
+
+      <AddToCampaignModal
+        opened={!!drawerAddCampLead}
+        leadIds={drawerAddCampLead ? [drawerAddCampLead.id] : []}
+        leadSummaryLabel={drawerAddCampLead?.companyName}
+        campaigns={campaigns}
+        onClose={() => setDrawerAddCampLead(null)}
+        onAdded={refreshAll}
+        onCreateNewCampaign={(ids) => {
+          setSelectedLead(null);
+          setCampaignPrefillLeads(ids);
           setSection("campaigns");
         }}
       />

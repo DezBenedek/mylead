@@ -1,37 +1,57 @@
 import { useMemo, useState } from "react";
 import {
+  ActionIcon,
   Badge,
   Box,
   Button,
   Checkbox,
   Group,
   Loader,
+  Modal,
   NumberInput,
   Paper,
   Progress,
   Select,
   SimpleGrid,
   Stack,
+  Switch,
   Table,
   Text,
+  Textarea,
   TextInput,
   Title,
+  Tooltip,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import {
   IconDownload,
+  IconMail,
+  IconPlus,
   IconRefresh,
   IconSearch,
   IconSend,
   IconTrash,
 } from "@tabler/icons-react";
+import { AddToCampaignModal } from "../components/AddToCampaignModal";
+import { DirectEmailModal } from "../components/DirectEmailModal";
 import { api, LEAD_STATUS_META } from "../lib/api";
-import type { Lead, Project, SearchJob, SearchLiveEvent } from "../types";
+import type {
+  AppSettings,
+  Campaign,
+  Lead,
+  Project,
+  SearchJob,
+  SearchLiveEvent,
+  SenderAccount,
+} from "../types";
 
 interface Props {
   leads: Lead[];
   searches: SearchJob[];
   projects: Project[];
+  campaigns: Campaign[];
+  senderAccounts: SenderAccount[];
+  settings: AppSettings;
   initialSearchFilter: string | null;
   activeLeadWorkers: Record<string, SearchLiveEvent>;
   onSelectLead: (lead: Lead) => void;
@@ -43,6 +63,9 @@ export function LeadsPage({
   leads,
   searches,
   projects,
+  campaigns,
+  senderAccounts,
+  settings,
   initialSearchFilter,
   activeLeadWorkers,
   onSelectLead,
@@ -52,14 +75,36 @@ export function LeadsPage({
   const [searchFilter, setSearchFilter] = useState<string>(initialSearchFilter || "all");
   const [statusFilter, setStatusFilter] = useState<string>("all");
   const [minScore, setMinScore] = useState<number>(0);
+  const [maxScore, setMaxScore] = useState<number>(100);
+  const [sortBy, setSortBy] = useState<string>("score_desc");
   const [textQuery, setTextQuery] = useState("");
   const [onlyWithEmail, setOnlyWithEmail] = useState(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [enriching, setEnriching] = useState(false);
+  const [bulkStatusTarget, setBulkStatusTarget] = useState<string>("");
+
+  // Direct Email & Add to Campaign modals
+  const [emailModalLead, setEmailModalLead] = useState<Lead | null>(null);
+  const [addCampaignIds, setAddCampaignIds] = useState<string[]>([]);
+  const [addCampaignLabel, setAddCampaignLabel] = useState<string | undefined>(undefined);
+
+  // Create manual lead modal
+  const [createLeadOpen, setCreateLeadOpen] = useState(false);
+  const [creatingLead, setCreatingLead] = useState(false);
+  const [newLead, setNewLead] = useState({
+    companyName: "",
+    websiteUrl: "",
+    industry: "",
+    location: "",
+    phone: "",
+    primaryEmail: "",
+    notes: "",
+    runAudit: true,
+  });
 
   const filtered = useMemo(() => {
     const q = textQuery.trim().toLowerCase();
-    return leads.filter((l) => {
+    const list = leads.filter((l) => {
       if (searchFilter !== "all" && !l.searches.some((s) => s.searchId === searchFilter)) {
         return false;
       }
@@ -69,16 +114,26 @@ export function LeadsPage({
       if (minScore > 0 && l.fitScore < minScore) {
         return false;
       }
+      if (maxScore < 100 && l.fitScore > maxScore) {
+        return false;
+      }
       if (onlyWithEmail && !l.primaryEmail.trim()) {
         return false;
       }
       if (q) {
-        const hay = `${l.companyName} ${l.domain} ${l.location} ${l.industry} ${l.primaryEmail} ${l.painPoints.join(" ")}`.toLowerCase();
+        const hay = `${l.companyName} ${l.domain} ${l.location} ${l.industry} ${l.primaryEmail} ${l.painPoints.join(" ")} ${l.howWeCanHelp}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
     });
-  }, [leads, searchFilter, statusFilter, minScore, textQuery, onlyWithEmail]);
+
+    return [...list].sort((a, b) => {
+      if (sortBy === "score_asc") return a.fitScore - b.fitScore;
+      if (sortBy === "name_asc") return a.companyName.localeCompare(b.companyName, "hu");
+      if (sortBy === "newest") return b.createdAt.localeCompare(a.createdAt);
+      return b.fitScore - a.fitScore;
+    });
+  }, [leads, searchFilter, statusFilter, minScore, maxScore, sortBy, textQuery, onlyWithEmail]);
 
   const allChecked = filtered.length > 0 && filtered.every((l) => selectedIds.includes(l.id));
 
@@ -104,7 +159,7 @@ export function LeadsPage({
       await onRefresh();
       notifications.show({
         title: "Mély gazdagítás kész",
-        message: `${updated.length} cég teljes adatlapja felépült.`,
+        message: `${updated.length} cég teljes adatlapja és okosűrlap-értékelése felépült.`,
         color: "forest",
       });
     } catch (e) {
@@ -114,15 +169,68 @@ export function LeadsPage({
     }
   };
 
-  const handleBulkDelete = async () => {
-    if (selectedIds.length === 0) return;
+  const handleBulkStatus = async (status: string) => {
+    if (!status || selectedIds.length === 0) return;
     try {
-      await api.deleteLeads(selectedIds);
-      setSelectedIds([]);
+      const cnt = await api.bulkUpdateLeadStatus(selectedIds, status);
+      setBulkStatusTarget("");
       await onRefresh();
-      notifications.show({ title: "Leadek törölve", message: "", color: "gray" });
+      notifications.show({
+        title: "Státuszok frissítve",
+        message: `${cnt} lead új státusza: ${LEAD_STATUS_META[status]?.label || status}`,
+        color: "forest",
+      });
     } catch (e) {
       notifications.show({ title: "Hiba", message: String(e), color: "red" });
+    }
+  };
+
+  const handleBulkDelete = async (idsToDelete?: string[]) => {
+    const ids = idsToDelete || selectedIds;
+    if (ids.length === 0) return;
+    try {
+      await api.deleteLeads(ids);
+      setSelectedIds((prev) => prev.filter((id) => !ids.includes(id)));
+      await onRefresh();
+      notifications.show({
+        title: `${ids.length} lead törölve`,
+        message: "",
+        color: "gray",
+      });
+    } catch (e) {
+      notifications.show({ title: "Hiba", message: String(e), color: "red" });
+    }
+  };
+
+  const handleCreateManualLead = async () => {
+    if (!newLead.companyName.trim()) {
+      notifications.show({ title: "Add meg a cég nevét!", message: "", color: "red" });
+      return;
+    }
+    setCreatingLead(true);
+    try {
+      const created = await api.createManualLead(newLead);
+      await onRefresh();
+      setCreateLeadOpen(false);
+      setNewLead({
+        companyName: "",
+        websiteUrl: "",
+        industry: "",
+        location: "",
+        phone: "",
+        primaryEmail: "",
+        notes: "",
+        runAudit: true,
+      });
+      notifications.show({
+        title: "Új lead felvéve",
+        message: `${created.companyName} (Fit: ${created.fitScore})`,
+        color: "forest",
+      });
+    } catch (e) {
+      notifications.show({ title: "Hiba", message: String(e), color: "red" });
+    } finally {
+      setCreatingLead(false);
     }
   };
 
@@ -138,7 +246,7 @@ export function LeadsPage({
         "Fit Score",
         "Státusz",
         "Keresések",
-        "Feltárt problémák",
+        "Okosűrlap / Miben segíthetünk",
       ],
       ...filtered.map((l) => [
         l.companyName,
@@ -150,7 +258,7 @@ export function LeadsPage({
         String(l.fitScore),
         l.status,
         l.searches.map((s) => s.searchName).join(" | "),
-        l.painPoints.join(" | "),
+        l.howWeCanHelp.replace(/\n/g, " | "),
       ]),
     ];
     const csv = rows
@@ -168,14 +276,14 @@ export function LeadsPage({
   return (
     <Box>
       <Box className="ml-page-header">
-        <Group justify="space-between" align="center">
+        <Group justify="space-between" align="center" wrap="wrap" gap="sm">
           <Box>
             <Title order={3} style={{ letterSpacing: "-0.02em" }}>
               Központi Lead Adatbázis
             </Title>
             <Text size="sm" c="dimmed">
-              Minden felkutatott és deduplikált cég egyetlen adatbázisban, keresési forrás
-              címkékkel és mély dossziéval.
+              Közvetlen üzenetküldés, manuális kampányba vétel, okosűrlap-értékelés és rugalmas
+              szűrés ({filtered.length} / {leads.length} cég).
             </Text>
           </Box>
           <Group gap="xs">
@@ -187,13 +295,16 @@ export function LeadsPage({
             >
               CSV export ({filtered.length})
             </Button>
+            <Button leftSection={<IconPlus size={15} />} onClick={() => setCreateLeadOpen(true)}>
+              Új lead kézzel
+            </Button>
           </Group>
         </Group>
       </Box>
 
       <Box className="ml-page-body">
         <Stack gap="sm">
-          {/* Live Multi-Site Deep Research Panel (shows whenever 1+ websites are being crawled concurrently!) */}
+          {/* Live Multi-Site Deep Research Panel */}
           {Object.keys(activeLeadWorkers).length > 0 && (
             <Paper p="sm" style={{ borderColor: "#166534" }}>
               <Group justify="space-between" mb={6}>
@@ -213,7 +324,11 @@ export function LeadsPage({
                   const pgCur = w.pagesCrawled ?? 1;
                   const pgTot = w.pagesTotal ?? (w.phase === "deep_enriching" ? 6 : 3);
                   return (
-                    <Paper key={w.leadId || w.companyName} p="xs" style={{ backgroundColor: "var(--ml-canvas)" }}>
+                    <Paper
+                      key={w.leadId || w.companyName}
+                      p="xs"
+                      style={{ backgroundColor: "var(--ml-canvas)" }}
+                    >
                       <Group justify="space-between" wrap="nowrap" mb={3}>
                         <Text size="xs" fw={600} truncate>
                           {w.companyName}
@@ -245,21 +360,21 @@ export function LeadsPage({
             </Paper>
           )}
 
-          {/* Filter Bar */}
+          {/* Filter & Sort Bar */}
           <Paper p="sm">
-            <Group gap="sm" wrap="wrap" align="flex-end">
+            <Group gap="xs" wrap="wrap" align="flex-end">
               <TextInput
-                placeholder="Keresés cégnév, domain, város, e-mail vagy probléma..."
+                placeholder="Keresés cégnév, domain, város, e-mail vagy okosűrlap-értékelés..."
                 leftSection={<IconSearch size={15} />}
                 value={textQuery}
                 onChange={(e) => setTextQuery(e.currentTarget.value)}
-                style={{ flex: 1, minWidth: 240 }}
+                style={{ flex: 1, minWidth: 220 }}
               />
               <Select
                 placeholder="Keresési forrás"
                 value={searchFilter}
                 onChange={(v) => setSearchFilter(v || "all")}
-                w={230}
+                w={200}
                 data={[
                   { value: "all", label: "Minden keresésből" },
                   ...searches.map((s) => ({ value: s.id, label: s.name })),
@@ -269,7 +384,7 @@ export function LeadsPage({
                 placeholder="Státusz"
                 value={statusFilter}
                 onChange={(v) => setStatusFilter(v || "all")}
-                w={170}
+                w={150}
                 data={[
                   { value: "all", label: "Minden státusz" },
                   ...Object.entries(LEAD_STATUS_META).map(([value, meta]) => ({
@@ -284,8 +399,28 @@ export function LeadsPage({
                 max={100}
                 value={minScore}
                 onChange={(v) => setMinScore(Number(v) || 0)}
-                w={100}
+                w={90}
                 prefix="≥ "
+              />
+              <NumberInput
+                placeholder="Max Fit"
+                min={0}
+                max={100}
+                value={maxScore}
+                onChange={(v) => setMaxScore(v === "" ? 100 : Number(v))}
+                w={90}
+                prefix="≤ "
+              />
+              <Select
+                value={sortBy}
+                onChange={(v) => setSortBy(v || "score_desc")}
+                w={155}
+                data={[
+                  { value: "score_desc", label: "Fit: magas → alacsony" },
+                  { value: "score_asc", label: "Fit: alacsony → magas" },
+                  { value: "newest", label: "Legújabb elöl" },
+                  { value: "name_asc", label: "Cégnév (A–Z)" },
+                ]}
               />
               <Checkbox
                 label="Csak e-maillel"
@@ -306,35 +441,52 @@ export function LeadsPage({
                 backgroundColor: "var(--ml-surface)",
               }}
             >
-              <Group justify="space-between">
+              <Group justify="space-between" wrap="wrap" gap="xs">
                 <Text size="sm" fw={600}>
                   {selectedIds.length} lead kijelölve
                 </Text>
-                <Group gap="xs">
+                <Group gap="xs" wrap="wrap">
                   <Button
                     size="xs"
                     leftSection={<IconRefresh size={14} />}
                     loading={enriching}
                     onClick={handleBulkEnrich}
                   >
-                    Mély adatlap építése (Gazdagítás)
+                    Mély kutatás
                   </Button>
                   <Button
                     size="xs"
-                    variant="default"
+                    variant="light"
+                    color="forest"
                     leftSection={<IconSend size={14} />}
-                    onClick={() => onCreateCampaignForLeads(selectedIds)}
+                    onClick={() => {
+                      setAddCampaignLabel(`${selectedIds.length} kijelölt lead`);
+                      setAddCampaignIds(selectedIds);
+                    }}
                   >
-                    Kampány indítása kijelöltekkel
+                    Kampányba vétel
                   </Button>
+                  <Select
+                    size="xs"
+                    w={155}
+                    placeholder="Státusz váltása..."
+                    value={bulkStatusTarget || null}
+                    onChange={(v) => {
+                      if (v) handleBulkStatus(v);
+                    }}
+                    data={Object.entries(LEAD_STATUS_META).map(([value, meta]) => ({
+                      value,
+                      label: meta.label,
+                    }))}
+                  />
                   <Button
                     size="xs"
                     variant="subtle"
                     color="red"
                     leftSection={<IconTrash size={14} />}
-                    onClick={handleBulkDelete}
+                    onClick={() => handleBulkDelete()}
                   >
-                    Törlés
+                    Törlés ({selectedIds.length})
                   </Button>
                 </Group>
               </Group>
@@ -358,10 +510,10 @@ export function LeadsPage({
                     </Table.Th>
                     <Table.Th>Cég & Weboldal</Table.Th>
                     <Table.Th>E-mail & Létszám</Table.Th>
-                    <Table.Th>Keresési források</Table.Th>
-                    <Table.Th>Fő feltárt probléma</Table.Th>
+                    <Table.Th>Nagyságrendi áttekintés (Okosűrlap / Segítség)</Table.Th>
                     <Table.Th ta="center">Fit</Table.Th>
                     <Table.Th>Státusz</Table.Th>
+                    <Table.Th ta="right">Műveletek</Table.Th>
                   </Table.Tr>
                 </Table.Thead>
                 <Table.Tbody>
@@ -425,26 +577,10 @@ export function LeadsPage({
                             {l.employeeEstimate || "Létszám ismeretlen"}
                           </Text>
                         </Table.Td>
-                        <Table.Td maw={210}>
-                          <Group gap={4}>
-                            {l.searches.length === 0 ? (
-                              <Text size="xs" c="dimmed">
-                                Kézi
-                              </Text>
-                            ) : (
-                              l.searches.map((s) => (
-                                <Badge key={s.searchId} size="xs" variant="default">
-                                  {s.searchName.length > 26
-                                    ? s.searchName.slice(0, 26) + "…"
-                                    : s.searchName}
-                                </Badge>
-                              ))
-                            )}
-                          </Group>
-                        </Table.Td>
-                        <Table.Td maw={260}>
+                        <Table.Td maw={300}>
                           <Text size="xs" c="dimmed" lineClamp={2}>
-                            {l.painPoints[0] ||
+                            {l.howWeCanHelp ||
+                              l.painPoints[0] ||
                               l.companySummary ||
                               (isNewUnaudited ? "Auditra váró új lead" : "Még nem auditált")}
                           </Text>
@@ -463,6 +599,57 @@ export function LeadsPage({
                             {isNewUnaudited ? "Új (auditra vár)" : meta.label}
                           </Badge>
                         </Table.Td>
+                        <Table.Td ta="right" onClick={(e) => e.stopPropagation()}>
+                          <Group gap={4} justify="flex-end" wrap="nowrap">
+                            <Tooltip
+                              label={
+                                l.primaryEmail
+                                  ? "Közvetlen üzenet küldése"
+                                  : "Nincs e-mail cím megadva"
+                              }
+                            >
+                              <ActionIcon
+                                size="sm"
+                                variant="subtle"
+                                color="forest"
+                                disabled={!l.primaryEmail}
+                                onClick={() => setEmailModalLead(l)}
+                              >
+                                <IconMail size={15} />
+                              </ActionIcon>
+                            </Tooltip>
+                            <Tooltip
+                              label={
+                                l.primaryEmail
+                                  ? "Manuálisan kampányba vétel"
+                                  : "Nincs e-mail cím megadva"
+                              }
+                            >
+                              <ActionIcon
+                                size="sm"
+                                variant="subtle"
+                                color="blue"
+                                disabled={!l.primaryEmail}
+                                onClick={() => {
+                                  setAddCampaignLabel(l.companyName);
+                                  setAddCampaignIds([l.id]);
+                                }}
+                              >
+                                <IconSend size={14} />
+                              </ActionIcon>
+                            </Tooltip>
+                            <Tooltip label="Lead törlése">
+                              <ActionIcon
+                                size="sm"
+                                variant="subtle"
+                                color="red"
+                                onClick={() => handleBulkDelete([l.id])}
+                              >
+                                <IconTrash size={14} />
+                              </ActionIcon>
+                            </Tooltip>
+                          </Group>
+                        </Table.Td>
                       </Table.Tr>
                     );
                   })}
@@ -472,6 +659,101 @@ export function LeadsPage({
           </Paper>
         </Stack>
       </Box>
+
+      {/* Direct Email Composer Modal */}
+      <DirectEmailModal
+        opened={!!emailModalLead}
+        lead={emailModalLead}
+        projects={projects}
+        senderAccounts={senderAccounts}
+        settings={settings}
+        onClose={() => setEmailModalLead(null)}
+        onSent={onRefresh}
+      />
+
+      {/* Add to Existing or New Campaign Modal */}
+      <AddToCampaignModal
+        opened={addCampaignIds.length > 0}
+        leadIds={addCampaignIds}
+        leadSummaryLabel={addCampaignLabel}
+        campaigns={campaigns}
+        onClose={() => setAddCampaignIds([])}
+        onAdded={onRefresh}
+        onCreateNewCampaign={(ids) => onCreateCampaignForLeads(ids)}
+      />
+
+      {/* Manual Lead Create Modal */}
+      <Modal
+        opened={createLeadOpen}
+        onClose={() => setCreateLeadOpen(false)}
+        title="Új lead felvétele kézzel"
+        size="md"
+      >
+        <Stack gap="sm">
+          <SimpleGrid cols={2}>
+            <TextInput
+              label="Cégnév"
+              required
+              placeholder="pl. Példa Kft."
+              value={newLead.companyName}
+              onChange={(e) => setNewLead({ ...newLead, companyName: e.currentTarget.value })}
+            />
+            <TextInput
+              label="Weboldal URL"
+              placeholder="https://pelda.hu"
+              value={newLead.websiteUrl}
+              onChange={(e) => setNewLead({ ...newLead, websiteUrl: e.currentTarget.value })}
+            />
+          </SimpleGrid>
+          <SimpleGrid cols={2}>
+            <TextInput
+              label="E-mail cím"
+              placeholder="info@pelda.hu"
+              value={newLead.primaryEmail}
+              onChange={(e) => setNewLead({ ...newLead, primaryEmail: e.currentTarget.value })}
+            />
+            <TextInput
+              label="Telefonszám"
+              placeholder="+36 ..."
+              value={newLead.phone}
+              onChange={(e) => setNewLead({ ...newLead, phone: e.currentTarget.value })}
+            />
+          </SimpleGrid>
+          <SimpleGrid cols={2}>
+            <TextInput
+              label="Iparág"
+              placeholder="pl. Fogászat, Építőipar..."
+              value={newLead.industry}
+              onChange={(e) => setNewLead({ ...newLead, industry: e.currentTarget.value })}
+            />
+            <TextInput
+              label="Város / Lokáció"
+              placeholder="Budapest"
+              value={newLead.location}
+              onChange={(e) => setNewLead({ ...newLead, location: e.currentTarget.value })}
+            />
+          </SimpleGrid>
+          <Textarea
+            label="Jegyzet (opcionális)"
+            minRows={2}
+            value={newLead.notes}
+            onChange={(e) => setNewLead({ ...newLead, notes: e.currentTarget.value })}
+          />
+          <Switch
+            label="Azonnali weboldal-audit és okosűrlap-értékelés futtatása mentéskor"
+            checked={newLead.runAudit}
+            onChange={(e) => setNewLead({ ...newLead, runAudit: e.currentTarget.checked })}
+          />
+          <Group justify="flex-end" mt="xs">
+            <Button variant="default" onClick={() => setCreateLeadOpen(false)}>
+              Mégse
+            </Button>
+            <Button loading={creatingLead} onClick={handleCreateManualLead}>
+              Lead mentése
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
     </Box>
   );
 }

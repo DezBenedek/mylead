@@ -4,6 +4,7 @@ import {
   Badge,
   Box,
   Button,
+  Checkbox,
   Divider,
   Group,
   Modal,
@@ -319,6 +320,7 @@ export function SettingsPage({
         <Tabs defaultValue="email">
           <Tabs.List mb="md">
             <Tabs.Tab value="email">E-mail küldés (SMTP / Amazon SES) & IMAP</Tabs.Tab>
+            <Tabs.Tab value="autoreply">Auto-válasz & Személyreszabás</Tabs.Tab>
             <Tabs.Tab value="ai">AI Modell & Szövegírás</Tabs.Tab>
             <Tabs.Tab value="discovery">Google Maps / Keresési API-k</Tabs.Tab>
             <Tabs.Tab value="suppression">Tiltólista ({suppressions.length})</Tabs.Tab>
@@ -451,6 +453,166 @@ export function SettingsPage({
                     </Table.Tbody>
                   </Table>
                 )}
+              </Paper>
+            </Stack>
+          </Tabs.Panel>
+
+          {/* Auto-Reply & Customization */}
+          <Tabs.Panel value="autoreply">
+            <Stack gap="md" maw={860}>
+              <Paper p="md">
+                <Stack gap="sm">
+                  <Text fw={600} size="sm">
+                    Automatikus AI válasz időzítése (Munkaidő & Véletlen késleltetés)
+                  </Text>
+                  <Text size="xs" c="dimmed">
+                    Beérkező kérdés vagy érdeklődés esetén az AI automatikusan legenerálja a választ,
+                    és a beállított munkaidőn belül véletlenszerűen időzíti a kiküldést. Minden
+                    időzített válasz a Beérkező oldalon egy kattintással megállítható, átírható vagy
+                    AI megjegyzéssel módosítható.
+                  </Text>
+
+                  <Switch
+                    label="AI automatikus válaszgenerálás és időzítés engedélyezése"
+                    checked={form.autoReplyEnabled}
+                    onChange={(e) =>
+                      setForm({ ...form, autoReplyEnabled: e.currentTarget.checked })
+                    }
+                  />
+
+                  <Box>
+                    <Text size="xs" fw={500} mb={6}>
+                      Munkanapok (alapértelmezett: Hétfő–Szombat)
+                    </Text>
+                    <Group gap="md">
+                      {[
+                        { day: 1, label: "Hétfő" },
+                        { day: 2, label: "Kedd" },
+                        { day: 3, label: "Szerda" },
+                        { day: 4, label: "Csütörtök" },
+                        { day: 5, label: "Péntek" },
+                        { day: 6, label: "Szombat" },
+                        { day: 7, label: "Vasárnap" },
+                      ].map((w) => {
+                        const checked = (form.autoReplyWorkdays || [1, 2, 3, 4, 5, 6]).includes(w.day);
+                        return (
+                          <Checkbox
+                            key={w.day}
+                            label={w.label}
+                            checked={checked}
+                            onChange={(e) => {
+                              const cur = form.autoReplyWorkdays || [1, 2, 3, 4, 5, 6];
+                              const next = e.currentTarget.checked
+                                ? [...cur, w.day].sort()
+                                : cur.filter((d) => d !== w.day);
+                              setForm({ ...form, autoReplyWorkdays: next });
+                            }}
+                          />
+                        );
+                      })}
+                    </Group>
+                  </Box>
+
+                  <SimpleGrid cols={{ base: 2, sm: 4 }}>
+                    <NumberInput
+                      label="Munkaidő kezdete (óra)"
+                      min={0}
+                      max={22}
+                      value={form.autoReplyStartHour}
+                      onChange={(v) => setForm({ ...form, autoReplyStartHour: Number(v) || 8 })}
+                    />
+                    <NumberInput
+                      label="Munkaidő vége (óra)"
+                      min={1}
+                      max={24}
+                      value={form.autoReplyEndHour}
+                      onChange={(v) => setForm({ ...form, autoReplyEndHour: Number(v) || 18 })}
+                    />
+                    <NumberInput
+                      label="Min. késleltetés (perc)"
+                      min={1}
+                      max={720}
+                      value={form.autoReplyMinDelayMin}
+                      onChange={(v) => setForm({ ...form, autoReplyMinDelayMin: Number(v) || 20 })}
+                    />
+                    <NumberInput
+                      label="Max. késleltetés (perc)"
+                      min={5}
+                      max={1440}
+                      value={form.autoReplyMaxDelayMin}
+                      onChange={(v) => setForm({ ...form, autoReplyMaxDelayMin: Number(v) || 120 })}
+                    />
+                  </SimpleGrid>
+
+                  <SimpleGrid cols={{ base: 1, sm: 3 }}>
+                    <NumberInput
+                      label="IMAP automatikus ellenőrzés (perc, 0 = ki)"
+                      min={0}
+                      max={120}
+                      value={form.imapPollMinutes}
+                      onChange={(v) => setForm({ ...form, imapPollMinutes: Number(v) || 0 })}
+                    />
+                    <Select
+                      label="Alapértelmezett kampány hangnem"
+                      value={form.defaultTone || "professional_formal"}
+                      onChange={(v) => setForm({ ...form, defaultTone: v || "professional_formal" })}
+                      data={[
+                        { value: "professional_formal", label: "Szakmai, magázódó" },
+                        { value: "friendly_direct", label: "Közvetlen, tegeződő" },
+                        { value: "concise_executive", label: "Tömör, vezetői" },
+                      ]}
+                    />
+                    <NumberInput
+                      label="Alapértelmezett napi limit"
+                      min={1}
+                      max={500}
+                      value={form.defaultDailyLimit || 35}
+                      onChange={(v) => setForm({ ...form, defaultDailyLimit: Number(v) || 35 })}
+                    />
+                  </SimpleGrid>
+
+                  <Switch
+                    label="Háttér auto-válasz teszt (szimulált) módban fusson éles SMTP helyett"
+                    checked={form.autoReplyDefaultDryRun}
+                    onChange={(e) =>
+                      setForm({ ...form, autoReplyDefaultDryRun: e.currentTarget.checked })
+                    }
+                  />
+                </Stack>
+              </Paper>
+
+              <Paper p="md">
+                <Stack gap="sm">
+                  <Text fw={600} size="sm">
+                    AI Elemzési fókusz (Okosűrlap) & Válasz-szabályok személyreszabása
+                  </Text>
+                  <Textarea
+                    label="Lead-elemzési fókusz (mit értékeljen az AI minden egyes cégnél)"
+                    description="Ezt használja a rendszer minden weboldal-audit és mély kutatás során a nagyságrendi áttekintés elkészítéséhez."
+                    minRows={3}
+                    value={form.aiAnalysisFocus || ""}
+                    onChange={(e) => setForm({ ...form, aiAnalysisFocus: e.currentTarget.value })}
+                  />
+                  <Textarea
+                    label="Globális AI auto-válasz instrukciók / szabályok"
+                    description="Pl. kommunikációs stílus, garanciák, mikor ajánljon hívást, mit ne ígérjen meg."
+                    minRows={3}
+                    placeholder="pl. Válaszolj barátságosan, mindig konkrétan a feltett kérdésre, és röviden emeld ki, hogy az okosűrlap 1 nap alatt beüzemelhető."
+                    value={form.aiReplyInstructions || ""}
+                    onChange={(e) =>
+                      setForm({ ...form, aiReplyInstructions: e.currentTarget.value })
+                    }
+                  />
+                  <Group justify="flex-end" mt="xs">
+                    <Button
+                      leftSection={<IconCheck size={15} />}
+                      loading={saving}
+                      onClick={handleSaveSettings}
+                    >
+                      Személyreszabás mentése
+                    </Button>
+                  </Group>
+                </Stack>
               </Paper>
             </Stack>
           </Tabs.Panel>
