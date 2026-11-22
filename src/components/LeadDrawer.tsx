@@ -39,6 +39,8 @@ interface Props {
   lead: Lead | null;
   projects: Project[];
   liveWorker?: SearchLiveEvent | null;
+  isEnriching?: boolean;
+  onEnrichLead?: (leadId: string) => void;
   onClose: () => void;
   onUpdated: (lead: Lead) => void;
   onDeleted?: (leadId: string) => void;
@@ -51,6 +53,8 @@ export function LeadDrawer({
   lead,
   projects,
   liveWorker,
+  isEnriching = false,
+  onEnrichLead,
   onClose,
   onUpdated,
   onDeleted,
@@ -67,7 +71,6 @@ export function LeadDrawer({
   const [employeeEst, setEmployeeEst] = useState("");
   const [notes, setNotes] = useState("");
   const [saving, setSaving] = useState(false);
-  const [enriching, setEnriching] = useState(false);
 
   useEffect(() => {
     if (lead) {
@@ -80,7 +83,7 @@ export function LeadDrawer({
       setEmployeeEst(lead.employeeEstimate);
       setNotes(lead.notes);
     }
-  }, [lead]);
+  }, [lead?.id]);
 
   if (!lead) return null;
 
@@ -109,23 +112,14 @@ export function LeadDrawer({
     }
   };
 
-  const handleDeepEnrich = async () => {
-    setEnriching(true);
-    try {
-      const [updated] = await api.enrichLeads([lead.id], projects[0]?.id || null);
-      if (updated) {
-        onUpdated(updated);
-        notifications.show({
-          title: "Mély adatlap frissítve",
-          message: `${updated.companyName} — Fit Score: ${updated.fitScore}/100`,
-          color: "forest",
-        });
-      }
-    } catch (e) {
-      notifications.show({ title: "Gazdagítási hiba", message: String(e), color: "red" });
-    } finally {
-      setEnriching(false);
+  const handleDeepEnrich = () => {
+    if (onEnrichLead) {
+      onEnrichLead(lead.id);
+      return;
     }
+    api.enrichLeads([lead.id], projects[0]?.id || null).then(([updated]) => {
+      if (updated) onUpdated(updated);
+    });
   };
 
   const scoreClass =
@@ -266,7 +260,7 @@ export function LeadDrawer({
             size="xs"
             variant="filled"
             leftSection={<IconRefresh size={14} />}
-            loading={enriching}
+            loading={isEnriching}
             onClick={handleDeepEnrich}
           >
             Mély adatlap gazdagítása

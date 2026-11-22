@@ -20,6 +20,7 @@ pub fn seed_demo_workspace(db: &Database) -> Result<(), String> {
         description: "Automatizált online időpontfoglaló, SMS emlékeztető és páciens-visszahívó rendszer magánklinikáknak, fogászatoknak és szépségszalonoknak.".to_string(),
         booking_url: "https://cal.com/foglaljpro/15perc-demo".to_string(),
         landing_url: "https://foglaljpro.hu/klinikaknak".to_string(),
+        email_signature: Some("Üdvözlettel,\nKovács Márton\nFoglaljPro • foglaljpro.hu".to_string()),
         value_proposition: Some("38%-kal kevesebb lemondott időpont és 0–24 órás online páciensfoglalás telefonos recepció-terhelés nélkül.".to_string()),
         target_audience: Some("5–50 fős magán fogászati klinikák, esztétikai rendelők és orvosi központok Magyarországon.".to_string()),
         pain_points_solved: Some(vec![
@@ -400,6 +401,9 @@ pub fn seed_demo_workspace(db: &Database) -> Result<(), String> {
         follow_up_days: 3,
         include_booking_link: false,
         custom_instructions: "Hivatkozz a konkrét weboldal-audit megállapításokra, kerüld a túlzó reklámszöveget.".to_string(),
+        offer_summary: "30 napos ingyenes próba + 25% kedvezmény az első félévre".to_string(),
+        offer_timing: "on_interest".to_string(),
+        offer_delivery: "Csak akkor ajánld fel a 25% kedvezményt, ha valódi érdeklődést mutat a megoldás iránt a válaszában!".to_string(),
         lead_ids: vec![],
     })?;
     db.update_campaign_status(&camp.id, "active")?;

@@ -85,13 +85,97 @@ body,
 
 .ml-page-header {
   border-bottom: 1px solid var(--ml-border);
-  padding: 18px 28px 16px;
+  padding: 12px 22px;
   background-color: var(--ml-surface);
 }
 
 .ml-page-body {
-  padding: 22px 28px 36px;
-  max-width: 1440px;
+  padding: 16px 22px 28px;
+  max-width: 1480px;
+}
+
+/* Crisp, clearly separated Select / MultiSelect / Menu / Popover dropdowns */
+.mantine-Combobox-dropdown,
+.mantine-Menu-dropdown,
+.mantine-Popover-dropdown {
+  background-color: var(--ml-surface) !important;
+  border: 1px solid var(--ml-border-strong) !important;
+  box-shadow: 0 12px 30px rgba(24, 24, 27, 0.14), 0 2px 6px rgba(24, 24, 27, 0.06) !important;
+  padding: 6px !important;
+  border-radius: 7px !important;
+}
+
+[data-mantine-color-scheme="dark"] .mantine-Combobox-dropdown,
+[data-mantine-color-scheme="dark"] .mantine-Menu-dropdown,
+[data-mantine-color-scheme="dark"] .mantine-Popover-dropdown {
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.55), 0 2px 8px rgba(0, 0, 0, 0.35) !important;
+}
+
+.mantine-Combobox-options {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mantine-Combobox-option {
+  padding: 8px 10px !important;
+  border-radius: 5px !important;
+  font-size: 13px !important;
+  line-height: 1.35 !important;
+  border-bottom: 1px solid var(--ml-border);
+  transition: background-color 100ms ease, color 100ms ease;
+}
+
+.mantine-Combobox-option:last-child {
+  border-bottom: none;
+}
+
+.mantine-Combobox-option:hover,
+.mantine-Combobox-option[data-combobox-active="true"] {
+  background-color: rgba(22, 101, 52, 0.09) !important;
+  color: var(--ml-ink) !important;
+}
+
+.mantine-Combobox-option[data-combobox-selected="true"] {
+  background-color: rgba(22, 101, 52, 0.14) !important;
+  color: #166534 !important;
+  font-weight: 600;
+}
+
+[data-mantine-color-scheme="dark"] .mantine-Combobox-option:hover,
+[data-mantine-color-scheme="dark"] .mantine-Combobox-option[data-combobox-active="true"] {
+  background-color: rgba(74, 222, 128, 0.12) !important;
+}
+
+[data-mantine-color-scheme="dark"] .mantine-Combobox-option[data-combobox-selected="true"] {
+  background-color: rgba(74, 222, 128, 0.18) !important;
+  color: #86efac !important;
+}
+
+.mantine-Combobox-group {
+  padding-bottom: 4px;
+}
+
+.mantine-Combobox-groupLabel {
+  background-color: var(--ml-canvas) !important;
+  color: var(--ml-ink-subtle) !important;
+  font-size: 10.5px !important;
+  font-weight: 700 !important;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 5px 8px !important;
+  margin: 4px 0 3px !important;
+  border-radius: 4px;
+}
+
+.mantine-Menu-item {
+  padding: 7px 10px !important;
+  font-size: 12.5px !important;
+  border-radius: 5px !important;
+}
+
+.mantine-Menu-item:hover {
+  background-color: rgba(22, 101, 52, 0.09) !important;
 }
 
 .ml-kpi-card {

@@ -5,12 +5,13 @@ import {
   Box,
   Button,
   Divider,
-  Grid,
   Group,
+  Loader,
   Modal,
   MultiSelect,
   NumberInput,
   Paper,
+  Progress,
   SegmentedControl,
   Select,
   SimpleGrid,
@@ -24,21 +25,23 @@ import {
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import {
+  IconArrowLeft,
   IconCheck,
+  IconChevronRight,
   IconEdit,
-  IconPlayerPlay,
+  IconMail,
   IconPlus,
   IconRefresh,
   IconSend,
   IconSettings,
   IconTag,
-  IconTestPipe,
   IconTrash,
   IconUserPlus,
   IconWand,
 } from "@tabler/icons-react";
 import { api, formatShortDate } from "../lib/api";
 import type {
+  AppSettings,
   Campaign,
   EmailMessage,
   Lead,
@@ -53,10 +56,22 @@ interface Props {
   searches: SearchJob[];
   senderAccounts: SenderAccount[];
   leads: Lead[];
+  settings?: AppSettings;
   prefillSearch: SearchJob | null;
   prefillLeadIds: string[];
   onClearPrefill: () => void;
   onRefresh: () => Promise<void>;
+}
+
+const OFFER_TIMING_OPTIONS = [
+  { value: "on_interest", label: "Csak valódi érdeklődésnél (válaszban)" },
+  { value: "first_email", label: "Már az első hideg levélben" },
+  { value: "on_objection", label: "Csak árkérdés / kifogás esetén" },
+  { value: "custom", label: "Egyedi szabály szerint" },
+];
+
+function offerTimingLabel(timing: string): string {
+  return OFFER_TIMING_OPTIONS.find((o) => o.value === timing)?.label || "Érdeklődésnél";
 }
 
 export function CampaignsPage({
@@ -65,26 +80,14 @@ export function CampaignsPage({
   searches,
   senderAccounts,
   leads,
+  settings,
   prefillSearch,
   prefillLeadIds,
   onClearPrefill,
   onRefresh,
 }: Props) {
-  // Flatten all Offers across all projects so Campaigns are Offer-driven (not Project-driven!)
-  const allOffers = useMemo(
-    () =>
-      projects.flatMap((p) =>
-        p.offers.map((o) => ({
-          ...o,
-          projectName: p.name,
-        }))
-      ),
-    [projects]
-  );
-
-  const [selectedCampaignId, setSelectedCampaignId] = useState<string | null>(
-    campaigns[0]?.id ?? null
-  );
+  // Default to null so the user sees the compact vertical campaign list first; clicking a campaign opens it full-page!
+  const [selectedCampaignId, setSelectedCampaignId] = useState<string | null>(null);
   const [messages, setMessages] = useState<EmailMessage[]>([]);
   const [createOpen, setCreateOpen] = useState(false);
   const [audienceMode, setAudienceMode] = useState<"search" | "manual" | "min_score">("manual");
@@ -95,13 +98,16 @@ export function CampaignsPage({
   const [editCampForm, setEditCampForm] = useState({
     id: "",
     name: "",
-    offerId: "",
+    projectId: "",
     senderAccountId: "",
     tone: "professional_formal",
     autoReplyMode: "draft",
     dailyLimit: 35,
     includeBookingLink: false,
     customInstructions: "",
+    offerSummary: "",
+    offerTiming: "on_interest",
+    offerDelivery: "",
   });
 
   // Add leads manually to existing campaign modal
@@ -117,13 +123,19 @@ export function CampaignsPage({
   const [rewriteNote, setRewriteNote] = useState("");
   const [rewritingDraft, setRewritingDraft] = useState(false);
 
+  // Bulk campaign regeneration with feedback modal ("mi a bajom az emailekkel")
+  const [regenModalOpen, setRegenModalOpen] = useState(false);
+  const [regenCampaignId, setRegenCampaignId] = useState<string | null>(null);
+  const [regenFeedback, setRegenFeedback] = useState("");
+  const [regenSaveToCampaign, setRegenSaveToCampaign] = useState(true);
+  const [startingRegen, setStartingRegen] = useState(false);
+
   const [creating, setCreating] = useState(false);
   const [sending, setSending] = useState(false);
 
   const [form, setForm] = useState({
     name: "",
-    offerId: allOffers[0]?.id || "",
-    projectId: allOffers[0]?.projectId || projects[0]?.id || "",
+    projectId: projects[0]?.id || "",
     searchId: "",
     senderAccountId: senderAccounts.find((a) => a.isDefault)?.id || senderAccounts[0]?.id || "",
     tone: "professional_formal",
@@ -134,20 +146,21 @@ export function CampaignsPage({
     followUpDays: 3,
     includeBookingLink: false,
     customInstructions: "",
+    offerSummary: "",
+    offerTiming: "on_interest",
+    offerDelivery: "",
     leadIds: [] as string[],
   });
 
   const selectedCampaign =
-    campaigns.find((c) => c.id === selectedCampaignId) ?? campaigns[0] ?? null;
+    campaigns.find((c) => c.id === selectedCampaignId) ?? null;
 
   useEffect(() => {
     if (prefillSearch) {
-      const matchedOffer = allOffers.find((o) => o.id === prefillSearch.offerId) || allOffers[0];
       setAudienceMode("search");
       setForm({
         name: `${prefillSearch.name} — Kampány`,
-        offerId: matchedOffer?.id || "",
-        projectId: matchedOffer?.projectId || prefillSearch.projectId,
+        projectId: prefillSearch.projectId || projects[0]?.id || "",
         searchId: prefillSearch.id,
         senderAccountId:
           senderAccounts.find((a) => a.isDefault)?.id || senderAccounts[0]?.id || "",
@@ -159,17 +172,18 @@ export function CampaignsPage({
         followUpDays: 3,
         includeBookingLink: false,
         customInstructions: "",
+        offerSummary: "",
+        offerTiming: "on_interest",
+        offerDelivery: "",
         leadIds: [],
       });
       setCreateOpen(true);
       onClearPrefill();
     } else if (prefillLeadIds.length > 0) {
-      const firstOffer = allOffers[0];
       setAudienceMode("manual");
       setForm({
-        name: `${firstOffer ? firstOffer.title : "Ajánlat"} kampány (${prefillLeadIds.length} cég)`,
-        offerId: firstOffer?.id || "",
-        projectId: firstOffer?.projectId || projects[0]?.id || "",
+        name: `Kampány (${prefillLeadIds.length} cég)`,
+        projectId: projects[0]?.id || "",
         searchId: "",
         senderAccountId:
           senderAccounts.find((a) => a.isDefault)?.id || senderAccounts[0]?.id || "",
@@ -181,6 +195,9 @@ export function CampaignsPage({
         followUpDays: 3,
         includeBookingLink: false,
         customInstructions: "",
+        offerSummary: "",
+        offerTiming: "on_interest",
+        offerDelivery: "",
         leadIds: prefillLeadIds,
       });
       setCreateOpen(true);
@@ -205,13 +222,40 @@ export function CampaignsPage({
     }
   }, [selectedCampaign?.id, campaigns]);
 
+  // Live listener: refresh campaign messages whenever a background AI generator thread finishes an email!
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    api
+      .onCampaignUpdated(() => {
+        if (selectedCampaignId) {
+          loadMessages(selectedCampaignId);
+        }
+      })
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch(() => {});
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [selectedCampaignId]);
+
+  // Keep open Email Dialog live-synced if it was opened while status === "generating"
+  useEffect(() => {
+    if (!editingMsg) return;
+    const latest = messages.find((m) => m.id === editingMsg.id);
+    if (latest && editingMsg.status === "generating" && latest.status !== "generating") {
+      setEditingMsg(latest);
+      setEditSubject(latest.subject);
+      setEditBody(latest.body);
+    }
+  }, [messages, editingMsg]);
+
   const openNewCampaign = () => {
-    const firstOffer = allOffers[0];
     setAudienceMode(searches.length > 0 ? "search" : "manual");
     setForm({
       name: "",
-      offerId: firstOffer?.id || "",
-      projectId: firstOffer?.projectId || projects[0]?.id || "",
+      projectId: projects[0]?.id || "",
       searchId: searches[0]?.id || "",
       senderAccountId:
         senderAccounts.find((a) => a.isDefault)?.id || senderAccounts[0]?.id || "",
@@ -223,6 +267,9 @@ export function CampaignsPage({
       followUpDays: 3,
       includeBookingLink: false,
       customInstructions: "",
+      offerSummary: "",
+      offerTiming: "on_interest",
+      offerDelivery: "",
       leadIds: [],
     });
     setCreateOpen(true);
@@ -253,21 +300,15 @@ export function CampaignsPage({
   }, [audienceMode, form.leadIds, form.searchId, leads, resolvedLeadIdsForCreate]);
 
   const handleCreateCampaign = async () => {
-    const selectedOffer = allOffers.find((o) => o.id === form.offerId);
-    const resolvedProjectId = selectedOffer?.projectId || form.projectId || projects[0]?.id || "";
-
+    const resolvedProjectId = form.projectId || projects[0]?.id || "";
     if (!form.name.trim()) {
-      notifications.show({
-        title: "Hiányzó adat",
-        message: "Add meg a kampány nevét!",
-        color: "red",
-      });
+      notifications.show({ title: "Add meg a kampány nevét!", message: "", color: "red" });
       return;
     }
     if (!resolvedProjectId) {
       notifications.show({
-        title: "Ajánlat szükséges",
-        message: "Hozz létre legalább egy Ajánlatot a Projektek & Ajánlatok menüben!",
+        title: "Projekt szükséges",
+        message: "Hozz létre legalább egy Projektet a Projektek menüben!",
         color: "orange",
       });
       return;
@@ -277,7 +318,7 @@ export function CampaignsPage({
       const created = await api.createCampaignWithDrafts({
         name: form.name.trim(),
         projectId: resolvedProjectId,
-        offerId: form.offerId || null,
+        offerId: null,
         searchId: audienceMode === "search" ? form.searchId || null : null,
         senderAccountId: form.senderAccountId || null,
         tone: form.tone,
@@ -288,16 +329,21 @@ export function CampaignsPage({
         followUpDays: form.followUpDays,
         includeBookingLink: form.includeBookingLink,
         customInstructions: form.customInstructions,
+        offerSummary: form.offerSummary.trim(),
+        offerTiming: form.offerTiming,
+        offerDelivery: form.offerDelivery.trim(),
         leadIds: audienceMode === "search" ? [] : resolvedLeadIdsForCreate,
       });
-      await onRefresh();
-      setSelectedCampaignId(created.id);
+      // Close modal immediately and notify that parallel background AI generation is running!
       setCreateOpen(false);
+      setSelectedCampaignId(created.id);
       notifications.show({
-        title: "Ajánlat-kampány elkészült",
-        message: `${created.totalRecipients} személyre szabott levél készült el.`,
+        title: "Kampány létrehozva — AI levélírás folyamatban!",
+        message: `${created.totalRecipients} személyre szabott levél párhuzamos generálása már fut a háttérben (4 szálon).`,
         color: "forest",
       });
+      await onRefresh();
+      await loadMessages(created.id);
     } catch (e) {
       notifications.show({ title: "Hiba", message: String(e), color: "red" });
     } finally {
@@ -309,13 +355,16 @@ export function CampaignsPage({
     setEditCampForm({
       id: c.id,
       name: c.name,
-      offerId: c.offerId || "",
+      projectId: c.projectId,
       senderAccountId: c.senderAccountId || "",
       tone: c.tone,
       autoReplyMode: c.autoReplyMode,
       dailyLimit: c.dailyLimit,
       includeBookingLink: c.includeBookingLink,
       customInstructions: c.customInstructions,
+      offerSummary: c.offerSummary || c.offerTitle || "",
+      offerTiming: c.offerTiming || "on_interest",
+      offerDelivery: c.offerDelivery || "",
     });
     setEditCampOpen(true);
   };
@@ -325,17 +374,20 @@ export function CampaignsPage({
       await api.updateCampaign({
         id: editCampForm.id,
         name: editCampForm.name.trim(),
-        offerId: editCampForm.offerId || null,
+        projectId: editCampForm.projectId || null,
         senderAccountId: editCampForm.senderAccountId || null,
         tone: editCampForm.tone,
         autoReplyMode: editCampForm.autoReplyMode,
         dailyLimit: editCampForm.dailyLimit,
         includeBookingLink: editCampForm.includeBookingLink,
         customInstructions: editCampForm.customInstructions,
+        offerSummary: editCampForm.offerSummary.trim(),
+        offerTiming: editCampForm.offerTiming,
+        offerDelivery: editCampForm.offerDelivery.trim(),
       });
       await onRefresh();
       setEditCampOpen(false);
-      notifications.show({ title: "Kampány beállításai mentve", message: "", color: "forest" });
+      notifications.show({ title: "Kampány & ajánlat mentve", message: "", color: "forest" });
     } catch (e) {
       notifications.show({ title: "Hiba", message: String(e), color: "red" });
     }
@@ -345,20 +397,60 @@ export function CampaignsPage({
     if (!selectedCampaign || addLeadIds.length === 0) return;
     setAddingLeads(true);
     try {
+      const count = addLeadIds.length;
       await api.addLeadsToCampaign(selectedCampaign.id, addLeadIds, addGenerateDrafts);
-      await onRefresh();
-      await loadMessages(selectedCampaign.id);
       setAddLeadsOpen(false);
       setAddLeadIds([]);
       notifications.show({
-        title: "Leadek hozzáadva",
-        message: "Az új cégek bekerültek a kampányba.",
+        title: addGenerateDrafts
+          ? "Leadek hozzáadva — párhuzamos AI levélírás indult!"
+          : "Leadek hozzáadva",
+        message: addGenerateDrafts
+          ? `${count} új cég személyre szabott levelét több szálon írja az AI a háttérben.`
+          : "Az új cégek bekerültek a kampányba.",
         color: "forest",
       });
+      await onRefresh();
+      await loadMessages(selectedCampaign.id);
     } catch (e) {
       notifications.show({ title: "Hiba", message: String(e), color: "red" });
     } finally {
       setAddingLeads(false);
+    }
+  };
+
+  const openBulkRegenModal = (campaignId: string) => {
+    setRegenCampaignId(campaignId);
+    setRegenFeedback("");
+    setRegenSaveToCampaign(true);
+    setRegenModalOpen(true);
+  };
+
+  const handleConfirmBulkRegenerate = async () => {
+    const targetId = regenCampaignId || selectedCampaign?.id;
+    if (!targetId) return;
+    setStartingRegen(true);
+    try {
+      const note = regenFeedback.trim();
+      setRegenModalOpen(false);
+      setSelectedCampaignId(targetId);
+      await api.regenerateCampaignDrafts(targetId, note || null, regenSaveToCampaign);
+      await onRefresh();
+      await loadMessages(targetId);
+      notifications.show({
+        title: "Párhuzamos AI újragenerálás elindítva (4 szálon)!",
+        message: note
+          ? `Az AI figyelembe veszi a visszajelzésedet ("${note.slice(0, 70)}${
+              note.length > 70 ? "..." : ""
+            }") és újraírja a kampány leveleit a háttérben.`
+          : "Az AI több szálon újraírja a kampány tervezeteit a háttérben.",
+        color: "forest",
+        autoClose: 6000,
+      });
+    } catch (e) {
+      notifications.show({ title: "Hiba", message: String(e), color: "red" });
+    } finally {
+      setStartingRegen(false);
     }
   };
 
@@ -448,260 +540,328 @@ export function CampaignsPage({
     [leads]
   );
 
+  const openEmailDialog = (m: EmailMessage) => {
+    setEditingMsg(m);
+    setEditSubject(m.subject);
+    setEditBody(m.body);
+    setRewriteNote("");
+  };
+
+  const generatingCount = useMemo(
+    () => messages.filter((m) => m.status === "generating").length,
+    [messages]
+  );
+  const readyCount = useMemo(
+    () => messages.filter((m) => m.status !== "generating").length,
+    [messages]
+  );
+
   return (
     <Box>
-      <Box className="ml-page-header">
-        <Group justify="space-between">
-          <Box>
-            <Title order={3} style={{ letterSpacing: "-0.02em" }}>
-              Kampányok (Ajánlatok szerint)
-            </Title>
-            <Text size="sm" c="dimmed">
-              Ajánlatokra épülő, személyre szabott AI e-mail kampányok manuális lead-hozzáadással és
-              SMTP / Amazon SES küldéssel.
-            </Text>
-          </Box>
-          <Button leftSection={<IconPlus size={15} />} onClick={openNewCampaign}>
-            Új ajánlat-kampány
-          </Button>
-        </Group>
-      </Box>
-
-      <Box className="ml-page-body">
-        {campaigns.length === 0 ? (
-          <Paper p="xl">
-            <Stack gap="sm" maw={560}>
-              <Title order={4}>Még nincs e-mail kampány</Title>
-              <Text size="sm" c="dimmed">
-                Válassz egy konkrét ajánlatot és add hozzá a célcégeket keresésből, Fit Score
-                alapján vagy kézzel — a rendszer minden cégnek egyedi levelet ír.
-              </Text>
-              <Group>
-                <Button leftSection={<IconPlus size={15} />} onClick={openNewCampaign}>
-                  Első ajánlat-kampány létrehozása
+      {/* ==================== FULL-PAGE CAMPAIGN DETAIL VIEW ==================== */}
+      {selectedCampaign ? (
+        <>
+          <Box className="ml-page-header">
+            <Group justify="space-between" align="center" wrap="wrap" gap="sm">
+              <Group gap="sm" align="center" wrap="nowrap" style={{ minWidth: 0, flex: 1 }}>
+                <Button
+                  size="xs"
+                  variant="default"
+                  leftSection={<IconArrowLeft size={14} />}
+                  onClick={() => setSelectedCampaignId(null)}
+                  style={{ flexShrink: 0 }}
+                >
+                  Kampányok
                 </Button>
+                <Box style={{ minWidth: 0 }}>
+                  <Group gap={8} wrap="nowrap">
+                    <Title order={4} lineClamp={1} style={{ letterSpacing: "-0.02em" }}>
+                      {selectedCampaign.name}
+                    </Title>
+                    <Badge
+                      size="sm"
+                      color={
+                        generatingCount > 0
+                          ? "blue"
+                          : selectedCampaign.status === "active"
+                          ? "green"
+                          : "gray"
+                      }
+                      style={{ flexShrink: 0 }}
+                    >
+                      {generatingCount > 0
+                        ? `AI írja (${readyCount}/${messages.length})`
+                        : selectedCampaign.status === "active"
+                        ? "Aktív"
+                        : "Tervezet"}
+                    </Badge>
+                  </Group>
+                  <Text size="xs" c="dimmed" truncate mt={1}>
+                    Projekt: <strong>{selectedCampaign.projectName}</strong> • Küldő:{" "}
+                    <strong>{selectedCampaign.senderName || "Nincs kiválasztva"}</strong> • Limit:{" "}
+                    <strong>{selectedCampaign.dailyLimit} levél/nap</strong>
+                  </Text>
+                </Box>
               </Group>
-            </Stack>
-          </Paper>
-        ) : (
-          <Grid gutter="md">
-            {/* Campaign List */}
-            <Grid.Col span={{ base: 12, md: 4 }}>
-              <Stack gap="xs">
-                <Text className="ml-section-label">Kampányok ({campaigns.length})</Text>
-                {campaigns.map((c) => {
-                  const active = selectedCampaign?.id === c.id;
-                  return (
-                    <Paper
-                      key={c.id}
-                      p="sm"
-                      onClick={() => setSelectedCampaignId(c.id)}
-                      style={{
-                        cursor: "pointer",
-                        borderColor: active ? "#166534" : undefined,
+
+              <Group gap={8} wrap="nowrap">
+                <Button
+                  size="xs"
+                  variant="default"
+                  leftSection={<IconSettings size={14} />}
+                  onClick={() => openEditCampaign(selectedCampaign)}
+                >
+                  Beállítások
+                </Button>
+                <Button
+                  size="xs"
+                  variant="light"
+                  color="forest"
+                  leftSection={<IconWand size={14} />}
+                  disabled={messages.length === 0 || generatingCount > 0}
+                  onClick={() => openBulkRegenModal(selectedCampaign.id)}
+                >
+                  Újragenerálás (AI)
+                </Button>
+                <Button
+                  size="xs"
+                  color="forest"
+                  leftSection={<IconSend size={14} />}
+                  loading={sending}
+                  disabled={readyCount === 0}
+                  onClick={() => handleSendCampaign(false)}
+                >
+                  Kampány kiküldése ({readyCount})
+                </Button>
+                <ActionIcon
+                  variant="subtle"
+                  color="red"
+                  size="md"
+                  title="Kampány törlése"
+                  onClick={() => handleDeleteCampaign(selectedCampaign.id)}
+                >
+                  <IconTrash size={15} />
+                </ActionIcon>
+              </Group>
+            </Group>
+          </Box>
+
+          <Box className="ml-page-body">
+            <Stack gap="sm">
+              {/* Live Multi-Threaded AI Generation Progress Banner */}
+              {generatingCount > 0 && (
+                <Paper p="sm" px="md" style={{ borderColor: "#166534" }}>
+                  <Group justify="space-between" mb={6}>
+                    <Group gap={8}>
+                      <Loader size={14} color="forest" />
+                      <Text size="sm" fw={600}>
+                        Párhuzamos AI levélírás folyamatban (4 szálon egyszerre)...
+                      </Text>
+                    </Group>
+                    <Badge color="forest" variant="filled" className="ml-tabular">
+                      {readyCount} / {messages.length} levél kész ({generatingCount} hátravan)
+                    </Badge>
+                  </Group>
+                  <Progress
+                    value={
+                      messages.length > 0
+                        ? Math.max(6, Math.round((readyCount / messages.length) * 100))
+                        : 100
+                    }
+                    animated
+                    color="forest"
+                    size="sm"
+                  />
+                  <Text size="xs" c="dimmed" mt={5}>
+                    A levelek a háttérben íródnak (akár az alkalmazás újraindítása után is
+                    folytatódnak). Kattints bármelyik elkészült címzettre a levél megnyitásához!
+                  </Text>
+                </Paper>
+              )}
+
+              {/* KPI Strip */}
+              <SimpleGrid cols={{ base: 2, sm: 4 }} spacing="sm">
+                <Box className="ml-kpi-card">
+                  <Text className="ml-section-label">Címzettek</Text>
+                  <Text size="xl" fw={700} className="ml-tabular">
+                    {selectedCampaign.totalRecipients}
+                  </Text>
+                  <Text size="xs" c="dimmed">
+                    {generatingCount > 0
+                      ? `${readyCount} kész • ${generatingCount} készül`
+                      : "Minden levél elkészült"}
+                  </Text>
+                </Box>
+                <Box className="ml-kpi-card">
+                  <Text className="ml-section-label">Elküldve</Text>
+                  <Text size="xl" fw={700} className="ml-tabular">
+                    {selectedCampaign.sentCount}
+                  </Text>
+                  <Text size="xs" c="dimmed">
+                    Napi limit: {selectedCampaign.dailyLimit}
+                  </Text>
+                </Box>
+                <Box className="ml-kpi-card">
+                  <Text className="ml-section-label">Beérkezett válaszok</Text>
+                  <Text size="xl" fw={700} className="ml-tabular" c="forest.9">
+                    {selectedCampaign.replyCount}
+                  </Text>
+                  <Text size="xs" c="dimmed">
+                    Pozitív: {selectedCampaign.positiveCount}
+                  </Text>
+                </Box>
+                <Box className="ml-kpi-card">
+                  <Text className="ml-section-label">Időpontfoglalások</Text>
+                  <Text size="xl" fw={700} className="ml-tabular" c="forest.9">
+                    {selectedCampaign.bookedCount}
+                  </Text>
+                  <Text size="xs" c="dimmed">
+                    Konvertált érdeklődők
+                  </Text>
+                </Box>
+              </SimpleGrid>
+
+              {/* Clean, Dedicated Offer & AI Instructions Summary Bar */}
+              <Paper p="xs" px="md" style={{ backgroundColor: "var(--ml-canvas)" }}>
+                <Group justify="space-between" wrap="nowrap" gap="md">
+                  <Group gap="xs" wrap="wrap" style={{ minWidth: 0, flex: 1 }}>
+                    <Badge
+                      size="xs"
+                      color="forest"
+                      variant="light"
+                      leftSection={<IconTag size={10} />}
+                    >
+                      {offerTimingLabel(selectedCampaign.offerTiming)}
+                    </Badge>
+                    <Text size="xs" fw={600} lineClamp={1} style={{ flex: 1, minWidth: 180 }}>
+                      Ajánlat:{" "}
+                      <Text span fw={400} c="dimmed">
+                        {selectedCampaign.offerSummary ||
+                          selectedCampaign.offerTitle ||
+                          "Nincs külön ajánlat megadva"}
+                      </Text>
+                    </Text>
+                    {selectedCampaign.offerDelivery && (
+                      <Text size="xs" c="dimmed" lineClamp={1}>
+                        • Szabály: {selectedCampaign.offerDelivery}
+                      </Text>
+                    )}
+                  </Group>
+                  <Button
+                    size="compact-xs"
+                    variant="subtle"
+                    color="gray"
+                    leftSection={<IconEdit size={12} />}
+                    onClick={() => openEditCampaign(selectedCampaign)}
+                    style={{ flexShrink: 0 }}
+                  >
+                    Ajánlat szerkesztése
+                  </Button>
+                </Group>
+              </Paper>
+
+              {/* Full-Screen Recipients & Emails Table */}
+              <Paper>
+                <Group
+                  justify="space-between"
+                  p="sm"
+                  px="md"
+                  wrap="wrap"
+                  gap="xs"
+                  style={{ borderBottom: "1px solid var(--ml-border)" }}
+                >
+                  <Box>
+                    <Text fw={600} size="sm">
+                      Címzettek és generált levelek ({messages.length})
+                    </Text>
+                    <Text size="xs" c="dimmed">
+                      Kattints bármelyik cégre a neki írt teljes e-mail megnyitásához és
+                      szerkesztéséhez.
+                    </Text>
+                  </Box>
+                  <Group gap={6}>
+                    <Button
+                      size="xs"
+                      variant="default"
+                      leftSection={<IconUserPlus size={14} />}
+                      onClick={() => {
+                        setAddLeadIds([]);
+                        setAddLeadsOpen(true);
                       }}
                     >
-                      <Group justify="space-between" wrap="nowrap">
-                        <Text size="sm" fw={600} truncate>
-                          {c.name}
-                        </Text>
-                        <Badge size="xs" color={c.status === "active" ? "green" : "gray"}>
-                          {c.status === "active" ? "Aktív" : "Tervezet"}
-                        </Badge>
-                      </Group>
-                      <Group gap={5} mt={4} wrap="nowrap">
-                        <IconTag size={12} color="#166534" />
-                        <Text size="xs" c="forest.9" fw={500} truncate>
-                          {c.offerTitle || "Egyedi ajánlat"}
-                        </Text>
-                      </Group>
-                      <Text size="11px" c="dimmed" mt={2} truncate>
-                        Küldő: {c.senderName || "Nincs küldő fiók"}
-                      </Text>
-                      <Group gap="md" mt={8}>
-                        <Text size="11px" className="ml-tabular">
-                          Címzett: <strong>{c.totalRecipients}</strong>
-                        </Text>
-                        <Text size="11px" className="ml-tabular">
-                          Elküldve: <strong>{c.sentCount}</strong>
-                        </Text>
-                        <Text size="11px" className="ml-tabular" c="forest.9">
-                          Válasz: <strong>{c.replyCount}</strong>
-                        </Text>
-                        <Text size="11px" className="ml-tabular" c="forest.9">
-                          Időpont: <strong>{c.bookedCount}</strong>
-                        </Text>
-                      </Group>
-                    </Paper>
-                  );
-                })}
-              </Stack>
-            </Grid.Col>
+                      + Címzettek hozzáadása
+                    </Button>
+                  </Group>
+                </Group>
 
-            {/* Selected Campaign Details & Messages */}
-            {selectedCampaign && (
-              <Grid.Col span={{ base: 12, md: 8 }}>
-                <Stack gap="md">
-                  <Paper p="md">
-                    <Group justify="space-between" align="flex-start" wrap="wrap" gap="sm">
-                      <Box>
-                        <Title order={4}>{selectedCampaign.name}</Title>
-                        <Group gap="xs" mt={6} wrap="wrap">
-                          <Badge
-                            variant="filled"
-                            color="forest"
-                            leftSection={<IconTag size={11} />}
-                          >
-                            Ajánlat: {selectedCampaign.offerTitle || "Egyedi ajánlat"}
-                          </Badge>
-                          <Badge variant="light" color="gray">
-                            Auto-válasz:{" "}
-                            {selectedCampaign.autoReplyMode === "autopilot"
-                              ? "Időzített AI (Auto)"
-                              : selectedCampaign.autoReplyMode === "draft"
-                              ? "AI + Időzítés / Jóváhagyás"
-                              : "Kézi"}
-                          </Badge>
-                        </Group>
-                      </Box>
-                      <Group gap="xs" wrap="wrap">
-                        <Button
-                          size="xs"
-                          variant="light"
-                          color="forest"
-                          leftSection={<IconUserPlus size={14} />}
-                          onClick={() => {
-                            setAddLeadIds([]);
-                            setAddLeadsOpen(true);
-                          }}
-                        >
-                          Leadek hozzáadása
-                        </Button>
-                        <ActionIcon
-                          variant="default"
-                          size="md"
-                          title="Kampány beállítások szerkesztése"
-                          onClick={() => openEditCampaign(selectedCampaign)}
-                        >
-                          <IconSettings size={15} />
-                        </ActionIcon>
-                        <Button
-                          size="xs"
-                          variant="default"
-                          leftSection={<IconTestPipe size={14} />}
-                          loading={sending}
-                          onClick={() => handleSendCampaign(true)}
-                        >
-                          Szimulált küldés
-                        </Button>
-                        <Button
-                          size="xs"
-                          leftSection={<IconPlayerPlay size={14} />}
-                          loading={sending}
-                          onClick={() => handleSendCampaign(false)}
-                        >
-                          Éles kiküldés
-                        </Button>
-                        <ActionIcon
-                          variant="subtle"
-                          color="red"
-                          onClick={() => handleDeleteCampaign(selectedCampaign.id)}
-                        >
-                          <IconTrash size={15} />
-                        </ActionIcon>
-                      </Group>
-                    </Group>
-
-                    <SimpleGrid cols={4} spacing="xs" mt="md">
-                      <Box className="ml-kpi-card">
-                        <Text className="ml-section-label">Címzettek</Text>
-                        <Text size="lg" fw={700} className="ml-tabular">
-                          {selectedCampaign.totalRecipients}
-                        </Text>
-                      </Box>
-                      <Box className="ml-kpi-card">
-                        <Text className="ml-section-label">Elküldve</Text>
-                        <Text size="lg" fw={700} className="ml-tabular">
-                          {selectedCampaign.sentCount}
-                        </Text>
-                      </Box>
-                      <Box className="ml-kpi-card">
-                        <Text className="ml-section-label">Válaszok</Text>
-                        <Text size="lg" fw={700} className="ml-tabular" c="forest.9">
-                          {selectedCampaign.replyCount}
-                        </Text>
-                      </Box>
-                      <Box className="ml-kpi-card">
-                        <Text className="ml-section-label">Időpontok</Text>
-                        <Text size="lg" fw={700} className="ml-tabular" c="forest.9">
-                          {selectedCampaign.bookedCount}
-                        </Text>
-                      </Box>
-                    </SimpleGrid>
-                  </Paper>
-
-                  <Paper>
-                    <Group
-                      justify="space-between"
-                      p="sm"
-                      style={{ borderBottom: "1px solid var(--ml-border)" }}
+                {messages.length === 0 ? (
+                  <Box p="xl" ta="center">
+                    <Text size="sm" c="dimmed" mb="xs">
+                      Még nincsenek címzettek ebben a kampányban.
+                    </Text>
+                    <Button
+                      size="xs"
+                      variant="default"
+                      leftSection={<IconUserPlus size={14} />}
+                      onClick={() => setAddLeadsOpen(true)}
                     >
-                      <Text fw={600} size="sm">
-                        Személyre szabott levelek ({messages.length})
-                      </Text>
-                      <Text size="xs" c="dimmed">
-                        Kattints a szerkesztésre bármelyik levél kézi vagy AI-alapú átírásához
-                      </Text>
-                    </Group>
-                    {messages.length === 0 ? (
-                      <Box p="md">
-                        <Group justify="space-between">
-                          <Text size="sm" c="dimmed">
-                            Még nincsenek leadek ebben a kampányban — adj hozzá manuálisan!
-                          </Text>
-                          <Button
-                            size="xs"
-                            variant="default"
-                            leftSection={<IconUserPlus size={14} />}
-                            onClick={() => setAddLeadsOpen(true)}
+                      Leadek hozzáadása
+                    </Button>
+                  </Box>
+                ) : (
+                  <Table highlightOnHover>
+                    <Table.Thead>
+                      <Table.Tr>
+                        <Table.Th>Címzett / Cég</Table.Th>
+                        <Table.Th>AI által írt levél (Tárgy & Előnézet)</Table.Th>
+                        <Table.Th>Állapot</Table.Th>
+                        <Table.Th>Időpont</Table.Th>
+                        <Table.Th ta="right">Megnyitás</Table.Th>
+                      </Table.Tr>
+                    </Table.Thead>
+                    <Table.Tbody>
+                      {messages.map((m) => {
+                        const isGen = m.status === "generating";
+                        return (
+                          <Table.Tr
+                            key={m.id}
+                            style={{ cursor: "pointer" }}
+                            onClick={() => openEmailDialog(m)}
                           >
-                            Leadek hozzáadása
-                          </Button>
-                        </Group>
-                      </Box>
-                    ) : (
-                      <Table>
-                        <Table.Thead>
-                          <Table.Tr>
-                            <Table.Th>Címzett cég</Table.Th>
-                            <Table.Th>Tárgy</Table.Th>
-                            <Table.Th>Állapot</Table.Th>
-                            <Table.Th>Időpont</Table.Th>
-                            <Table.Th ta="right">Művelet</Table.Th>
-                          </Table.Tr>
-                        </Table.Thead>
-                        <Table.Tbody>
-                          {messages.map((m) => (
-                            <Table.Tr key={m.id}>
-                              <Table.Td>
-                                <Text size="sm" fw={500}>
-                                  {m.leadCompany}
+                            <Table.Td w={240}>
+                              <Text size="sm" fw={600}>
+                                {m.leadCompany}
+                              </Text>
+                              <Text size="11px" c="dimmed" className="ml-mono">
+                                {m.leadEmail}
+                              </Text>
+                            </Table.Td>
+                            <Table.Td maw={460}>
+                              <Text size="xs" fw={600} c={isGen ? "dimmed" : undefined} truncate>
+                                {m.subject}
+                              </Text>
+                              <Text size="xs" c="dimmed" lineClamp={1} mt={2}>
+                                {isGen
+                                  ? "Az AI épp most fogalmazza a személyre szabott levelet..."
+                                  : m.body.replace(/\s+/g, " ")}
+                              </Text>
+                              {m.errorMessage && (
+                                <Text size="11px" c="red" lineClamp={1}>
+                                  {m.errorMessage}
                                 </Text>
-                                <Text size="11px" c="dimmed" className="ml-mono">
-                                  {m.leadEmail}
-                                </Text>
-                              </Table.Td>
-                              <Table.Td maw={260}>
-                                <Text size="xs" fw={500} truncate>
-                                  {m.subject}
-                                </Text>
-                                {m.errorMessage && (
-                                  <Text size="11px" c="red" lineClamp={1}>
-                                    {m.errorMessage}
-                                  </Text>
-                                )}
-                              </Table.Td>
-                              <Table.Td>
+                              )}
+                            </Table.Td>
+                            <Table.Td w={140}>
+                              {isGen ? (
+                                <Badge
+                                  size="xs"
+                                  color="blue"
+                                  variant="light"
+                                  leftSection={<Loader size={9} color="blue" />}
+                                >
+                                  AI írja...
+                                </Badge>
+                              ) : (
                                 <Badge
                                   size="xs"
                                   color={
@@ -713,8 +873,9 @@ export function CampaignsPage({
                                       ? "yellow"
                                       : m.status === "failed"
                                       ? "red"
-                                      : "gray"
+                                      : "forest"
                                   }
+                                  variant={m.status === "draft" ? "light" : "filled"}
                                 >
                                   {m.direction === "inbound"
                                     ? "Beérkező válasz"
@@ -724,87 +885,266 @@ export function CampaignsPage({
                                     ? "Időzítve"
                                     : m.status === "failed"
                                     ? "Sikertelen"
-                                    : "Tervezet"}
+                                    : "Tervezet (Kész)"}
                                 </Badge>
-                              </Table.Td>
-                              <Table.Td>
-                                <Text size="11px" c="dimmed" className="ml-tabular">
-                                  {formatShortDate(m.sentAt || m.scheduledSendAt || m.createdAt)}
-                                </Text>
-                              </Table.Td>
-                              <Table.Td ta="right">
-                                <ActionIcon
-                                  size="sm"
-                                  variant="subtle"
-                                  onClick={() => {
-                                    setEditingMsg(m);
-                                    setEditSubject(m.subject);
-                                    setEditBody(m.body);
-                                    setRewriteNote("");
-                                  }}
-                                >
-                                  <IconEdit size={14} />
-                                </ActionIcon>
-                              </Table.Td>
-                            </Table.Tr>
-                          ))}
-                        </Table.Tbody>
-                      </Table>
-                    )}
-                  </Paper>
-                </Stack>
-              </Grid.Col>
-            )}
-          </Grid>
-        )}
-      </Box>
+                              )}
+                            </Table.Td>
+                            <Table.Td w={120}>
+                              <Text size="11px" c="dimmed" className="ml-tabular">
+                                {formatShortDate(m.sentAt || m.scheduledSendAt || m.createdAt)}
+                              </Text>
+                            </Table.Td>
+                            <Table.Td ta="right" w={110}>
+                              <Button
+                                size="compact-xs"
+                                variant="subtle"
+                                color="forest"
+                                leftSection={<IconMail size={13} />}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  openEmailDialog(m);
+                                }}
+                              >
+                                Levél
+                              </Button>
+                            </Table.Td>
+                          </Table.Tr>
+                        );
+                      })}
+                    </Table.Tbody>
+                  </Table>
+                )}
+              </Paper>
+            </Stack>
+          </Box>
+        </>
+      ) : (
+        /* ==================== COMPACT VERTICAL CAMPAIGN LIST VIEW ==================== */
+        <>
+          <Box className="ml-page-header">
+            <Group justify="space-between">
+              <Box>
+                <Title order={3} style={{ letterSpacing: "-0.02em" }}>
+                  Kampányok & Ajánlatok
+                </Title>
+                <Text size="xs" c="dimmed">
+                  Kompakt kampánylista — kattints bármelyik kampányra a teljes képernyős
+                  megnyitáshoz és a generált AI levelek megtekintéséhez.
+                </Text>
+              </Box>
+              <Button size="xs" leftSection={<IconPlus size={14} />} onClick={openNewCampaign}>
+                Új kampány
+              </Button>
+            </Group>
+          </Box>
 
-      {/* Create Campaign Modal (Offer-First!) */}
+          <Box className="ml-page-body">
+            {campaigns.length === 0 ? (
+              <Paper p="lg">
+                <Stack gap="sm" maw={560}>
+                  <Title order={4}>Még nincs e-mail kampány</Title>
+                  <Text size="sm" c="dimmed">
+                    Hozz létre egy kampányt, add meg az ajánlatot és hogy mikor/hogyan tálalja az
+                    AI, majd válaszd ki a célcégeket! A személyre szabott leveleket az AI több
+                    szálon, a háttérben generálja le.
+                  </Text>
+                  <Group>
+                    <Button leftSection={<IconPlus size={15} />} onClick={openNewCampaign}>
+                      Első kampány létrehozása
+                    </Button>
+                  </Group>
+                </Stack>
+              </Paper>
+            ) : (
+              <Stack gap={8}>
+                {campaigns.map((c) => {
+                  const displayOffer = c.offerSummary || c.offerTitle;
+                  return (
+                    <Paper
+                      key={c.id}
+                      p="xs"
+                      px="md"
+                      onClick={() => setSelectedCampaignId(c.id)}
+                      style={{
+                        cursor: "pointer",
+                        transition: "border-color 120ms ease",
+                      }}
+                    >
+                      <Group justify="space-between" wrap="wrap" gap="sm">
+                        <Group gap="sm" wrap="nowrap" style={{ flex: 1, minWidth: 240 }}>
+                          <Box style={{ minWidth: 0, flex: 1 }}>
+                            <Group gap={8} wrap="wrap">
+                              <Text size="sm" fw={700} truncate>
+                                {c.name}
+                              </Text>
+                              <Badge
+                                size="xs"
+                                color={c.status === "active" ? "green" : "gray"}
+                                variant="light"
+                              >
+                                {c.status === "active" ? "Aktív" : "Tervezet"}
+                              </Badge>
+                              {displayOffer && (
+                                <Badge
+                                  size="xs"
+                                  color="forest"
+                                  variant="outline"
+                                  leftSection={<IconTag size={10} />}
+                                  maw={260}
+                                >
+                                  {displayOffer.length > 42
+                                    ? `${displayOffer.slice(0, 42)}...`
+                                    : displayOffer}
+                                </Badge>
+                              )}
+                            </Group>
+                            <Text size="11px" c="dimmed" mt={2} truncate>
+                              Projekt: {c.projectName || "Alap"} • Küldő:{" "}
+                              {c.senderName || "Nincs küldő fiók"} •{" "}
+                              {offerTimingLabel(c.offerTiming)}
+                            </Text>
+                          </Box>
+                        </Group>
+
+                        <Group gap="lg" wrap="nowrap">
+                          <Group gap="md" wrap="nowrap">
+                            <Box ta="right">
+                              <Text size="10px" c="dimmed" tt="uppercase" fw={600}>
+                                Címzett
+                              </Text>
+                              <Text size="sm" fw={700} className="ml-tabular">
+                                {c.totalRecipients}
+                              </Text>
+                            </Box>
+                            <Box ta="right">
+                              <Text size="10px" c="dimmed" tt="uppercase" fw={600}>
+                                Elküldve
+                              </Text>
+                              <Text size="sm" fw={700} className="ml-tabular">
+                                {c.sentCount}
+                              </Text>
+                            </Box>
+                            <Box ta="right">
+                              <Text size="10px" c="dimmed" tt="uppercase" fw={600}>
+                                Válasz
+                              </Text>
+                              <Text size="sm" fw={700} c="forest.9" className="ml-tabular">
+                                {c.replyCount}
+                              </Text>
+                            </Box>
+                            <Box ta="right">
+                              <Text size="10px" c="dimmed" tt="uppercase" fw={600}>
+                                Időpont
+                              </Text>
+                              <Text size="sm" fw={700} c="forest.9" className="ml-tabular">
+                                {c.bookedCount}
+                              </Text>
+                            </Box>
+                          </Group>
+
+                          <Group gap={6} wrap="nowrap" onClick={(e) => e.stopPropagation()}>
+                            <Button
+                              size="compact-xs"
+                              variant="light"
+                              color="forest"
+                              leftSection={<IconWand size={12} />}
+                              onClick={() => openBulkRegenModal(c.id)}
+                            >
+                              Újragenerálás
+                            </Button>
+                            <ActionIcon
+                              size="sm"
+                              variant="subtle"
+                              color="red"
+                              title="Kampány törlése"
+                              onClick={() => handleDeleteCampaign(c.id)}
+                            >
+                              <IconTrash size={14} />
+                            </ActionIcon>
+                            <Button
+                              size="compact-xs"
+                              variant="light"
+                              color="forest"
+                              rightSection={<IconChevronRight size={13} />}
+                              onClick={() => setSelectedCampaignId(c.id)}
+                            >
+                              Megnyitás
+                            </Button>
+                          </Group>
+                        </Group>
+                      </Group>
+                    </Paper>
+                  );
+                })}
+              </Stack>
+            )}
+          </Box>
+        </>
+      )}
+
+      {/* Create Campaign Modal — Per-Campaign Offer & Delivery Rules */}
       <Modal
         opened={createOpen}
         onClose={() => setCreateOpen(false)}
-        title="Új ajánlat-kampány létrehozása"
+        title="Új kampány & ajánlat létrehozása"
         size="lg"
       >
         <Stack gap="sm">
-          <TextInput
-            label="Kampány neve"
-            placeholder="pl. Okosűrlap ingyenes próba — Budapesti szolgáltatók"
-            required
-            value={form.name}
-            onChange={(e) => setForm({ ...form, name: e.currentTarget.value })}
-          />
-          <SimpleGrid cols={2}>
-            <Select
-              label="Ajánlat / Akció (ez alapján épül a kampány)"
+          <SimpleGrid cols={projects.length > 1 ? 2 : 1}>
+            <TextInput
+              label="Kampány neve"
+              placeholder="pl. Budapesti szolgáltatók — Okosűrlap kampány"
               required
-              placeholder="Válassz egy ajánlatot..."
-              value={form.offerId || null}
-              onChange={(v) => {
-                const oid = v || "";
-                const off = allOffers.find((o) => o.id === oid);
-                setForm({
-                  ...form,
-                  offerId: oid,
-                  projectId: off?.projectId || projects[0]?.id || "",
-                });
-              }}
-              data={allOffers.map((o) => ({
-                value: o.id,
-                label: `${o.title}${o.discountValue ? ` (${o.discountValue})` : ""}`,
-              }))}
+              value={form.name}
+              onChange={(e) => setForm({ ...form, name: e.currentTarget.value })}
             />
-            <Select
-              label="Küldő csatorna (SMTP / Amazon SES)"
-              clearable
-              value={form.senderAccountId || null}
-              onChange={(v) => setForm({ ...form, senderAccountId: v || "" })}
-              data={senderAccounts.map((a) => ({
-                value: a.id,
-                label: `${a.name} (${a.provider.toUpperCase()})`,
-              }))}
-            />
+            {projects.length > 1 && (
+              <Select
+                label="Projekt (weboldal & aláírás)"
+                value={form.projectId || null}
+                onChange={(v) => setForm({ ...form, projectId: v || "" })}
+                data={projects.map((p) => ({ value: p.id, label: p.name }))}
+              />
+            )}
           </SimpleGrid>
+
+          {/* Per-Campaign Offer Box */}
+          <Paper p="sm" style={{ backgroundColor: "var(--ml-canvas)", borderColor: "#166534" }}>
+            <Stack gap="xs">
+              <Group gap={6}>
+                <IconTag size={14} color="#166534" />
+                <Text size="xs" fw={700} c="forest.9">
+                  Kampány ajánlat & tálalási szabály (csak ehhez a kampányhoz)
+                </Text>
+              </Group>
+              <SimpleGrid cols={2} spacing="xs">
+                <TextInput
+                  size="xs"
+                  label="Mi az ajánlat?"
+                  placeholder="pl. 5 000 Ft kedvezmény / 14 nap ingyenes próba"
+                  value={form.offerSummary}
+                  onChange={(e) => setForm({ ...form, offerSummary: e.currentTarget.value })}
+                />
+                <Select
+                  size="xs"
+                  label="Mikor ajánlja fel az AI?"
+                  value={form.offerTiming}
+                  onChange={(v) => setForm({ ...form, offerTiming: v || "on_interest" })}
+                  data={OFFER_TIMING_OPTIONS}
+                />
+              </SimpleGrid>
+              <Textarea
+                size="xs"
+                label="Hogyan és milyen feltétellel tálalja az AI?"
+                placeholder="pl. 5 000 Ft kedvezmény, de CSAK akkor ajánld fel a válaszban, ha tényleg érdeklődik az okosűrlap iránt!"
+                autosize
+                minRows={2}
+                maxRows={4}
+                value={form.offerDelivery}
+                onChange={(e) => setForm({ ...form, offerDelivery: e.currentTarget.value })}
+              />
+            </Stack>
+          </Paper>
 
           <Divider label="Célcégek kiválasztása" />
           <SegmentedControl
@@ -815,7 +1155,7 @@ export function CampaignsPage({
             data={[
               { value: "manual", label: "Kézi lead kijelölés" },
               { value: "search", label: "Keresésből" },
-              { value: "min_score", label: "Fit Score küszöb alapján" },
+              { value: "min_score", label: "Fit Score alapján" },
             ]}
           />
 
@@ -846,7 +1186,7 @@ export function CampaignsPage({
 
           {audienceMode === "min_score" && (
             <NumberInput
-              label="Minimum Fit Score (minden ennyi vagy magasabb pontú, e-maillel rendelkező lead)"
+              label="Minimum Fit Score"
               min={0}
               max={100}
               value={audienceMinScore}
@@ -856,7 +1196,7 @@ export function CampaignsPage({
 
           <Paper p="xs" style={{ backgroundColor: "var(--ml-canvas)" }}>
             <Group justify="space-between">
-              <Text size="xs">Érvényes e-maillel rendelkező célcégek száma:</Text>
+              <Text size="xs">Érvényes e-maillel rendelkező célcégek:</Text>
               <Badge color={matchingLeadCount > 0 ? "forest" : "red"}>
                 {matchingLeadCount} cég kap egyedi levelet
               </Badge>
@@ -864,6 +1204,16 @@ export function CampaignsPage({
           </Paper>
 
           <SimpleGrid cols={3}>
+            <Select
+              label="Küldő fiók"
+              clearable
+              value={form.senderAccountId || null}
+              onChange={(v) => setForm({ ...form, senderAccountId: v || "" })}
+              data={senderAccounts.map((a) => ({
+                value: a.id,
+                label: `${a.name} (${a.provider.toUpperCase()})`,
+              }))}
+            />
             <Select
               label="Hangnem"
               value={form.tone}
@@ -874,18 +1224,8 @@ export function CampaignsPage({
                 { value: "concise_executive", label: "Tömör, vezetői" },
               ]}
             />
-            <Select
-              label="Beérkező válasz AI mód"
-              value={form.autoReplyMode}
-              onChange={(v) => setForm({ ...form, autoReplyMode: v || "draft" })}
-              data={[
-                { value: "draft", label: "AI auto-válasz időzítve (megállítható)" },
-                { value: "autopilot", label: "Teljes Autopilóta (munkaidőben)" },
-                { value: "manual", label: "Csak tervezet (nem küldi ki magától)" },
-              ]}
-            />
             <NumberInput
-              label="Napi küldési limit"
+              label="Napi limit"
               min={1}
               max={500}
               value={form.dailyLimit}
@@ -901,8 +1241,9 @@ export function CampaignsPage({
 
           <Textarea
             label="Egyedi AI szövegírási instrukció (opcionális)"
-            placeholder="pl. Emeld ki az okosűrlap előnyeit, és maradj 110 szó alatt..."
+            autosize
             minRows={2}
+            placeholder="pl. Maradj 100 szó alatt, hivatkozz konkrétan az oldalukra..."
             value={form.customInstructions}
             onChange={(e) => setForm({ ...form, customInstructions: e.currentTarget.value })}
           />
@@ -916,7 +1257,7 @@ export function CampaignsPage({
               loading={creating}
               onClick={handleCreateCampaign}
             >
-              Kampány és egyedi levelek generálása
+              Kampány és levelek generálása
             </Button>
           </Group>
         </Stack>
@@ -926,7 +1267,7 @@ export function CampaignsPage({
       <Modal
         opened={addLeadsOpen}
         onClose={() => setAddLeadsOpen(false)}
-        title={`Leadek manuális hozzáadása — ${selectedCampaign?.name || ""}`}
+        title={`Leadek hozzáadása — ${selectedCampaign?.name || ""}`}
         size="md"
       >
         <Stack gap="sm">
@@ -960,12 +1301,12 @@ export function CampaignsPage({
         </Stack>
       </Modal>
 
-      {/* Edit Campaign Settings Modal */}
+      {/* Edit Campaign & Offer Settings Modal */}
       <Modal
         opened={editCampOpen}
         onClose={() => setEditCampOpen(false)}
-        title="Kampány testreszabása"
-        size="md"
+        title="Kampány & ajánlat szerkesztése"
+        size="lg"
       >
         <Stack gap="sm">
           <TextInput
@@ -973,16 +1314,47 @@ export function CampaignsPage({
             value={editCampForm.name}
             onChange={(e) => setEditCampForm({ ...editCampForm, name: e.currentTarget.value })}
           />
-          <Select
-            label="Ajánlat"
-            value={editCampForm.offerId || null}
-            onChange={(v) => setEditCampForm({ ...editCampForm, offerId: v || "" })}
-            data={allOffers.map((o) => ({
-              value: o.id,
-              label: `${o.title}${o.discountValue ? ` (${o.discountValue})` : ""}`,
-            }))}
-          />
-          <SimpleGrid cols={2}>
+          <Paper p="sm" style={{ backgroundColor: "var(--ml-canvas)", borderColor: "#166534" }}>
+            <Stack gap="xs">
+              <Text size="xs" fw={700} c="forest.9">
+                Kampány ajánlat & tálalás
+              </Text>
+              <SimpleGrid cols={2} spacing="xs">
+                <TextInput
+                  size="xs"
+                  label="Mi az ajánlat?"
+                  placeholder="pl. 5 000 Ft kedvezmény"
+                  value={editCampForm.offerSummary}
+                  onChange={(e) =>
+                    setEditCampForm({ ...editCampForm, offerSummary: e.currentTarget.value })
+                  }
+                />
+                <Select
+                  size="xs"
+                  label="Mikor ajánlja fel az AI?"
+                  value={editCampForm.offerTiming}
+                  onChange={(v) =>
+                    setEditCampForm({ ...editCampForm, offerTiming: v || "on_interest" })
+                  }
+                  data={OFFER_TIMING_OPTIONS}
+                />
+              </SimpleGrid>
+              <Textarea
+                size="xs"
+                label="Hogyan és milyen feltétellel tálalja?"
+                autosize
+                minRows={2}
+                maxRows={4}
+                placeholder="pl. Csak akkor ajánld fel, ha tényleg érdeklődik az okosűrlap iránt!"
+                value={editCampForm.offerDelivery}
+                onChange={(e) =>
+                  setEditCampForm({ ...editCampForm, offerDelivery: e.currentTarget.value })
+                }
+              />
+            </Stack>
+          </Paper>
+
+          <SimpleGrid cols={3}>
             <Select
               label="Küldő fiók"
               clearable
@@ -1003,28 +1375,17 @@ export function CampaignsPage({
                 { value: "concise_executive", label: "Tömör, vezetői" },
               ]}
             />
-          </SimpleGrid>
-          <SimpleGrid cols={2}>
-            <Select
-              label="Beérkező válasz AI mód"
-              value={editCampForm.autoReplyMode}
-              onChange={(v) => setEditCampForm({ ...editCampForm, autoReplyMode: v || "draft" })}
-              data={[
-                { value: "draft", label: "AI auto-válasz időzítve (megállítható)" },
-                { value: "autopilot", label: "Teljes Autopilóta" },
-                { value: "manual", label: "Kézi kezelés" },
-              ]}
-            />
             <NumberInput
-              label="Napi küldési limit"
+              label="Napi limit"
               min={1}
               max={500}
               value={editCampForm.dailyLimit}
               onChange={(v) => setEditCampForm({ ...editCampForm, dailyLimit: Number(v) || 35 })}
             />
           </SimpleGrid>
+
           <Switch
-            label="Időpontfoglaló link beillesztése"
+            label="Időpontfoglaló link beillesztése az első levélbe"
             checked={editCampForm.includeBookingLink}
             onChange={(e) =>
               setEditCampForm({ ...editCampForm, includeBookingLink: e.currentTarget.checked })
@@ -1032,6 +1393,7 @@ export function CampaignsPage({
           />
           <Textarea
             label="Egyedi AI instrukciók"
+            autosize
             minRows={2}
             value={editCampForm.customInstructions}
             onChange={(e) =>
@@ -1061,7 +1423,7 @@ export function CampaignsPage({
                 <TextInput
                   size="xs"
                   label="Megjegyzés az AI-nak (átíráshoz)"
-                  placeholder="pl. Legyen rövidebb, közvetlenebb, emeld ki az okosűrlap gyorsaságát..."
+                  placeholder="pl. Legyen rövidebb, közvetlenebb, emeld ki az okosűrlapot..."
                   value={rewriteNote}
                   onChange={(e) => setRewriteNote(e.currentTarget.value)}
                   style={{ flex: 1 }}
@@ -1096,7 +1458,9 @@ export function CampaignsPage({
           />
           <Textarea
             label="Levél törzse"
-            minRows={10}
+            autosize
+            minRows={9}
+            maxRows={16}
             value={editBody}
             onChange={(e) => setEditBody(e.currentTarget.value)}
           />
@@ -1109,6 +1473,85 @@ export function CampaignsPage({
                 Tervezet mentése
               </Button>
             )}
+          </Group>
+        </Stack>
+      </Modal>
+
+      {/* Bulk Campaign Emails Regeneration Modal ("Mi a bajom az emailekkel") */}
+      <Modal
+        opened={regenModalOpen}
+        onClose={() => setRegenModalOpen(false)}
+        title="Kampány emailek újragenerálása — Mi a gond a jelenlegi levelekkel?"
+        size="lg"
+      >
+        <Stack gap="sm">
+          <Text size="xs" c="dimmed">
+            Írd le nyugodtan saját szavaiddal, mi nem tetszik a generált emailekben (vagy kattints a
+            gyors javítási szempontokra). Az AI <strong>4 párhuzamos szálon</strong> újraírja az
+            összes kiküldendő levelet úgy, hogy mindegyiknél látja a korábbi verziót és a te
+            kritikádat is.
+          </Text>
+
+          <Box>
+            <Text size="xs" fw={600} mb={6}>
+              Gyors javítási szempontok (kattints a beszúráshoz):
+            </Text>
+            <Group gap={6} wrap="wrap">
+              {[
+                "Túl gépi és sablonos a szöveg, legyen sokkal emberibb, mintha egy valódi szakember írná.",
+                "Túl hosszú, rövidítsd le maximum 3-4 ütős, lényegretörő mondatra.",
+                "Ne legyen nyomulós vagy értékesítős, inkább egy barátságos észrevétel és egy laza kérdés legyen.",
+                "Írj konkrétabb, egyedi észrevételt a cég saját weboldaláról és szolgáltatásairól.",
+                "Ne sorold fel listában a hibákat, hanem emelj ki egyetlen konkrét lehetőséget pozitív hangnemben.",
+                "Legyen közvetlenebb, természetes tegező stílusú.",
+              ].map((preset) => (
+                <Badge
+                  key={preset}
+                  size="sm"
+                  variant="light"
+                  color="forest"
+                  style={{ cursor: "pointer", textTransform: "none" }}
+                  onClick={() =>
+                    setRegenFeedback((prev) =>
+                      prev.trim() ? `${prev.trim()} ${preset}` : preset
+                    )
+                  }
+                >
+                  + {preset.length > 58 ? `${preset.slice(0, 58)}...` : preset}
+                </Badge>
+              ))}
+            </Group>
+          </Box>
+
+          <Textarea
+            label="Mi a baj az emailekkel? Mit változtasson az AI?"
+            placeholder="pl. Túl hivatalos és gépi a hangnem, ne kezdje minden levél ugyanazzal a mondattal! Legyen benne egy valódi szakmai észrevétel a weboldalukról, és a végén csak egyetlen rövid kérdéssel nyisson beszélgetést..."
+            autosize
+            minRows={4}
+            maxRows={8}
+            value={regenFeedback}
+            onChange={(e) => setRegenFeedback(e.currentTarget.value)}
+            data-autofocus
+          />
+
+          <Switch
+            size="xs"
+            label="Mentés a kampány állandó AI szabályai közé is (hogy a később hozzáadott leadek levelei is így készüljenek)"
+            checked={regenSaveToCampaign}
+            onChange={(e) => setRegenSaveToCampaign(e.currentTarget.checked)}
+          />
+
+          <Group justify="flex-end" mt="xs">
+            <Button variant="default" onClick={() => setRegenModalOpen(false)}>
+              Mégse
+            </Button>
+            <Button
+              leftSection={<IconWand size={15} />}
+              loading={startingRegen}
+              onClick={handleConfirmBulkRegenerate}
+            >
+              Összes email újragenerálása (4 szálon)
+            </Button>
           </Group>
         </Stack>
       </Modal>

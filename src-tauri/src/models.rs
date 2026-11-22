@@ -11,6 +11,8 @@ pub struct Project {
     pub description: String,
     pub booking_url: String,
     pub landing_url: String,
+    #[serde(default)]
+    pub email_signature: String,
     pub value_proposition: String,
     pub target_audience: String,
     pub pain_points_solved: Vec<String>,
@@ -35,6 +37,8 @@ pub struct ProjectInput {
     pub description: String,
     pub booking_url: String,
     pub landing_url: String,
+    #[serde(default)]
+    pub email_signature: Option<String>,
     pub value_proposition: Option<String>,
     pub target_audience: Option<String>,
     pub pain_points_solved: Option<Vec<String>>,
@@ -325,6 +329,12 @@ pub struct Campaign {
     pub follow_up_days: i64,
     pub include_booking_link: bool,
     pub custom_instructions: String,
+    #[serde(default)]
+    pub offer_summary: String,
+    #[serde(default = "default_offer_timing")]
+    pub offer_timing: String, // first_email | on_interest | on_objection | custom
+    #[serde(default)]
+    pub offer_delivery: String,
     pub total_recipients: i64,
     pub sent_count: i64,
     pub failed_count: i64,
@@ -352,7 +362,17 @@ pub struct CampaignInput {
     pub follow_up_days: i64,
     pub include_booking_link: bool,
     pub custom_instructions: String,
+    #[serde(default)]
+    pub offer_summary: String,
+    #[serde(default = "default_offer_timing")]
+    pub offer_timing: String,
+    #[serde(default)]
+    pub offer_delivery: String,
     pub lead_ids: Vec<String>,
+}
+
+fn default_offer_timing() -> String {
+    "on_interest".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -385,6 +405,10 @@ pub struct EmailMessage {
     pub ai_summary: Option<String>,
     #[serde(default)]
     pub ai_rewrite_note: Option<String>,
+    #[serde(default)]
+    pub ai_priority_score: i64,
+    #[serde(default)]
+    pub ai_tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -402,6 +426,12 @@ pub struct InboxThread {
     pub last_message_at: String,
     pub last_direction: String,
     pub latest_intent: Option<String>,
+    #[serde(default)]
+    pub priority_score: i64,
+    #[serde(default)]
+    pub ai_tags: Vec<String>,
+    #[serde(default)]
+    pub decision_summary: Option<String>,
     pub has_pending_draft: bool,
     #[serde(default)]
     pub pending_reply_id: Option<String>,
@@ -467,6 +497,9 @@ pub struct CampaignUpdateInput {
     pub daily_limit: Option<i64>,
     pub include_booking_link: Option<bool>,
     pub custom_instructions: Option<String>,
+    pub offer_summary: Option<String>,
+    pub offer_timing: Option<String>,
+    pub offer_delivery: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -488,6 +521,8 @@ pub struct AppSettings {
     pub cli_search_engine: String, // auto | opencode | claude | codex
     pub default_language: String,
     pub company_signature: String,
+    #[serde(default)]
+    pub signature_fine_print: String,
     pub imap_poll_minutes: i64,
     // Auto-reply scheduling & customization
     #[serde(default = "default_true")]
@@ -512,6 +547,27 @@ pub struct AppSettings {
     pub default_tone: String,
     #[serde(default = "default_daily_limit")]
     pub default_daily_limit: i64,
+    // OpenRouter Inbound Decision / Triage Model settings
+    #[serde(default = "default_decision_provider")]
+    pub decision_model_provider: String, // openrouter | inherit
+    #[serde(default = "default_decision_api")]
+    pub decision_model_api: String, // decisions (OpenRouter Decisions API) | chat (legacy structured outputs)
+    #[serde(default)]
+    pub decision_model_api_key: String, // OpenRouter API key (falls back to ai_api_key when provider is openrouter)
+    #[serde(default = "default_decision_model_id")]
+    pub decision_model_id: String, // Decisions model slug, e.g. typesafe/jev-1.14, cloudflare/clef-flash
+    #[serde(default = "default_true")]
+    pub decision_auto_sort_inbox: bool,
+}
+
+fn default_decision_provider() -> String {
+    "openrouter".to_string()
+}
+fn default_decision_api() -> String {
+    "decisions".to_string()
+}
+fn default_decision_model_id() -> String {
+    "typesafe/jev-1.14".to_string()
 }
 
 fn default_cli_search_engine() -> String {
@@ -560,7 +616,8 @@ impl Default for AppSettings {
             cli_search_engine: "auto".to_string(),
             default_language: "hu".to_string(),
             company_signature: "Üdvözlettel,\nMyLead Csapat".to_string(),
-            imap_poll_minutes: 5,
+            signature_fine_print: String::new(),
+            imap_poll_minutes: 1,
             auto_reply_enabled: default_true(),
             auto_reply_workdays: default_workdays(),
             auto_reply_start_hour: default_start_hour(),
@@ -572,6 +629,11 @@ impl Default for AppSettings {
             ai_reply_instructions: String::new(),
             default_tone: default_tone(),
             default_daily_limit: default_daily_limit(),
+            decision_model_provider: default_decision_provider(),
+            decision_model_api: default_decision_api(),
+            decision_model_api_key: String::new(),
+            decision_model_id: default_decision_model_id(),
+            decision_auto_sort_inbox: true,
         }
     }
 }

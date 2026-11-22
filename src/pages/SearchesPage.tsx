@@ -49,10 +49,12 @@ interface Props {
   leads: Lead[];
   activeSearchId: string | null;
   runningSearchIds: string[];
+  enrichingLeadIds: string[];
   liveLogsBySearch: Record<string, SearchLiveEvent[]>;
   liveActiveWorkersBySearch: Record<string, Record<string, SearchLiveEvent>>;
   onSelectSearchId: (id: string | null) => void;
   onSelectLead: (lead: Lead) => void;
+  onEnrichLeads: (leadIds: string[], projectId?: string | null) => void;
   onRefresh: () => Promise<void>;
   onCreateCampaignFromSearch: (search: SearchJob) => void;
 }
@@ -105,10 +107,12 @@ export function SearchesPage({
   leads,
   activeSearchId,
   runningSearchIds,
+  enrichingLeadIds,
   liveLogsBySearch,
   liveActiveWorkersBySearch,
   onSelectSearchId,
   onSelectLead,
+  onEnrichLeads,
   onRefresh,
   onCreateCampaignFromSearch,
 }: Props) {
@@ -116,7 +120,6 @@ export function SearchesPage({
   const [importModalOpen, setImportModalOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [optimizing, setOptimizing] = useState(false);
-  const [enrichingLeadId, setEnrichingLeadId] = useState<string | null>(null);
 
   const [detailTab, setDetailTab] = useState<string>("live");
   const [leadSubFilter, setLeadSubFilter] = useState<string>("all");
@@ -147,9 +150,9 @@ export function SearchesPage({
 
   const activeSearch = searches.find((s) => s.id === activeSearchId) ?? null;
 
-  // Sync inline edit form whenever the user opens/changes activeSearch
+  // Sync inline edit form only when the user switches to a different search ID
   useEffect(() => {
-    if (activeSearch) {
+    if (activeSearch && !modalOpen) {
       setForm({
         id: activeSearch.id,
         projectId: activeSearch.projectId,
@@ -168,7 +171,7 @@ export function SearchesPage({
       setAiReasoning("");
       setAiInstruction("");
     }
-  }, [activeSearch?.id, activeSearch?.name, activeSearch?.query, activeSearch?.source, activeSearch?.targetProblem, activeSearch?.maxResults]);
+  }, [activeSearch?.id]);
 
   const searchLeads = useMemo(() => {
     if (!activeSearch) return [];
@@ -185,8 +188,6 @@ export function SearchesPage({
     if (!activeSearch) return [];
     return leads.filter((l) => l.searches.some((sp) => sp.searchId === activeSearch.id));
   }, [leads, activeSearch]);
-
-  const selectedProject = projects.find((p) => p.id === form.projectId);
 
   const openCreateModal = () => {
     const firstProj = projects[0];
@@ -350,21 +351,8 @@ export function SearchesPage({
     }
   };
 
-  const handleDeepEnrichSingle = async (lead: Lead) => {
-    setEnrichingLeadId(lead.id);
-    try {
-      await api.enrichLeads([lead.id], activeSearch?.projectId || projects[0]?.id || null);
-      await onRefresh();
-      notifications.show({
-        title: "Mély kutatás elkészült",
-        message: `${lead.companyName} teljes adatlapja frissítve.`,
-        color: "forest",
-      });
-    } catch (e) {
-      notifications.show({ title: "Hiba", message: String(e), color: "red" });
-    } finally {
-      setEnrichingLeadId(null);
-    }
+  const handleDeepEnrichSingle = (lead: Lead) => {
+    onEnrichLeads([lead.id], activeSearch?.projectId || projects[0]?.id || null);
   };
 
   const handleImport = async () => {
@@ -890,15 +878,15 @@ export function SearchesPage({
                                   </Badge>
                                 </Table.Td>
                                 <Table.Td ta="right" onClick={(e) => e.stopPropagation()}>
-                                  <Button
-                                    size="compact-xs"
-                                    variant={isNewUnaudited ? "filled" : "default"}
-                                    leftSection={<IconRefresh size={12} />}
-                                    loading={enrichingLeadId === l.id}
-                                    onClick={() => handleDeepEnrichSingle(l)}
-                                  >
-                                    {isNewUnaudited ? "Audit" : "Mély kutatás"}
-                                  </Button>
+                                    <Button
+                                      size="compact-xs"
+                                      variant={isNewUnaudited ? "filled" : "default"}
+                                      leftSection={<IconRefresh size={12} />}
+                                      loading={enrichingLeadIds.includes(l.id) || !!worker}
+                                      onClick={() => handleDeepEnrichSingle(l)}
+                                    >
+                                      {isNewUnaudited ? "Audit" : "Mély kutatás"}
+                                    </Button>
                                 </Table.Td>
                               </Table.Tr>
                             );
@@ -961,32 +949,12 @@ export function SearchesPage({
                         value={form.name}
                         onChange={(e) => setForm({ ...form, name: e.currentTarget.value })}
                       />
-                      <SimpleGrid cols={2}>
-                        <Select
-                          label="Projekt"
-                          value={form.projectId}
-                          onChange={(v) => {
-                            const pid = v || "";
-                            const proj = projects.find((p) => p.id === pid);
-                            setForm({
-                              ...form,
-                              projectId: pid,
-                              offerId: proj?.offers[0]?.id || "",
-                            });
-                          }}
-                          data={projects.map((p) => ({ value: p.id, label: p.name }))}
-                        />
-                        <Select
-                          label="Célzott ajánlat / kedvezmény"
-                          clearable
-                          value={form.offerId || null}
-                          onChange={(v) => setForm({ ...form, offerId: v || "" })}
-                          data={(selectedProject?.offers || []).map((o) => ({
-                            value: o.id,
-                            label: `${o.title} (${o.discountValue})`,
-                          }))}
-                        />
-                      </SimpleGrid>
+                      <Select
+                        label="Projekt"
+                        value={form.projectId}
+                        onChange={(v) => setForm({ ...form, projectId: v || "", offerId: "" })}
+                        data={projects.map((p) => ({ value: p.id, label: p.name }))}
+                      />
 
                       <SimpleGrid cols={3}>
                         <TextInput
@@ -1033,7 +1001,6 @@ export function SearchesPage({
                         <NumberInput
                           label="Max találat"
                           min={1}
-                          max={60}
                           value={form.maxResults}
                           onChange={(v) => setForm({ ...form, maxResults: Number(v) || 15 })}
                         />
@@ -1159,7 +1126,7 @@ export function SearchesPage({
               <Table.Thead>
                 <Table.Tr>
                   <Table.Th>Keresés neve & célprobléma</Table.Th>
-                  <Table.Th>Projekt / Ajánlat</Table.Th>
+                  <Table.Th>Projekt</Table.Th>
                   <Table.Th>Célzás</Table.Th>
                   <Table.Th>Motor</Table.Th>
                   <Table.Th ta="right">Találatok</Table.Th>
@@ -1196,9 +1163,6 @@ export function SearchesPage({
                     <Table.Td>
                       <Text size="xs" fw={600}>
                         {s.projectName}
-                      </Text>
-                      <Text size="xs" c="dimmed" truncate maw={180}>
-                        {s.offerTitle || "Alap projekt ajánlat"}
                       </Text>
                     </Table.Td>
                     <Table.Td>
@@ -1364,29 +1328,13 @@ export function SearchesPage({
             onChange={(e) => setForm({ ...form, name: e.currentTarget.value })}
           />
 
-          <SimpleGrid cols={2}>
-            <Select
-              label="Melyik projektedhez?"
-              required
-              value={form.projectId}
-              onChange={(v) => {
-                const pid = v || "";
-                const proj = projects.find((p) => p.id === pid);
-                setForm({ ...form, projectId: pid, offerId: proj?.offers[0]?.id || "" });
-              }}
-              data={projects.map((p) => ({ value: p.id, label: p.name }))}
-            />
-            <Select
-              label="Melyik ajánlatot / kedvezményt kapják?"
-              clearable
-              value={form.offerId || null}
-              onChange={(v) => setForm({ ...form, offerId: v || "" })}
-              data={(selectedProject?.offers || []).map((o) => ({
-                value: o.id,
-                label: `${o.title} (${o.discountValue})`,
-              }))}
-            />
-          </SimpleGrid>
+          <Select
+            label="Melyik projektedhez?"
+            required
+            value={form.projectId}
+            onChange={(v) => setForm({ ...form, projectId: v || "", offerId: "" })}
+            data={projects.map((p) => ({ value: p.id, label: p.name }))}
+          />
 
           <SimpleGrid cols={3}>
             <TextInput
@@ -1434,7 +1382,6 @@ export function SearchesPage({
             <NumberInput
               label="Max találat"
               min={1}
-              max={60}
               value={form.maxResults}
               onChange={(v) => setForm({ ...form, maxResults: Number(v) || 15 })}
             />

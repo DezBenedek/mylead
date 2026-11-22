@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ActionIcon,
   Badge,
@@ -43,6 +43,14 @@ import type {
   SenderAccount,
   SuppressionEntry,
 } from "../types";
+
+const FALLBACK_DECISION_MODELS: AiModelOption[] = [
+  { id: "typesafe/jev-1.14", label: "TypeSafe Jev 1.14 (ajánlott)" },
+  { id: "~typesafe/jev-latest", label: "TypeSafe Jev (latest)" },
+  { id: "cloudflare/clef-flash", label: "Cloudflare Clef Flash (gyors)" },
+  { id: "liquid/d1.2", label: "Liquid D1.2" },
+  { id: "google/gemini-decision-1", label: "Google Gemini Decision 1" },
+];
 
 interface Props {
   settings: AppSettings;
@@ -90,6 +98,8 @@ export function SettingsPage({
   const [installingScraper, setInstallingScraper] = useState(false);
   const [modelOptions, setModelOptions] = useState<AiModelOption[]>([]);
   const [loadingModels, setLoadingModels] = useState(false);
+  const [decisionModelOptions, setDecisionModelOptions] = useState<AiModelOption[]>([]);
+  const [loadingDecisionModels, setLoadingDecisionModels] = useState(false);
 
   const [accModalOpen, setAccModalOpen] = useState(false);
   const [accForm, setAccForm] = useState(emptyAccount);
@@ -98,10 +108,59 @@ export function SettingsPage({
 
   const [newSupEmail, setNewSupEmail] = useState("");
   const [newSupReason, setNewSupReason] = useState("Kézi tiltás");
+  const lastServerSettingsJsonRef = useRef<string>(JSON.stringify(settings));
+  const latestFormRef = useRef<AppSettings>(form);
+  const isEditingRef = useRef<boolean>(false);
+  const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  latestFormRef.current = form;
+
+  // Only sync from parent settings if the user is NOT actively editing in SettingsPage
+  useEffect(() => {
+    if (isEditingRef.current) return;
+    const incomingJson = JSON.stringify(settings);
+    if (incomingJson !== lastServerSettingsJsonRef.current) {
+      lastServerSettingsJsonRef.current = incomingJson;
+      setForm(settings);
+    }
+  }, [settings]);
+
+  // Automatic debounced save (500ms after typing stops) + flush on unmount so user edits are NEVER lost or reverted!
+  useEffect(() => {
+    const currentJson = JSON.stringify(form);
+    if (currentJson === lastServerSettingsJsonRef.current) {
+      return;
+    }
+    isEditingRef.current = true;
+    if (autoSaveTimerRef.current) {
+      clearTimeout(autoSaveTimerRef.current);
+    }
+    autoSaveTimerRef.current = setTimeout(async () => {
+      try {
+        const snapshot = latestFormRef.current;
+        const saved = await api.saveSettings(snapshot);
+        lastServerSettingsJsonRef.current = JSON.stringify(saved);
+        isEditingRef.current = false;
+        await onRefresh();
+      } catch {
+        isEditingRef.current = false;
+      }
+    }, 500);
+
+    return () => {
+      if (autoSaveTimerRef.current) {
+        clearTimeout(autoSaveTimerRef.current);
+      }
+    };
+  }, [form, onRefresh]);
 
   useEffect(() => {
-    setForm(settings);
-  }, [settings]);
+    return () => {
+      if (JSON.stringify(latestFormRef.current) !== lastServerSettingsJsonRef.current) {
+        api.saveSettings(latestFormRef.current).then(() => onRefresh()).catch(() => {});
+      }
+    };
+  }, [onRefresh]);
 
   const refreshLocalClis = async () => {
     setProbingClis(true);
@@ -158,6 +217,42 @@ export function SettingsPage({
     }
   };
 
+  const baseDecisionModels = decisionModelOptions.length > 0 ? decisionModelOptions : FALLBACK_DECISION_MODELS;
+  const decisionModelSelectData: { value: string; label: string }[] = baseDecisionModels.map((m) => ({
+    value: m.id,
+    label: m.label,
+  }));
+  if (
+    form.decisionModelId &&
+    !decisionModelSelectData.some((m) => m.value === form.decisionModelId)
+  ) {
+    decisionModelSelectData.unshift({
+      value: form.decisionModelId,
+      label: form.decisionModelId,
+    });
+  }
+
+  const handleFetchDecisionModels = async () => {
+    setLoadingDecisionModels(true);
+    try {
+      const list = await api.fetchDecisionModels();
+      setDecisionModelOptions(list);
+      notifications.show({
+        title: "Döntési modellek betöltve",
+        message: `${list.length} döntési modell érkezett az OpenRouterról.`,
+        color: "forest",
+      });
+    } catch (e) {
+      notifications.show({
+        title: "Döntési modell lekérési hiba",
+        message: String(e),
+        color: "orange",
+      });
+    } finally {
+      setLoadingDecisionModels(false);
+    }
+  };
+
   const applyProvider = (prov: string, cliPath?: string) => {
     const defaultModels: Record<string, string> = {
       openrouter: "openai/gpt-4o-mini",
@@ -183,9 +278,15 @@ export function SettingsPage({
   };
 
   const handleSaveSettings = async () => {
+    if (autoSaveTimerRef.current) {
+      clearTimeout(autoSaveTimerRef.current);
+    }
     setSaving(true);
     try {
-      await api.saveSettings(form);
+      const saved = await api.saveSettings(form);
+      lastServerSettingsJsonRef.current = JSON.stringify(saved);
+      isEditingRef.current = false;
+      setForm(saved);
       await onRefresh();
       notifications.show({ title: "Beállítások mentve", message: "", color: "forest" });
     } catch (e) {
@@ -307,60 +408,59 @@ export function SettingsPage({
   return (
     <Box>
       <Box className="ml-page-header">
-        <Title order={3} style={{ letterSpacing: "-0.02em" }}>
-          Beállítások
-        </Title>
-        <Text size="sm" c="dimmed">
-          AI modell, SMTP és Amazon SES küldő fiókok, IMAP postafiók, Google Maps API kulcsok és
-          tiltólista.
-        </Text>
+        <Group justify="space-between" align="center">
+          <Title order={4} style={{ letterSpacing: "-0.02em" }}>
+            Beállítások
+          </Title>
+          <Button
+            size="xs"
+            leftSection={<IconCheck size={14} />}
+            loading={saving}
+            onClick={handleSaveSettings}
+          >
+            Mentés
+          </Button>
+        </Group>
       </Box>
 
       <Box className="ml-page-body">
         <Tabs defaultValue="email">
-          <Tabs.List mb="md">
-            <Tabs.Tab value="email">E-mail küldés (SMTP / Amazon SES) & IMAP</Tabs.Tab>
-            <Tabs.Tab value="autoreply">Auto-válasz & Személyreszabás</Tabs.Tab>
-            <Tabs.Tab value="ai">AI Modell & Szövegírás</Tabs.Tab>
-            <Tabs.Tab value="discovery">Google Maps / Keresési API-k</Tabs.Tab>
+          <Tabs.List mb="sm">
+            <Tabs.Tab value="email">E-mail & IMAP</Tabs.Tab>
+            <Tabs.Tab value="autoreply">Auto-válasz & Fókusz</Tabs.Tab>
+            <Tabs.Tab value="ai">AI Modell</Tabs.Tab>
+            <Tabs.Tab value="discovery">Keresőmotorok</Tabs.Tab>
             <Tabs.Tab value="suppression">Tiltólista ({suppressions.length})</Tabs.Tab>
-            <Tabs.Tab value="data">Adatbázis & Mintaadatok</Tabs.Tab>
+            <Tabs.Tab value="data">Adatbázis</Tabs.Tab>
           </Tabs.List>
 
           {/* SMTP / SES / IMAP */}
           <Tabs.Panel value="email">
-            <Stack gap="md">
-              <Paper p="md">
-                <Group justify="space-between" mb="sm" wrap="wrap">
-                  <Box>
-                    <Text fw={600} size="sm">
-                      Küldő és fogadó e-mail fiókok
-                    </Text>
-                    <Text size="xs" c="dimmed">
-                      Használhatsz saját SMTP szervert (Google Workspace, Microsoft 365, Postmark,
-                      saját domain) vagy Amazon SES-t (AWS SigV4).
-                    </Text>
-                  </Box>
-                  <Group gap="xs">
-                    <TextInput
-                      size="xs"
-                      placeholder="Teszt címzett e-mail..."
-                      value={testEmailTarget}
-                      onChange={(e) => setTestEmailTarget(e.currentTarget.value)}
-                      w={210}
-                    />
-                    <Button
-                      size="xs"
-                      leftSection={<IconPlus size={14} />}
-                      onClick={() => {
-                        setAccForm(emptyAccount);
-                        setAccModalOpen(true);
-                      }}
-                    >
-                      Új SMTP / SES fiók
-                    </Button>
-                  </Group>
+            <Paper p="sm">
+              <Group justify="space-between" mb="xs" wrap="wrap" gap="xs">
+                <Text fw={600} size="sm">
+                  Küldő & IMAP fiókok ({senderAccounts.length})
+                </Text>
+                <Group gap="xs">
+                  <TextInput
+                    size="xs"
+                    placeholder="Teszt címzett e-mail..."
+                    value={testEmailTarget}
+                    onChange={(e) => setTestEmailTarget(e.currentTarget.value)}
+                    w={200}
+                  />
+                  <Button
+                    size="xs"
+                    leftSection={<IconPlus size={14} />}
+                    onClick={() => {
+                      setAccForm(emptyAccount);
+                      setAccModalOpen(true);
+                    }}
+                  >
+                    Új fiók
+                  </Button>
                 </Group>
+              </Group>
 
                 {senderAccounts.length === 0 ? (
                   <Text size="sm" c="dimmed">
@@ -453,51 +553,47 @@ export function SettingsPage({
                     </Table.Tbody>
                   </Table>
                 )}
-              </Paper>
-            </Stack>
+            </Paper>
           </Tabs.Panel>
 
-          {/* Auto-Reply & Customization */}
+          {/* Auto-Reply & Customization (Compact 2-column layout) */}
           <Tabs.Panel value="autoreply">
-            <Stack gap="md" maw={860}>
-              <Paper p="md">
-                <Stack gap="sm">
-                  <Text fw={600} size="sm">
-                    Automatikus AI válasz időzítése (Munkaidő & Véletlen késleltetés)
-                  </Text>
-                  <Text size="xs" c="dimmed">
-                    Beérkező kérdés vagy érdeklődés esetén az AI automatikusan legenerálja a választ,
-                    és a beállított munkaidőn belül véletlenszerűen időzíti a kiküldést. Minden
-                    időzített válasz a Beérkező oldalon egy kattintással megállítható, átírható vagy
-                    AI megjegyzéssel módosítható.
-                  </Text>
-
-                  <Switch
-                    label="AI automatikus válaszgenerálás és időzítés engedélyezése"
-                    checked={form.autoReplyEnabled}
-                    onChange={(e) =>
-                      setForm({ ...form, autoReplyEnabled: e.currentTarget.checked })
-                    }
-                  />
+            <SimpleGrid cols={{ base: 1, lg: 2 }} spacing="sm">
+              <Paper p="sm">
+                <Stack gap="xs">
+                  <Group justify="space-between">
+                    <Text fw={600} size="sm">
+                      AI Auto-válasz időzítés
+                    </Text>
+                    <Switch
+                      size="xs"
+                      label="Aktív"
+                      checked={form.autoReplyEnabled}
+                      onChange={(e) =>
+                        setForm({ ...form, autoReplyEnabled: e.currentTarget.checked })
+                      }
+                    />
+                  </Group>
 
                   <Box>
-                    <Text size="xs" fw={500} mb={6}>
-                      Munkanapok (alapértelmezett: Hétfő–Szombat)
+                    <Text size="xs" fw={500} mb={4}>
+                      Munkanapok
                     </Text>
-                    <Group gap="md">
+                    <Group gap="xs">
                       {[
-                        { day: 1, label: "Hétfő" },
-                        { day: 2, label: "Kedd" },
-                        { day: 3, label: "Szerda" },
-                        { day: 4, label: "Csütörtök" },
-                        { day: 5, label: "Péntek" },
-                        { day: 6, label: "Szombat" },
-                        { day: 7, label: "Vasárnap" },
+                        { day: 1, label: "H" },
+                        { day: 2, label: "K" },
+                        { day: 3, label: "Sze" },
+                        { day: 4, label: "Cs" },
+                        { day: 5, label: "P" },
+                        { day: 6, label: "Szo" },
+                        { day: 7, label: "V" },
                       ].map((w) => {
                         const checked = (form.autoReplyWorkdays || [1, 2, 3, 4, 5, 6]).includes(w.day);
                         return (
                           <Checkbox
                             key={w.day}
+                            size="xs"
                             label={w.label}
                             checked={checked}
                             onChange={(e) => {
@@ -513,8 +609,9 @@ export function SettingsPage({
                     </Group>
                   </Box>
 
-                  <SimpleGrid cols={{ base: 2, sm: 4 }}>
+                  <SimpleGrid cols={2} spacing="xs">
                     <NumberInput
+                      size="xs"
                       label="Munkaidő kezdete (óra)"
                       min={0}
                       max={22}
@@ -522,6 +619,7 @@ export function SettingsPage({
                       onChange={(v) => setForm({ ...form, autoReplyStartHour: Number(v) || 8 })}
                     />
                     <NumberInput
+                      size="xs"
                       label="Munkaidő vége (óra)"
                       min={1}
                       max={24}
@@ -529,6 +627,7 @@ export function SettingsPage({
                       onChange={(v) => setForm({ ...form, autoReplyEndHour: Number(v) || 18 })}
                     />
                     <NumberInput
+                      size="xs"
                       label="Min. késleltetés (perc)"
                       min={1}
                       max={720}
@@ -536,6 +635,7 @@ export function SettingsPage({
                       onChange={(v) => setForm({ ...form, autoReplyMinDelayMin: Number(v) || 20 })}
                     />
                     <NumberInput
+                      size="xs"
                       label="Max. késleltetés (perc)"
                       min={5}
                       max={1440}
@@ -544,26 +644,29 @@ export function SettingsPage({
                     />
                   </SimpleGrid>
 
-                  <SimpleGrid cols={{ base: 1, sm: 3 }}>
+                  <SimpleGrid cols={3} spacing="xs">
                     <NumberInput
-                      label="IMAP automatikus ellenőrzés (perc, 0 = ki)"
-                      min={0}
+                      size="xs"
+                      label="Automata IMAP lekérés (perc)"
+                      min={1}
                       max={120}
-                      value={form.imapPollMinutes}
-                      onChange={(v) => setForm({ ...form, imapPollMinutes: Number(v) || 0 })}
+                      value={form.imapPollMinutes || 1}
+                      onChange={(v) => setForm({ ...form, imapPollMinutes: Math.max(1, Number(v) || 1) })}
                     />
                     <Select
-                      label="Alapértelmezett kampány hangnem"
+                      size="xs"
+                      label="Alap hangnem"
                       value={form.defaultTone || "professional_formal"}
                       onChange={(v) => setForm({ ...form, defaultTone: v || "professional_formal" })}
                       data={[
-                        { value: "professional_formal", label: "Szakmai, magázódó" },
-                        { value: "friendly_direct", label: "Közvetlen, tegeződő" },
-                        { value: "concise_executive", label: "Tömör, vezetői" },
+                        { value: "professional_formal", label: "Magázó" },
+                        { value: "friendly_direct", label: "Tegező" },
+                        { value: "concise_executive", label: "Tömör" },
                       ]}
                     />
                     <NumberInput
-                      label="Alapértelmezett napi limit"
+                      size="xs"
+                      label="Napi limit"
                       min={1}
                       max={500}
                       value={form.defaultDailyLimit || 35}
@@ -572,77 +675,148 @@ export function SettingsPage({
                   </SimpleGrid>
 
                   <Switch
-                    label="Háttér auto-válasz teszt (szimulált) módban fusson éles SMTP helyett"
-                    checked={form.autoReplyDefaultDryRun}
+                    size="xs"
+                    label="Beérkező levelek automatikus rendezése OpenRouter Decision Model prioritás (1-100) szerint"
+                    checked={form.decisionAutoSortInbox ?? true}
                     onChange={(e) =>
-                      setForm({ ...form, autoReplyDefaultDryRun: e.currentTarget.checked })
+                      setForm({ ...form, decisionAutoSortInbox: e.currentTarget.checked })
                     }
                   />
                 </Stack>
               </Paper>
 
-              <Paper p="md">
-                <Stack gap="sm">
+              <Paper p="sm">
+                <Stack gap="xs">
                   <Text fw={600} size="sm">
-                    AI Elemzési fókusz (Okosűrlap) & Válasz-szabályok személyreszabása
+                    AI Fókusz (Okosűrlap) & Globális szabályok
                   </Text>
                   <Textarea
-                    label="Lead-elemzési fókusz (mit értékeljen az AI minden egyes cégnél)"
-                    description="Ezt használja a rendszer minden weboldal-audit és mély kutatás során a nagyságrendi áttekintés elkészítéséhez."
+                    size="xs"
+                    label="Lead-elemzési fókusz"
+                    autosize
                     minRows={3}
+                    maxRows={6}
                     value={form.aiAnalysisFocus || ""}
                     onChange={(e) => setForm({ ...form, aiAnalysisFocus: e.currentTarget.value })}
                   />
                   <Textarea
-                    label="Globális AI auto-válasz instrukciók / szabályok"
-                    description="Pl. kommunikációs stílus, garanciák, mikor ajánljon hívást, mit ne ígérjen meg."
-                    minRows={3}
-                    placeholder="pl. Válaszolj barátságosan, mindig konkrétan a feltett kérdésre, és röviden emeld ki, hogy az okosűrlap 1 nap alatt beüzemelhető."
+                    size="xs"
+                    label="Globális AI auto-válasz szabályok"
+                    autosize
+                    minRows={2}
+                    maxRows={5}
+                    placeholder="pl. Válaszolj barátságosan, röviden, emeld ki az okosűrlapot..."
                     value={form.aiReplyInstructions || ""}
                     onChange={(e) =>
                       setForm({ ...form, aiReplyInstructions: e.currentTarget.value })
                     }
                   />
-                  <Group justify="flex-end" mt="xs">
-                    <Button
-                      leftSection={<IconCheck size={15} />}
-                      loading={saving}
-                      onClick={handleSaveSettings}
-                    >
-                      Személyreszabás mentése
-                    </Button>
-                  </Group>
+                  <Textarea
+                    size="xs"
+                    label="Alapértelmezett e-mail aláírás (fő aláírás)"
+                    autosize
+                    minRows={2}
+                    maxRows={5}
+                    value={form.companySignature}
+                    onChange={(e) => setForm({ ...form, companySignature: e.currentTarget.value })}
+                  />
+
+                  <Box>
+                    <Group justify="space-between" mb={4}>
+                      <Text size="xs" fw={600}>
+                        Apróbetűs rész az aláírás alatt (Cégadatok, adószám, székhely, jogi / GDPR szöveg)
+                      </Text>
+                      <Button
+                        size="compact-xs"
+                        variant="light"
+                        color="forest"
+                        onClick={() => {
+                          const tpl =
+                            "OKOSűrlap • Székhely: Budapest • Web: https://okosurlap.hu\nEz egy B2B szakmai megkeresés. Amennyiben a jövőben nem szeretne tőlünk üzenetet kapni, kérjük, jelezze egy rövid válaszlevélben.";
+                          setForm({
+                            ...form,
+                            signatureFinePrint: form.signatureFinePrint?.trim()
+                              ? `${form.signatureFinePrint.trim()}\n${tpl}`
+                              : tpl,
+                          });
+                        }}
+                      >
+                        + Cégadatok & GDPR sablon beszúrása
+                      </Button>
+                    </Group>
+                    <Textarea
+                      size="xs"
+                      placeholder="pl. Cégnév Kft. | Székhely: 1051 Budapest, Példa u. 1. | Adószám: 12345678-2-41 | Cégjegyzékszám: 01-09-123456&#10;Amennyiben nem szeretne további megkeresést kapni, válaszoljon 'Leiratkozás' üzenettel."
+                      autosize
+                      minRows={2}
+                      maxRows={5}
+                      value={form.signatureFinePrint || ""}
+                      onChange={(e) =>
+                        setForm({ ...form, signatureFinePrint: e.currentTarget.value })
+                      }
+                    />
+                    <Text size="11px" c="dimmed" mt={3}>
+                      Kiküldéskor az e-mail végén, egy elválasztó vonal alatt automatikusan{" "}
+                      <strong>apróbetűs (11px, halványszürke)</strong> formázással jelenik meg a
+                      címzett postafiókjában.
+                    </Text>
+                  </Box>
+
+                  {/* Live Signature & Fine Print Preview */}
+                  <Paper
+                    p="xs"
+                    style={{
+                      backgroundColor: "var(--ml-canvas)",
+                      border: "1px dashed var(--ml-border-strong)",
+                    }}
+                  >
+                    <Text size="10px" tt="uppercase" fw={700} c="dimmed" mb={4}>
+                      Élő aláírás előnézet (ahogy a kiküldött levél alján megjelenik):
+                    </Text>
+                    <Text size="xs" style={{ whiteSpace: "pre-wrap", lineHeight: 1.5 }}>
+                      {form.companySignature || "Üdvözlettel,\nMyLead Csapat"}
+                    </Text>
+                    {(form.signatureFinePrint || "").trim() && (
+                      <Box
+                        mt={8}
+                        pt={6}
+                        style={{
+                          borderTop: "1px solid var(--ml-border)",
+                          fontSize: "11px",
+                          lineHeight: 1.4,
+                          color: "var(--mantine-color-dimmed)",
+                          whiteSpace: "pre-wrap",
+                        }}
+                      >
+                        {form.signatureFinePrint}
+                      </Box>
+                    )}
+                  </Paper>
                 </Stack>
               </Paper>
-            </Stack>
+            </SimpleGrid>
           </Tabs.Panel>
 
           {/* AI Settings */}
           <Tabs.Panel value="ai">
-            <Stack gap="md" maw={860}>
+            <Stack gap="sm" maw={920}>
               {/* Installed Local CLIs Card */}
-              <Paper p="md">
-                <Group justify="space-between" mb="sm">
-                  <Box>
-                    <Group gap={6}>
-                      <IconTerminal2 size={16} />
-                      <Text fw={600} size="sm">
-                        Gépemre telepített AI CLI-k (API kulcs nélkül, meglévő előfizetéssel)
-                      </Text>
-                    </Group>
-                    <Text size="xs" c="dimmed">
-                      A MyLead automatikusan felismeri a gépeden lévő Claude Code, Codex, OpenCode
-                      és Ollama CLI eszközöket — egy kattintással használhatod őket.
+              <Paper p="sm">
+                <Group justify="space-between" mb="xs">
+                  <Group gap={6}>
+                    <IconTerminal2 size={15} />
+                    <Text fw={600} size="sm">
+                      Telepített AI CLI-k (API kulcs nélkül)
                     </Text>
-                  </Box>
+                  </Group>
                   <Button
-                    size="xs"
+                    size="compact-xs"
                     variant="default"
-                    leftSection={<IconRefresh size={13} />}
+                    leftSection={<IconRefresh size={12} />}
                     loading={probingClis}
                     onClick={refreshLocalClis}
                   >
-                    Újraellenőrzés
+                    Frissítés
                   </Button>
                 </Group>
 
@@ -689,16 +863,16 @@ export function SettingsPage({
               </Paper>
 
               {/* Main AI Provider Configuration */}
-              <Paper p="md">
-                <Stack gap="sm">
-                  <Text fw={600} size="sm">
-                    AI Szolgáltató & Modell konfiguráció
-                  </Text>
-                  <Text size="xs" c="dimmed">
-                    Támogatott: <strong>OpenRouter API</strong>, <strong>OpenCode Go API</strong>,
-                    gépre telepített <strong>Claude Code / Codex / OpenCode CLI</strong>, OpenAI,
-                    Anthropic, Google Gemini, Ollama és lokális heurisztikus mód.
-                  </Text>
+              <Paper p="sm">
+                <Stack gap="xs">
+                  <Group justify="space-between">
+                    <Text fw={600} size="sm">
+                      AI Szolgáltató & Modell
+                    </Text>
+                    <Button size="compact-xs" variant="default" loading={testingAi} onClick={handleTestAi}>
+                      Kapcsolat tesztelése
+                    </Button>
+                  </Group>
 
                   <SimpleGrid cols={{ base: 1, sm: 2 }}>
                     <Select
@@ -835,26 +1009,106 @@ export function SettingsPage({
                       />
                     )
                   )}
+                </Stack>
+              </Paper>
 
-                  <Textarea
-                    label="Alapértelmezett e-mail aláírás"
-                    minRows={3}
-                    value={form.companySignature}
-                    onChange={(e) => setForm({ ...form, companySignature: e.currentTarget.value })}
+              {/* OpenRouter Decisions API — Decision Model for inbound email ranking & tagging */}
+              <Paper p="sm" style={{ borderColor: "#166534" }}>
+                <Stack gap="xs">
+                  <Group justify="space-between" wrap="wrap">
+                    <Box>
+                      <Group gap={6}>
+                        <Text fw={700} size="sm">
+                          OpenRouter Decisions API — döntő modell (beérkező e-mail rangsorolás & címkézés)
+                        </Text>
+                        <Badge size="xs" color="forest">
+                          choice · score · noul
+                        </Badge>
+                      </Group>
+                      <Text size="xs" c="dimmed" mt={2}>
+                        A Decisions API típusos döntéseket ad vissza szöveg helyett: szándék (choice),
+                        prioritás (score + choice), címkék (noul). Az ajánlott válasz szövegét a helyi
+                        válaszépítő állítja elő, mert a döntési modellek nem írnak szöveget.
+                      </Text>
+                    </Box>
+                    <Switch
+                      size="xs"
+                      label="Automata prioritás-sorrend"
+                      checked={form.decisionAutoSortInbox ?? true}
+                      onChange={(e) =>
+                        setForm({ ...form, decisionAutoSortInbox: e.currentTarget.checked })
+                      }
+                    />
+                  </Group>
+
+                  <Select
+                    size="xs"
+                    label="Döntési API mód"
+                    value={form.decisionModelApi || "decisions"}
+                    onChange={(v) =>
+                      setForm({
+                        ...form,
+                        decisionModelProvider: "openrouter",
+                        decisionModelApi: v || "decisions",
+                      })
+                    }
+                    data={[
+                      { value: "decisions", label: "Decisions API (ajánlott — típusos döntések)" },
+                      { value: "chat", label: "Chat Completions + Structured Outputs (régi mód)" },
+                    ]}
                   />
 
-                  <Group justify="flex-end" mt="xs">
-                    <Button variant="default" loading={testingAi} onClick={handleTestAi}>
-                      Kapcsolat / CLI tesztelése
-                    </Button>
+                  <Group align="flex-end" gap="xs" wrap="wrap">
+                    <Select
+                      size="xs"
+                      label="Döntési modell (OpenRouter Decisions modell)"
+                      searchable
+                      style={{ flex: 1, minWidth: 260 }}
+                      value={form.decisionModelId || "typesafe/jev-1.14"}
+                      onChange={(v) =>
+                        setForm({
+                          ...form,
+                          decisionModelProvider: "openrouter",
+                          decisionModelId: v || "typesafe/jev-1.14",
+                        })
+                      }
+                      data={decisionModelSelectData}
+                    />
                     <Button
-                      leftSection={<IconCheck size={15} />}
-                      loading={saving}
-                      onClick={handleSaveSettings}
+                      size="xs"
+                      variant="default"
+                      loading={loadingDecisionModels}
+                      onClick={handleFetchDecisionModels}
                     >
-                      Beállítások mentése
+                      Modellek frissítése
                     </Button>
                   </Group>
+
+                  <TextInput
+                    size="xs"
+                    label="Egyedi döntési modell azonosító"
+                    description="Bármely OpenRouter döntési modell slugja. A lista a /api/v1/models?output_modalities=decisions végpontról jön."
+                    placeholder="pl. typesafe/jev-1.14 vagy cloudflare/clef-flash"
+                    value={form.decisionModelId || "typesafe/jev-1.14"}
+                    onChange={(e) =>
+                      setForm({
+                        ...form,
+                        decisionModelProvider: "openrouter",
+                        decisionModelId: e.currentTarget.value,
+                      })
+                    }
+                  />
+
+                  <PasswordInput
+                    size="xs"
+                    label="OpenRouter API kulcs a döntő modellhez (sk-or-v1-...)"
+                    description="Itt állítsd be az API kulcsot (https://openrouter.ai/keys). Ha üresen hagyod és a fő AI szolgáltatód is OpenRouter, automatikusan a fenti OpenRouter API kulcsot használja."
+                    placeholder="sk-or-v1-... (vagy üres = fő OpenRouter kulcs használata)"
+                    value={form.decisionModelApiKey || ""}
+                    onChange={(e) =>
+                      setForm({ ...form, decisionModelApiKey: e.currentTarget.value })
+                    }
+                  />
                 </Stack>
               </Paper>
             </Stack>
@@ -862,44 +1116,37 @@ export function SettingsPage({
 
           {/* Discovery APIs & Open-Source Scrapers */}
           <Tabs.Panel value="discovery">
-            <Stack gap="md" maw={860}>
-              <Paper p="md">
-                <Group justify="space-between" mb="sm">
-                  <Box>
-                    <Text fw={600} size="sm">
-                      Nyílt forráskódú keresőmotorok & Google Maps Scraper állapot
-                    </Text>
-                    <Text size="xs" c="dimmed">
-                      Az „Okos Hibrid” algoritmus automatikusan ötvözi a rendelkezésre álló
-                      ingyenes motorokat, kiszűri a gyűjtőoldalakat (Facebook, Aranyoldalak stb.),
-                      és párhuzamosan auditálja a talált cégek weboldalait.
-                    </Text>
-                  </Box>
+            <Stack gap="sm" maw={920}>
+              <Paper p="sm">
+                <Group justify="space-between" mb="xs">
+                  <Text fw={600} size="sm">
+                    Keresőmotorok & Scraper állapot
+                  </Text>
                   <Button
-                    size="xs"
+                    size="compact-xs"
                     variant="default"
-                    leftSection={<IconRefresh size={13} />}
+                    leftSection={<IconRefresh size={12} />}
                     loading={probingClis}
                     onClick={refreshLocalClis}
                   >
-                    Állapot frissítése
+                    Frissítés
                   </Button>
                 </Group>
 
-                <Stack gap="xs">
+                <SimpleGrid cols={{ base: 1, sm: 2 }} spacing="xs">
                   {discoveryTools.map((tool) => (
                     <Paper key={tool.id} p="xs">
                       <Group justify="space-between" wrap="nowrap">
-                        <Box>
-                          <Group gap={6}>
-                            <Text size="xs" fw={600}>
+                        <Box style={{ minWidth: 0 }}>
+                          <Group gap={6} wrap="nowrap">
+                            <Text size="xs" fw={600} truncate>
                               {tool.name}
                             </Text>
                             <Badge size="xs" color={tool.available ? "green" : "gray"}>
-                              {tool.available ? "Aktív / Kész" : "Nincs telepítve"}
+                              {tool.available ? "Kész" : "Hiányzik"}
                             </Badge>
                           </Group>
-                          <Text size="11px" c="dimmed" mt={2}>
+                          <Text size="11px" c="dimmed" truncate mt={2}>
                             {tool.detail}
                           </Text>
                         </Box>
@@ -910,19 +1157,19 @@ export function SettingsPage({
                             loading={installingScraper}
                             onClick={handleInstallGmapsScraper}
                           >
-                            Telepítés (Go)
+                            Telepítés
                           </Button>
                         )}
                       </Group>
                     </Paper>
                   ))}
-                </Stack>
+                </SimpleGrid>
               </Paper>
 
-              <Paper p="md">
-                <Stack gap="sm">
+              <Paper p="sm">
+                <Stack gap="xs">
                   <Text fw={600} size="sm">
-                    Keresőmotor beállítások & opcionális API kulcsok
+                    Keresőmotor beállítások & API kulcsok
                   </Text>
 
                   <SimpleGrid cols={{ base: 1, sm: 2 }}>

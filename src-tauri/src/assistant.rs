@@ -671,10 +671,46 @@ pub async fn execute_search_pipeline(
                 }));
             }
 
-            // Wait for all 5 in this batch to complete, saving each result immediately
+            // Wait for all 5 in this batch to complete, filtering out non-matching noise and saving verified leads with AI-cleaned names
             for h in handles {
                 if let Ok(Some((lead_id, comp, lead, crawled_opt, analysis, deep_enriched))) = h.await {
                     total_processed += 1;
+                    let dom = crawler::extract_domain(&comp.website_url);
+                    let clean_name = if !analysis.company_name.trim().is_empty() {
+                        analysis.company_name.trim().to_string()
+                    } else {
+                        comp.company_name.clone()
+                    };
+
+                    // Strict gate: only keep leads in the search that genuinely match the search criteria!
+                    if !analysis.matches_search || analysis.fit_score < 48 {
+                        {
+                            let db = app.state::<Database>();
+                            let _ = db.remove_rejected_search_lead(search_id, &lead_id);
+                        }
+                        let reject_msg = format!(
+                            "Kiszűrve ({}/{}) — {} ({}): nem felel meg a keresési feltételeknek (Fit {})",
+                            total_processed, target_total, clean_name, dom, analysis.fit_score
+                        );
+                        emit_live(
+                            app,
+                            search_id,
+                            "lead_done",
+                            Some(lead_id),
+                            Some(clean_name),
+                            Some(dom),
+                            Some(analysis.fit_score),
+                            Some("disqualified".to_string()),
+                            reject_msg,
+                            total_processed,
+                            target_total,
+                            round,
+                            global_batch,
+                            continuous,
+                        );
+                        continue;
+                    }
+
                     let audit_ref = crawled_opt.as_ref().map(|c| &c.audit);
                     let is_promising = analysis.fit_score >= search.auto_enrich_threshold;
                     let status = if deep_enriched {
@@ -696,7 +732,7 @@ pub async fn execute_search_pipeline(
                     if let Some(ref em) = first_email {
                         if !contacts.iter().any(|c| c.email.eq_ignore_ascii_case(em)) {
                             contacts.push(LeadContact {
-                                name: format!("{} Kapcsolat", comp.company_name),
+                                name: format!("{} Kapcsolat", clean_name),
                                 role: "Központi / Vezetőség".to_string(),
                                 email: em.clone(),
                                 phone: first_phone.clone().unwrap_or_default(),
@@ -708,6 +744,11 @@ pub async fn execute_search_pipeline(
                     let tech = audit_ref.map(|a| a.tech_stack.clone()).unwrap_or_default();
                     {
                         let db = app.state::<Database>();
+                        let _ = db.update_lead_identity(
+                            &lead_id,
+                            Some(&clean_name),
+                            Some(&analysis.detected_industry),
+                        );
                         let _ = db.update_lead_enrichment(
                             &lead_id,
                             analysis.fit_score,
@@ -726,7 +767,6 @@ pub async fn execute_search_pipeline(
                         );
                     }
 
-                    let dom = crawler::extract_domain(&comp.website_url);
                     let audit_score_str = audit_ref
                         .map(|a| format!(" • Audit: {}/100", a.overall_score))
                         .unwrap_or_default();
@@ -734,7 +774,7 @@ pub async fn execute_search_pipeline(
                         "Kész ({}/{}) — {}: Fit {}{}{}",
                         total_processed,
                         target_total,
-                        comp.company_name,
+                        clean_name,
                         analysis.fit_score,
                         audit_score_str,
                         if deep_enriched { " [Mély dosszié]" } else { "" }
@@ -744,7 +784,7 @@ pub async fn execute_search_pipeline(
                         search_id,
                         "lead_done",
                         Some(lead_id),
-                        Some(comp.company_name),
+                        Some(clean_name),
                         Some(dom),
                         Some(analysis.fit_score),
                         Some(status.to_string()),
@@ -1032,14 +1072,30 @@ pub async fn run_central_assistant(
         }
     }
 
-    // Include BOTH top 25 AND bottom 25 leads (deduplicated) so assistant sees both best & weakest leads
+    // Include BOTH top 25 AND bottom 25 leads (prioritizing active_search_id if set) with domain, industry & search provenance
+    let scoped_leads: Vec<&Lead> = if let Some(asid) = active_search_id.filter(|s| !s.is_empty()) {
+        let matching: Vec<&Lead> = leads
+            .iter()
+            .filter(|l| l.searches.iter().any(|sp| sp.search_id == asid))
+            .collect();
+        if matching.is_empty() {
+            leads.iter().collect()
+        } else {
+            matching
+        }
+    } else {
+        leads.iter().collect()
+    };
+
     let mut seen_lead_ids: HashSet<String> = HashSet::new();
     let mut sample_leads: Vec<Value> = Vec::new();
-    for l in leads.iter().take(25).chain(leads.iter().rev().take(25)) {
+    for l in scoped_leads.iter().take(25).chain(scoped_leads.iter().rev().take(25)) {
         if seen_lead_ids.insert(l.id.clone()) {
             sample_leads.push(serde_json::json!({
                 "id": l.id,
                 "name": l.company_name,
+                "domain": l.domain,
+                "industry": l.industry,
                 "email": l.primary_email,
                 "fit": l.fit_score,
                 "status": l.status,
@@ -1047,22 +1103,6 @@ pub async fn run_central_assistant(
             }));
         }
     }
-
-    let all_offers: Vec<Value> = projects
-        .iter()
-        .flat_map(|p| {
-            p.offers.iter().map(move |o| {
-                serde_json::json!({
-                    "id": o.id,
-                    "projectId": p.id,
-                    "projectName": p.name,
-                    "title": o.title,
-                    "val": o.discount_value,
-                    "active": o.active
-                })
-            })
-        })
-        .collect();
 
     let scheduled_count = threads
         .iter()
@@ -1073,7 +1113,6 @@ pub async fn run_central_assistant(
         "activeSearchId": active_search_id,
         "stats": {
             "projects": projects.len(),
-            "offers": all_offers.len(),
             "searches": searches.len(),
             "leadsTotal": leads.len(),
             "leadsWithoutEmail": without_email_count,
@@ -1099,9 +1138,8 @@ pub async fn run_central_assistant(
             "minDelayMin": settings.auto_reply_min_delay_min,
             "maxDelayMin": settings.auto_reply_max_delay_min
         },
-        "offers": all_offers,
         "projects": projects.iter().take(6).map(|p| serde_json::json!({
-            "id": p.id, "name": p.name, "url": p.website_url
+            "id": p.id, "name": p.name, "url": p.website_url, "emailSignature": p.email_signature
         })).collect::<Vec<_>>(),
         "searches": searches.iter().take(12).map(|s| serde_json::json!({
             "id": s.id, "name": s.name, "query": s.query, "loc": s.location,
@@ -1109,7 +1147,14 @@ pub async fn run_central_assistant(
         })).collect::<Vec<_>>(),
         "leadsSample": sample_leads,
         "campaigns": campaigns.iter().take(10).map(|c| serde_json::json!({
-            "id": c.id, "name": c.name, "offer": c.offer_title, "recipients": c.total_recipients, "sent": c.sent_count, "replies": c.reply_count
+            "id": c.id,
+            "name": c.name,
+            "offerSummary": if !c.offer_summary.is_empty() { c.offer_summary.as_str() } else { c.offer_title.as_deref().unwrap_or("") },
+            "offerTiming": c.offer_timing,
+            "offerDelivery": c.offer_delivery,
+            "recipients": c.total_recipients,
+            "sent": c.sent_count,
+            "replies": c.reply_count
         })).collect::<Vec<_>>(),
         "inboxThreads": threads.iter().take(12).map(|t| serde_json::json!({
             "leadId": t.lead_id,
@@ -1134,15 +1179,14 @@ ELÉRHETŐ ESZKÖZÖK (MINDEN VALÓBAN VÉGREHAJTÓDIK):
 - enrich_leads: {"leadIds":[],"minScore":70}
 - create_project: {"name","websiteUrl","industry","description","bookingUrl","landingUrl"}
 - crawl_project: {"projectId":"id|LAST"}
-- create_offer: {"projectId":"id|LAST","title","offerType":"discount|free_trial|audit|bundle|custom","discountValue","description","ctaText"}
-- create_search: {"projectId":"id|LAST","offerId","name","query","industry","location","companySize":"any|1-10|11-50|51-200|200+","targetProblem","source":"smart_hybrid|duckduckgo|gmaps_scraper|ai_cli_search|osm","maxResults":15,"autoAudit":true,"autoEnrichThreshold":70}
+- create_search: {"projectId":"id|LAST","name","query","industry","location","companySize":"any|1-10|11-50|51-200|200+","targetProblem","source":"smart_hybrid|duckduckgo|gmaps_scraper|ai_cli_search|osm","maxResults":15,"autoAudit":true,"autoEnrichThreshold":70}
 - update_search: {"searchId":"id|activeSearchId","name","query","industry","location","companySize","targetProblem","source","maxResults","autoEnrichThreshold"}
 - run_search: {"searchId":"id|LAST|activeSearchId","continuous":false}
 - stop_search: {"searchId":"id|activeSearchId"}
-- create_campaign: {"name","offerId","projectId","searchId","leadIds":[],"minScore":null,"tone":"professional_formal|friendly_direct|concise_executive","autoReplyMode":"draft|autopilot|manual","includeBookingLink":false,"customInstructions":""} — Ajánlat (offerId) alapján hoz létre kampányt!
+- create_campaign: {"name","projectId":"id|LAST","offerSummary":"pl. 5 000 Ft kedvezmény","offerTiming":"first_email|on_interest|on_objection|custom","offerDelivery":"pl. Csak akkor ajánld fel, ha tényleg érdeklődik az okosűrlap iránt!","searchId","leadIds":[],"minScore":null,"tone":"professional_formal|friendly_direct|concise_executive","autoReplyMode":"draft|autopilot|manual","includeBookingLink":false,"customInstructions":""} — Az ajánlat és annak tálalási szabálya MINDIG kampányonként van megadva (projekteknél nincs ajánlat)!
 - add_leads_to_campaign: {"campaignId":"id|LAST","leadIds":[],"minScore":null,"searchId":null,"generateDrafts":true} — Meglévő kampányba veszi a leadeket!
 - send_campaign: {"campaignId":"id|LAST","dryRun":true}
-- send_direct_email: {"leadId","offerId","subject","body","generateWithAi":true,"instruction":"","scheduleMode":"now|auto_random","dryRun":false} — Közvetlen üzenet küldése vagy időzítése egy leadnek.
+- send_direct_email: {"leadId","subject","body","generateWithAi":true,"instruction":"","scheduleMode":"now|auto_random","dryRun":false} — Közvetlen üzenet küldése vagy időzítése egy leadnek.
 - control_auto_reply: {"messageId":"id|ALL","leadId":null,"action":"pause|cancel|resume|reschedule_random|rewrite|send_now","instruction":"","dryRun":false} — Időzített AI auto-válasz megállítása, átírása megjegyzéssel, újraidőzítése vagy azonnali küldése!
 - update_settings: {"autoReplyEnabled":true,"autoReplyWorkdays":[1,2,3,4,5,6],"autoReplyStartHour":8,"autoReplyEndHour":18,"autoReplyMinDelayMin":20,"autoReplyMaxDelayMin":120,"aiAnalysisFocus":null,"aiReplyInstructions":null,"companySignature":null}
 - load_demo_data: {}
@@ -1353,32 +1397,48 @@ FONTOS: Ha a felhasználó konkrét műveletet kér (pl. törlés, státuszvált
                         .collect();
                     let cnt = targets.len();
                     if let Ok(proj) = db.get_project(&camp.project_id) {
-                        let offer = camp.offer_id.as_deref().and_then(|oid| db.get_offer(oid).ok().flatten()).or_else(|| proj.offers.first().cloned());
-                        let app_c = app.clone();
-                        let settings_c = settings.clone();
-                        let camp_c = camp.clone();
-                        tokio::spawn(async move {
-                            for l in &targets {
-                                let (subj, body) = if generate_drafts {
-                                    let gen = ai::generate_cold_email(
-                                        &settings_c, &proj, offer.as_ref(), l,
-                                        &camp_c.tone, &camp_c.language, camp_c.include_booking_link, &camp_c.custom_instructions,
-                                    ).await;
-                                    (gen.subject, gen.body)
-                                } else {
-                                    (format!("{} — megkeresés", l.company_name), format!("Tisztelt {}!\n\n{}", l.company_name, settings_c.company_signature))
-                                };
-                                let db_bg = app_c.state::<Database>();
-                                let _ = db_bg.insert_email_message(
-                                    Some(&camp_c.id), &l.id, "outbound", "draft", 1,
-                                    &subj, &body, None, None, None, None, false, None,
+                        for l in &targets {
+                            if generate_drafts {
+                                let _ = db.insert_email_message(
+                                    Some(&camp.id),
+                                    &l.id,
+                                    "outbound",
+                                    "generating",
+                                    1,
+                                    &format!("Személyre szabott levél készül — {}...", l.company_name),
+                                    "Az AI több szálon írja az emberi hangvételű, cégre szabott megkeresést a háttérben...",
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    false,
+                                    None,
+                                );
+                            } else {
+                                let _ = db.insert_email_message(
+                                    Some(&camp.id),
+                                    &l.id,
+                                    "outbound",
+                                    "draft",
+                                    1,
+                                    &format!("{} — megkeresés", l.company_name),
+                                    &format!("Kedves {} Csapat!\n\n{}", l.company_name, ai::resolve_email_signature(Some(&proj), &settings)),
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    false,
+                                    None,
                                 );
                             }
-                        });
+                        }
+                        if generate_drafts && cnt > 0 {
+                            crate::commands::spawn_pending_email_generator(app.clone());
+                        }
                         data_changed = cnt > 0;
                         action_logs.push(AssistantActionLog {
                             tool: "add_leads_to_campaign".into(),
-                            summary: format!("{} új lead hozzáadva a „{}” kampányhoz", cnt, camp.name),
+                            summary: format!("{} új lead hozzáadva a „{}” kampányhoz (párhuzamos AI generálás indult)", cnt, camp.name),
                             ok: true,
                         });
                     }
@@ -1407,6 +1467,9 @@ FONTOS: Ha a felhasználó konkrét műveletet kér (pl. törlés, státuszvált
                                     &settings,
                                     p,
                                     offer.as_ref().or_else(|| p.offers.first()),
+                                    "",
+                                    "first_email",
+                                    "",
                                     &lead,
                                     &settings.default_tone,
                                     &settings.default_language,
@@ -1446,7 +1509,15 @@ FONTOS: Ha a felhasználó konkrét műveletet kér (pl. törlés, státuszvált
                             let msg_id_res = if dry_run {
                                 Ok(format!("<asst-sim-{}.mylead@local>", uuid::Uuid::new_v4()))
                             } else if let Some(acc) = senders.iter().find(|a| a.is_default).or_else(|| senders.first()) {
-                                mailer::send_email(acc, &lead.primary_email, &subj, &body, None).await
+                                mailer::send_email(
+                                    acc,
+                                    &lead.primary_email,
+                                    &subj,
+                                    &body,
+                                    None,
+                                    Some(settings.signature_fine_print.as_str()),
+                                )
+                                .await
                             } else {
                                 Err("Nincs küldő fiók beállítva".to_string())
                             };
@@ -1613,6 +1684,7 @@ FONTOS: Ha a felhasználó konkrét műveletet kér (pl. törlés, státuszvált
                     description: args["description"].as_str().unwrap_or_default().to_string(),
                     booking_url: args["bookingUrl"].as_str().unwrap_or_default().to_string(),
                     landing_url: args["landingUrl"].as_str().unwrap_or_default().to_string(),
+                    email_signature: args["emailSignature"].as_str().map(|s| s.to_string()),
                     value_proposition: None,
                     target_audience: None,
                     pain_points_solved: None,
@@ -1707,6 +1779,7 @@ FONTOS: Ha a felhasználó konkrét műveletet kér (pl. törlés, státuszvált
                         description: "Automatikusan létrehozott projekt".into(),
                         booking_url: String::new(),
                         landing_url: String::new(),
+                        email_signature: None,
                         value_proposition: None,
                         target_audience: None,
                         pain_points_solved: None,
@@ -1736,7 +1809,7 @@ FONTOS: Ha a felhasználó konkrét műveletet kér (pl. törlés, státuszvált
                     company_size: args["companySize"].as_str().unwrap_or("any").to_string(),
                     target_problem: args["targetProblem"].as_str().unwrap_or_default().to_string(),
                     source: args["source"].as_str().unwrap_or("smart_hybrid").to_string(),
-                    max_results: args["maxResults"].as_i64().unwrap_or(15).clamp(1, 60),
+                    max_results: args["maxResults"].as_i64().unwrap_or(15).max(1),
                     auto_audit: args["autoAudit"].as_bool().unwrap_or(true),
                     auto_enrich_threshold: args["autoEnrichThreshold"].as_i64().unwrap_or(70).clamp(10, 95),
                 }) {
@@ -1772,7 +1845,7 @@ FONTOS: Ha a felhasználó konkrét műveletet kér (pl. törlés, státuszvált
                             company_size: args["companySize"].as_str().unwrap_or(&cur.company_size).to_string(),
                             target_problem: args["targetProblem"].as_str().unwrap_or(&cur.target_problem).to_string(),
                             source: args["source"].as_str().unwrap_or(&cur.source).to_string(),
-                            max_results: args["maxResults"].as_i64().unwrap_or(cur.max_results).clamp(1, 60),
+                            max_results: args["maxResults"].as_i64().unwrap_or(cur.max_results).max(1),
                             auto_audit: args["autoAudit"].as_bool().unwrap_or(cur.auto_audit),
                             auto_enrich_threshold: args["autoEnrichThreshold"].as_i64().unwrap_or(cur.auto_enrich_threshold).clamp(10, 95),
                         };
@@ -1863,6 +1936,10 @@ FONTOS: Ha a felhasználó konkrét műveletet kér (pl. törlés, státuszvált
                                 db_bg.get_lead(&lid).ok()
                             };
                             if let Some(lead) = lead_opt {
+                                let lead_search_opt = {
+                                    let db_bg = app_c.state::<Database>();
+                                    lead.searches.first().and_then(|sp| db_bg.get_search(&sp.search_id).ok())
+                                };
                                 let crawled = if !lead.website_url.is_empty() {
                                     crawler::crawl_website(&lead.website_url, 5).await.ok()
                                 } else {
@@ -1870,11 +1947,16 @@ FONTOS: Ha a felhasználó konkrét műveletet kér (pl. törlés, státuszvált
                                 };
                                 let audit_ref = crawled.as_ref().map(|c| &c.audit);
                                 let txt = crawled.as_ref().map(|c| c.combined_text.as_str()).unwrap_or("");
-                                let an = ai::audit_and_score_lead(&settings_c, &proj, proj.offers.first(), None, &lead, audit_ref, txt).await;
+                                let an = ai::audit_and_score_lead(&settings_c, &proj, proj.offers.first(), lead_search_opt.as_ref(), &lead, audit_ref, txt).await;
                                 let first_em = audit_ref.and_then(|a| a.extracted_emails.first().cloned());
                                 let first_ph = audit_ref.and_then(|a| a.extracted_phones.first().cloned());
                                 let tech = audit_ref.map(|a| a.tech_stack.clone()).unwrap_or_else(|| lead.tech_stack.clone());
                                 let db_bg = app_c.state::<Database>();
+                                let _ = db_bg.update_lead_identity(
+                                    &lid,
+                                    Some(&an.company_name),
+                                    Some(&an.detected_industry),
+                                );
                                 let _ = db_bg.update_lead_enrichment(
                                     &lid, an.fit_score, "enriched", true, &an.employee_estimate,
                                     &an.company_summary, &an.pain_points, &an.how_we_can_help,
@@ -1923,11 +2005,13 @@ FONTOS: Ha a felhasználó konkrét műveletet kér (pl. törlés, státuszvált
                     follow_up_days: 3,
                     include_booking_link: args["includeBookingLink"].as_bool().unwrap_or(false),
                     custom_instructions: args["customInstructions"].as_str().unwrap_or_default().to_string(),
+                    offer_summary: args["offerSummary"].as_str().unwrap_or_default().to_string(),
+                    offer_timing: args["offerTiming"].as_str().unwrap_or("on_interest").to_string(),
+                    offer_delivery: args["offerDelivery"].as_str().unwrap_or_default().to_string(),
                     lead_ids: lead_ids.clone(),
                 };
 
-                if let (Ok(proj), Ok(camp)) = (db.get_project(&pid), db.create_campaign(&input)) {
-                    let offer = resolved_offer.or_else(|| proj.offers.first().cloned());
+                if let (Ok(_proj), Ok(camp)) = (db.get_project(&pid), db.create_campaign(&input)) {
                     let min_sc = args["minScore"].as_i64().unwrap_or(70);
                     let targets: Vec<Lead> = if !lead_ids.is_empty() {
                         lead_ids.iter().filter_map(|id| db.get_lead(id).ok()).filter(|l| !l.primary_email.is_empty()).collect()
@@ -1939,36 +2023,40 @@ FONTOS: Ha a felhasználó konkrét műveletet kér (pl. törlés, státuszvált
                     let target_count = targets.len();
                     let camp_id = camp.id.clone();
                     let camp_name = camp.name.clone();
-                    let app_c = app.clone();
-                    let settings_c = settings.clone();
 
-                    // Generate personalized email drafts in background so assistant responds fast!
-                    tokio::spawn(async move {
-                        for l in &targets {
-                            let gen = ai::generate_cold_email(
-                                &settings_c, &proj, offer.as_ref(), l,
-                                &camp.tone, &camp.language, camp.include_booking_link, &camp.custom_instructions,
-                            ).await;
-                            let db_bg = app_c.state::<Database>();
-                            let _ = db_bg.insert_email_message(
-                                Some(&camp.id), &l.id, "outbound", "draft", 1,
-                                &gen.subject, &gen.body, None, None, None, None, false, None,
-                            );
-                        }
-                    });
+                    for l in &targets {
+                        let _ = db.insert_email_message(
+                            Some(&camp.id),
+                            &l.id,
+                            "outbound",
+                            "generating",
+                            1,
+                            &format!("Személyre szabott levél készül — {}...", l.company_name),
+                            "Az AI több szálon írja az emberi hangvételű, cégre szabott megkeresést a háttérben...",
+                            None,
+                            None,
+                            None,
+                            None,
+                            false,
+                            None,
+                        );
+                    }
+                    if target_count > 0 {
+                        crate::commands::spawn_pending_email_generator(app.clone());
+                    }
 
                     last_campaign_id = camp_id;
                     data_changed = true;
                     action_logs.push(AssistantActionLog {
                         tool: "create_campaign".into(),
-                        summary: format!("Kampány létrehozva: {} ({} levéltervezet generálása indult)", camp_name, target_count),
+                        summary: format!("Kampány létrehozva: {} ({} levél párhuzamos AI generálása elindult)", camp_name, target_count),
                         ok: true,
                     });
                 }
             }
             "send_campaign" => {
                 let cid = resolve_id(args["campaignId"].as_str(), &last_campaign_id);
-                let dry_run = args["dryRun"].as_bool().unwrap_or(true);
+                let dry_run = args["dryRun"].as_bool().unwrap_or(false);
                 if let Ok(camp) = db.get_campaign(&cid) {
                     let msgs: Vec<EmailMessage> = db.list_campaign_messages(&cid).unwrap_or_default()
                         .into_iter().filter(|m| m.direction == "outbound" && m.status == "draft").collect();
@@ -1979,7 +2067,16 @@ FONTOS: Ha a felhasználó konkrét műveletet kér (pl. törlés, státuszvált
                             let _ = db.mark_email_sent(&m.id, &format!("<sim-{}.mylead@local>", uuid::Uuid::new_v4()), false);
                             sent += 1;
                         } else if let Some(ref acc) = acc_opt {
-                            if let Ok(mid) = mailer::send_email(acc, &m.lead_email, &m.subject, &m.body, None).await {
+                            if let Ok(mid) = mailer::send_email(
+                                acc,
+                                &m.lead_email,
+                                &m.subject,
+                                &m.body,
+                                None,
+                                Some(settings.signature_fine_print.as_str()),
+                            )
+                            .await
+                            {
                                 let _ = db.mark_email_sent(&m.id, &mid, false);
                                 sent += 1;
                             }
@@ -2278,6 +2375,7 @@ pub fn import_csv_and_evaluate(
                         description: "CSV importáláshoz létrehozott projekt".into(),
                         booking_url: String::new(),
                         landing_url: String::new(),
+                        email_signature: None,
                         value_proposition: None,
                         target_audience: None,
                         pain_points_solved: None,
@@ -2641,8 +2739,18 @@ pub async fn evaluate_lead_ids_in_batches(
                     }
                 }
                 let tech = audit_ref.map(|a| a.tech_stack.clone()).unwrap_or_default();
+                let clean_name = if !analysis.company_name.trim().is_empty() {
+                    analysis.company_name.trim().to_string()
+                } else {
+                    lead.company_name.clone()
+                };
                 {
                     let db = app.state::<Database>();
+                    let _ = db.update_lead_identity(
+                        &lead.id,
+                        Some(&clean_name),
+                        Some(&analysis.detected_industry),
+                    );
                     let _ = db.update_lead_enrichment(
                         &lead.id,
                         analysis.fit_score,

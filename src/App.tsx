@@ -42,7 +42,8 @@ const defaultSettings: AppSettings = {
   cliSearchEngine: "auto",
   defaultLanguage: "hu",
   companySignature: "Üdvözlettel,\nMyLead Csapat",
-  imapPollMinutes: 5,
+  signatureFinePrint: "",
+  imapPollMinutes: 1,
   autoReplyEnabled: true,
   autoReplyWorkdays: [1, 2, 3, 4, 5, 6],
   autoReplyStartHour: 8,
@@ -55,6 +56,11 @@ const defaultSettings: AppSettings = {
   aiReplyInstructions: "",
   defaultTone: "professional_formal",
   defaultDailyLimit: 35,
+  decisionModelProvider: "openrouter",
+  decisionModelApi: "decisions",
+  decisionModelApiKey: "",
+  decisionModelId: "typesafe/jev-1.14",
+  decisionAutoSortInbox: true,
 };
 
 export default function App() {
@@ -88,6 +94,8 @@ export default function App() {
   const [assistantOpen, setAssistantOpen] = useState(false);
   const [drawerEmailLead, setDrawerEmailLead] = useState<Lead | null>(null);
   const [drawerAddCampLead, setDrawerAddCampLead] = useState<Lead | null>(null);
+  // Per-lead concurrent deep-enrichment tracking (allows launching multiple leads simultaneously!)
+  const [enrichingLeadIds, setEnrichingLeadIds] = useState<string[]>([]);
 
   const refreshAll = useCallback(async () => {
     try {
@@ -110,7 +118,7 @@ export default function App() {
       setThreads(t);
       setSenderAccounts(sa);
       setSuppressions(sup);
-      setSettings(cfg);
+      setSettings((prev) => (JSON.stringify(prev) === JSON.stringify(cfg) ? prev : cfg));
       setAnalytics(an);
       setRunningSearchIds(running);
     } catch (err) {
@@ -128,25 +136,63 @@ export default function App() {
     }
   }, []);
 
+  const refreshInboxBackground = useCallback(async () => {
+    try {
+      const [t, l, c, an] = await Promise.all([
+        api.listInboxThreads(),
+        api.listLeads(),
+        api.listCampaigns(),
+        api.getAnalytics(),
+      ]);
+      setThreads(t);
+      setLeads(l);
+      setCampaigns(c);
+      setAnalytics(an);
+    } catch {
+      // ignore transient refresh error
+    }
+  }, []);
+
+  const refreshCampaignsBackground = useCallback(async () => {
+    try {
+      const [c, an] = await Promise.all([api.listCampaigns(), api.getAnalytics()]);
+      setCampaigns(c);
+      setAnalytics(an);
+    } catch {
+      // ignore transient refresh error
+    }
+  }, []);
+
   useEffect(() => {
     refreshAll();
   }, [refreshAll]);
 
-  // Live refresh when background auto-reply scheduler or IMAP poller updates inbox
+  // Live refresh when background auto-reply scheduler, IMAP poller, or multi-threaded email generator updates
+  // Uses targeted refresh so active forms/settings are never reset while typing!
   useEffect(() => {
-    let unlisten: (() => void) | null = null;
+    let unlistenInbox: (() => void) | null = null;
+    let unlistenCamp: (() => void) | null = null;
     api
       .onInboxUpdated(() => {
-        refreshAll();
+        refreshInboxBackground();
       })
       .then((fn) => {
-        unlisten = fn;
+        unlistenInbox = fn;
+      })
+      .catch(() => {});
+    api
+      .onCampaignUpdated(() => {
+        refreshCampaignsBackground();
+      })
+      .then((fn) => {
+        unlistenCamp = fn;
       })
       .catch(() => {});
     return () => {
-      if (unlisten) unlisten();
+      if (unlistenInbox) unlistenInbox();
+      if (unlistenCamp) unlistenCamp();
     };
-  }, [refreshAll]);
+  }, [refreshInboxBackground, refreshCampaignsBackground]);
 
   // Global ⌘K / Ctrl+K shortcut for Central Assistant
   useEffect(() => {
@@ -247,6 +293,37 @@ export default function App() {
     };
   }, [refreshLeadsAndSearches]);
 
+  const handleEnrichLeadsConcurrent = useCallback(
+    async (leadIds: string[], projectId?: string | null) => {
+      const freshIds = leadIds.filter((id) => !enrichingLeadIds.includes(id));
+      if (freshIds.length === 0) return;
+
+      setEnrichingLeadIds((prev) => Array.from(new Set([...prev, ...freshIds])));
+      try {
+        const updated = await api.enrichLeads(freshIds, projectId || projects[0]?.id || null);
+        await refreshAll();
+        if (updated.length === 1) {
+          notifications.show({
+            title: "Mély adatlap kész",
+            message: `${updated[0].companyName} — Fit: ${updated[0].fitScore}/100`,
+            color: "forest",
+          });
+        } else if (updated.length > 1) {
+          notifications.show({
+            title: "Mély gazdagítás kész",
+            message: `${updated.length} cég teljes adatlapja frissült.`,
+            color: "forest",
+          });
+        }
+      } catch (e) {
+        notifications.show({ title: "Gazdagítási hiba", message: String(e), color: "red" });
+      } finally {
+        setEnrichingLeadIds((prev) => prev.filter((id) => !freshIds.includes(id)));
+      }
+    },
+    [enrichingLeadIds, projects, refreshAll]
+  );
+
   const handleLoadDemo = async () => {
     setLoadingDemo(true);
     try {
@@ -318,10 +395,12 @@ export default function App() {
             leads={leads}
             activeSearchId={activeSearchId}
             runningSearchIds={runningSearchIds}
+            enrichingLeadIds={enrichingLeadIds}
             liveLogsBySearch={liveLogsBySearch}
             liveActiveWorkersBySearch={liveActiveWorkersBySearch}
             onSelectSearchId={setActiveSearchId}
             onSelectLead={setSelectedLead}
+            onEnrichLeads={handleEnrichLeadsConcurrent}
             onRefresh={refreshAll}
             onCreateCampaignFromSearch={(s) => {
               setCampaignPrefillSearch(s);
@@ -341,6 +420,8 @@ export default function App() {
             settings={settings}
             initialSearchFilter={leadsSearchFilter}
             activeLeadWorkers={activeLeadWorkers}
+            enrichingLeadIds={enrichingLeadIds}
+            onEnrichLeads={handleEnrichLeadsConcurrent}
             onSelectLead={setSelectedLead}
             onRefresh={refreshAll}
             onCreateCampaignForLeads={(ids) => {
@@ -357,6 +438,7 @@ export default function App() {
             searches={searches}
             senderAccounts={senderAccounts}
             leads={leads}
+            settings={settings}
             prefillSearch={campaignPrefillSearch}
             prefillLeadIds={campaignPrefillLeads}
             onClearPrefill={() => {
@@ -401,6 +483,13 @@ export default function App() {
         lead={currentSelectedLead}
         projects={projects}
         liveWorker={currentSelectedLead ? activeLeadWorkers[currentSelectedLead.id] || null : null}
+        isEnriching={
+          currentSelectedLead
+            ? enrichingLeadIds.includes(currentSelectedLead.id) ||
+              !!activeLeadWorkers[currentSelectedLead.id]
+            : false
+        }
+        onEnrichLead={(lid) => handleEnrichLeadsConcurrent([lid], projects[0]?.id || null)}
         onClose={() => setSelectedLead(null)}
         onUpdated={(updated) => {
           setSelectedLead(updated);

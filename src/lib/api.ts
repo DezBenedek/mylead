@@ -111,6 +111,16 @@ export const api = {
   updateCampaign: (input: CampaignUpdateInput) => invoke<Campaign>("update_campaign", { input }),
   addLeadsToCampaign: (campaignId: string, leadIds: string[], generateDrafts: boolean) =>
     invoke<Campaign>("add_leads_to_campaign", { campaignId, leadIds, generateDrafts }),
+  regenerateCampaignDrafts: (
+    campaignId: string,
+    instruction?: string | null,
+    saveToCampaign?: boolean
+  ) =>
+    invoke<Campaign>("regenerate_campaign_drafts", {
+      campaignId,
+      instruction: instruction || null,
+      saveToCampaign: saveToCampaign ?? true,
+    }),
   updateEmailDraft: (messageId: string, subject: string, body: string) =>
     invoke<void>("update_email_draft", { messageId, subject, body }),
   regenerateEmailDraft: (messageId: string, instruction?: string | null) =>
@@ -141,6 +151,7 @@ export const api = {
   listInboxThreads: () => invoke<InboxThread[]>("list_inbox_threads"),
   syncImapInbox: (senderAccountId?: string | null) =>
     invoke<number>("sync_imap_inbox", { senderAccountId: senderAccountId || null }),
+  reclassifyInboxThreads: () => invoke<number>("reclassify_inbox_threads"),
   simulateInboundReply: (leadId: string, campaignId: string | null, body: string) =>
     invoke<InboxThread>("simulate_inbound_reply", { leadId, campaignId, body }),
   sendInboxReply: (
@@ -220,6 +231,7 @@ export const api = {
   detectLocalAiClis: () => invoke<LocalCliStatus[]>("detect_local_ai_clis"),
   fetchAiModels: (settings: AppSettings) =>
     invoke<AiModelOption[]>("fetch_ai_models", { settings }),
+  fetchDecisionModels: () => invoke<AiModelOption[]>("fetch_decision_models"),
   detectDiscoveryTools: () => invoke<DiscoveryToolStatus[]>("detect_discovery_tools"),
   installGmapsScraper: () => invoke<string>("install_gmaps_scraper"),
   listSuppressions: () => invoke<SuppressionEntry[]>("list_suppressions"),
@@ -241,6 +253,8 @@ export const api = {
     listen<AssistantStatusEvent>("assistant-status", (event) => cb(event.payload)),
   onInboxUpdated: (cb: () => void): Promise<UnlistenFn> =>
     listen("inbox-updated", () => cb()),
+  onCampaignUpdated: (cb: (campaignId: string) => void): Promise<UnlistenFn> =>
+    listen<string>("campaign-updated", (ev) => cb(ev.payload)),
 };
 
 export function formatCountdown(iso: string | null | undefined): string {

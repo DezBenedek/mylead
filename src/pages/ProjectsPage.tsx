@@ -12,7 +12,6 @@ import {
   Select,
   SimpleGrid,
   Stack,
-  Switch,
   Text,
   Textarea,
   TextInput,
@@ -20,16 +19,14 @@ import {
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import {
-  IconCheck,
   IconEdit,
   IconPlus,
   IconRefresh,
-  IconTag,
   IconTrash,
   IconWorld,
 } from "@tabler/icons-react";
 import { api, formatShortDate } from "../lib/api";
-import type { Offer, Project } from "../types";
+import type { Project } from "../types";
 
 interface Props {
   projects: Project[];
@@ -45,6 +42,7 @@ const emptyProjectForm = {
   description: "",
   bookingUrl: "",
   landingUrl: "",
+  emailSignature: "",
   valueProposition: "",
   targetAudience: "",
   painPointsText: "",
@@ -52,24 +50,10 @@ const emptyProjectForm = {
   objectionHandlersText: "",
 };
 
-const emptyOfferForm = {
-  id: null as string | null,
-  projectId: "",
-  title: "",
-  offerType: "discount",
-  discountValue: "",
-  description: "",
-  ctaText: "15 perces bemutató igénylése",
-  conditions: "",
-  active: true,
-};
-
 export function ProjectsPage({ projects, onRefresh }: Props) {
   const [selectedId, setSelectedId] = useState<string | null>(projects[0]?.id ?? null);
   const [projectModalOpen, setProjectModalOpen] = useState(false);
   const [projectForm, setProjectForm] = useState(emptyProjectForm);
-  const [offerModalOpen, setOfferModalOpen] = useState(false);
-  const [offerForm, setOfferForm] = useState(emptyOfferForm);
   const [saving, setSaving] = useState(false);
   const [crawlingId, setCrawlingId] = useState<string | null>(null);
 
@@ -90,6 +74,7 @@ export function ProjectsPage({ projects, onRefresh }: Props) {
       description: p.description,
       bookingUrl: p.bookingUrl,
       landingUrl: p.landingUrl,
+      emailSignature: p.emailSignature || "",
       valueProposition: p.valueProposition,
       targetAudience: p.targetAudience,
       painPointsText: p.painPointsSolved.join("\n"),
@@ -101,7 +86,11 @@ export function ProjectsPage({ projects, onRefresh }: Props) {
 
   const handleSaveProject = async () => {
     if (!projectForm.name.trim()) {
-      notifications.show({ title: "Hiányzó adat", message: "Add meg a cég/projekt nevét!", color: "red" });
+      notifications.show({
+        title: "Hiányzó adat",
+        message: "Add meg a cég/projekt nevét!",
+        color: "red",
+      });
       return;
     }
     setSaving(true);
@@ -121,6 +110,7 @@ export function ProjectsPage({ projects, onRefresh }: Props) {
         description: projectForm.description.trim(),
         bookingUrl: projectForm.bookingUrl.trim(),
         landingUrl: projectForm.landingUrl.trim(),
+        emailSignature: projectForm.emailSignature.trim(),
         valueProposition: projectForm.valueProposition.trim() || undefined,
         targetAudience: projectForm.targetAudience.trim() || undefined,
         painPointsSolved: projectForm.painPointsText.trim()
@@ -160,7 +150,7 @@ export function ProjectsPage({ projects, onRefresh }: Props) {
       setSelectedId(updated.id);
       notifications.show({
         title: "Weboldal feltérképezve",
-        message: `${updated.crawledPagesCount} aloldal feldolgozva, értékesítési profil frissítve.`,
+        message: `${updated.crawledPagesCount} aloldal feldolgozva.`,
         color: "forest",
       });
     } catch (e) {
@@ -181,89 +171,33 @@ export function ProjectsPage({ projects, onRefresh }: Props) {
     }
   };
 
-  const openNewOffer = (projectId: string) => {
-    setOfferForm({ ...emptyOfferForm, projectId });
-    setOfferModalOpen(true);
-  };
-
-  const openEditOffer = (o: Offer) => {
-    setOfferForm({
-      id: o.id,
-      projectId: o.projectId,
-      title: o.title,
-      offerType: o.offerType,
-      discountValue: o.discountValue,
-      description: o.description,
-      ctaText: o.ctaText,
-      conditions: o.conditions,
-      active: o.active,
-    });
-    setOfferModalOpen(true);
-  };
-
-  const handleSaveOffer = async () => {
-    if (!offerForm.title.trim()) {
-      notifications.show({ title: "Hiányzó adat", message: "Add meg az ajánlat nevét!", color: "red" });
-      return;
-    }
-    setSaving(true);
-    try {
-      await api.saveOffer({
-        id: offerForm.id,
-        projectId: offerForm.projectId,
-        title: offerForm.title.trim(),
-        offerType: offerForm.offerType,
-        discountValue: offerForm.discountValue.trim(),
-        description: offerForm.description.trim(),
-        ctaText: offerForm.ctaText.trim(),
-        conditions: offerForm.conditions.trim(),
-        active: offerForm.active,
-      });
-      await onRefresh();
-      setOfferModalOpen(false);
-      notifications.show({ title: "Ajánlat mentve", message: offerForm.title, color: "forest" });
-    } catch (e) {
-      notifications.show({ title: "Hiba", message: String(e), color: "red" });
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const handleDeleteOffer = async (offerId: string) => {
-    try {
-      await api.deleteOffer(offerId);
-      await onRefresh();
-    } catch (e) {
-      notifications.show({ title: "Hiba", message: String(e), color: "red" });
-    }
-  };
-
   return (
     <Box>
       <Box className="ml-page-header">
         <Group justify="space-between">
           <Box>
-            <Title order={3} style={{ letterSpacing: "-0.02em" }}>
-              Projektek & Ajánlatok
+            <Title order={4} style={{ letterSpacing: "-0.02em" }}>
+              Projektek
             </Title>
-            <Text size="sm" c="dimmed">
-              Cégprofil, weboldal AI feltérképezés, kedvezmények és időpontfoglaló linkek kezelése.
+            <Text size="xs" c="dimmed">
+              Cégprofil, weboldal AI feltérképezés, foglalási linkek és e-mail aláírás (az
+              ajánlatok mindig kampányonként állíthatók be).
             </Text>
           </Box>
-          <Button leftSection={<IconPlus size={15} />} onClick={openNewProject}>
-            Új projekt / cég
+          <Button size="xs" leftSection={<IconPlus size={14} />} onClick={openNewProject}>
+            Új projekt
           </Button>
         </Group>
       </Box>
 
       <Box className="ml-page-body">
         {projects.length === 0 ? (
-          <Paper p="xl">
+          <Paper p="lg">
             <Stack gap="sm" maw={520}>
               <Title order={4}>Még nincs felvett projekt</Title>
               <Text size="sm" c="dimmed">
-                Add meg a céged vagy terméked adatait, weboldalát és kedvezményeit. A rendszer
-                bejárja a weboldalt, megérti mit kínálsz, és felépíti az értékesítési stratégiát.
+                Add meg a céged vagy terméked adatait, weboldalát és e-mail aláírását — a rendszer
+                bejárja a weboldalt és felépíti a tudásbázist.
               </Text>
               <Group>
                 <Button leftSection={<IconPlus size={15} />} onClick={openNewProject}>
@@ -295,8 +229,8 @@ export function ProjectsPage({ projects, onRefresh }: Props) {
                         <Text size="sm" fw={600} truncate>
                           {p.name}
                         </Text>
-                        <Badge size="xs" color="gray">
-                          {p.offers.length} ajánlat
+                        <Badge size="xs" variant="outline" color="forest">
+                          {p.language.toUpperCase()}
                         </Badge>
                       </Group>
                       <Text size="xs" c="dimmed" truncate mt={2}>
@@ -311,21 +245,21 @@ export function ProjectsPage({ projects, onRefresh }: Props) {
             {/* Right Selected Project Detail */}
             {selected && (
               <Grid.Col span={{ base: 12, md: 9 }}>
-                <Stack gap="md">
+                <Stack gap="sm">
                   <Paper p="md">
                     <Group justify="space-between" align="flex-start" wrap="wrap" gap="sm">
-                      <Box>
-                        <Group gap={10}>
+                      <Box style={{ flex: 1, minWidth: 260 }}>
+                        <Group gap={8}>
                           <Title order={4}>{selected.name}</Title>
                           {selected.industry && <Badge variant="default">{selected.industry}</Badge>}
                           <Badge variant="outline" color="forest">
                             {selected.language.toUpperCase()}
                           </Badge>
                         </Group>
-                        <Text size="sm" c="dimmed" mt={4}>
+                        <Text size="xs" c="dimmed" mt={4}>
                           {selected.description || "Nincs megadott leírás."}
                         </Text>
-                        <Group gap="md" mt="xs">
+                        <Group gap="md" mt="xs" wrap="wrap">
                           <Text size="xs" className="ml-mono">
                             Web: {selected.websiteUrl || "—"}
                           </Text>
@@ -333,22 +267,42 @@ export function ProjectsPage({ projects, onRefresh }: Props) {
                             Landing: {selected.landingUrl || "—"}
                           </Text>
                           <Text size="xs" className="ml-mono" c="forest.9">
-                            Időpontfoglaló: {selected.bookingUrl || "Nincs beállítva"}
+                            Foglaló: {selected.bookingUrl || "Nincs beállítva"}
                           </Text>
                         </Group>
+                        {selected.emailSignature && (
+                          <Box
+                            mt="xs"
+                            p="xs"
+                            style={{
+                              backgroundColor: "var(--ml-canvas)",
+                              border: "1px solid var(--ml-border)",
+                              borderRadius: 5,
+                            }}
+                          >
+                            <Text className="ml-section-label" mb={2}>
+                              E-mail aláírás
+                            </Text>
+                            <Text size="xs" style={{ whiteSpace: "pre-line" }}>
+                              {selected.emailSignature}
+                            </Text>
+                          </Box>
+                        )}
                       </Box>
 
                       <Group gap="xs">
                         <Button
-                          leftSection={<IconWorld size={15} />}
+                          size="xs"
+                          leftSection={<IconWorld size={14} />}
                           loading={crawlingId === selected.id}
                           onClick={() => handleCrawlProject(selected)}
                         >
                           Weboldal feltérképezése (AI)
                         </Button>
                         <Button
+                          size="xs"
                           variant="default"
-                          leftSection={<IconEdit size={15} />}
+                          leftSection={<IconEdit size={14} />}
                           onClick={() => openEditProject(selected)}
                         >
                           Szerkesztés
@@ -359,26 +313,24 @@ export function ProjectsPage({ projects, onRefresh }: Props) {
                           onClick={() => handleDeleteProject(selected.id)}
                           title="Projekt törlése"
                         >
-                          <IconTrash size={16} />
+                          <IconTrash size={15} />
                         </ActionIcon>
                       </Group>
                     </Group>
 
                     {selected.crawledSummary && (
                       <Box
-                        mt="md"
-                        p="sm"
+                        mt="sm"
+                        p="xs"
                         style={{
                           backgroundColor: "var(--ml-canvas)",
                           border: "1px solid var(--ml-border)",
                           borderRadius: 5,
                         }}
                       >
-                        <Group justify="space-between" mb={4}>
-                          <Text className="ml-section-label">
-                            Weboldal-feltérképezés összefoglalója
-                          </Text>
-                          <Text size="xs" c="dimmed">
+                        <Group justify="space-between" mb={2}>
+                          <Text className="ml-section-label">Weboldal összefoglaló</Text>
+                          <Text size="11px" c="dimmed">
                             {selected.crawledPagesCount} oldal •{" "}
                             {formatShortDate(selected.lastCrawledAt)}
                           </Text>
@@ -390,20 +342,14 @@ export function ProjectsPage({ projects, onRefresh }: Props) {
 
                   {/* AI Marketing & Positioning Profile */}
                   <Paper p="md">
-                    <Group justify="space-between" mb="sm">
-                      <Box>
-                        <Text fw={600} size="sm">
-                          Értékesítési & Reklám Stratégia (Tudásbázis az AI kampányokhoz)
-                        </Text>
-                        <Text size="xs" c="dimmed">
-                          A weboldal bejárásából és a megadott adatokból felépített pozicionálás —
-                          bármikor finomhangolható.
-                        </Text>
-                      </Box>
+                    <Group justify="space-between" mb="xs">
+                      <Text fw={600} size="sm">
+                        Értékesítési tudásbázis (AI kampányokhoz & auto-válaszokhoz)
+                      </Text>
                       <Button
-                        size="xs"
+                        size="compact-xs"
                         variant="default"
-                        leftSection={<IconRefresh size={13} />}
+                        leftSection={<IconRefresh size={12} />}
                         loading={crawlingId === selected.id}
                         onClick={() => handleCrawlProject(selected)}
                       >
@@ -411,12 +357,12 @@ export function ProjectsPage({ projects, onRefresh }: Props) {
                       </Button>
                     </Group>
 
-                    <SimpleGrid cols={{ base: 1, md: 2 }} spacing="sm">
+                    <SimpleGrid cols={{ base: 1, md: 2 }} spacing="xs">
                       <Box p="sm" style={{ border: "1px solid var(--ml-border)", borderRadius: 5 }}>
                         <Text className="ml-section-label" mb={4}>
-                          Fő értékajánlat (Value Proposition)
+                          Fő értékajánlat
                         </Text>
-                        <Text size="sm">
+                        <Text size="xs">
                           {selected.valueProposition ||
                             "Futtasd a Weboldal feltérképezését, vagy szerkeszd kézzel."}
                         </Text>
@@ -425,18 +371,18 @@ export function ProjectsPage({ projects, onRefresh }: Props) {
                         <Text className="ml-section-label" mb={4}>
                           Ideális célközönség (ICP)
                         </Text>
-                        <Text size="sm">
+                        <Text size="xs">
                           {selected.targetAudience || "Még nincs meghatározva."}
                         </Text>
                       </Box>
                     </SimpleGrid>
 
-                    <SimpleGrid cols={{ base: 1, md: 3 }} spacing="sm" mt="sm">
+                    <SimpleGrid cols={{ base: 1, md: 3 }} spacing="xs" mt="xs">
                       <Box p="sm" style={{ border: "1px solid var(--ml-border)", borderRadius: 5 }}>
-                        <Text className="ml-section-label" mb={6}>
-                          Megoldott ügyfélproblémák
+                        <Text className="ml-section-label" mb={4}>
+                          Megoldott problémák
                         </Text>
-                        <Stack gap={5}>
+                        <Stack gap={4}>
                           {selected.painPointsSolved.length === 0 ? (
                             <Text size="xs" c="dimmed">
                               Nincs megadva
@@ -452,10 +398,10 @@ export function ProjectsPage({ projects, onRefresh }: Props) {
                       </Box>
 
                       <Box p="sm" style={{ border: "1px solid var(--ml-border)", borderRadius: 5 }}>
-                        <Text className="ml-section-label" mb={6}>
-                          Reklámozási / Outreach szögek
+                        <Text className="ml-section-label" mb={4}>
+                          Outreach szögek
                         </Text>
-                        <Stack gap={5}>
+                        <Stack gap={4}>
                           {selected.pitchAngles.length === 0 ? (
                             <Text size="xs" c="dimmed">
                               Nincs megadva
@@ -471,10 +417,10 @@ export function ProjectsPage({ projects, onRefresh }: Props) {
                       </Box>
 
                       <Box p="sm" style={{ border: "1px solid var(--ml-border)", borderRadius: 5 }}>
-                        <Text className="ml-section-label" mb={6}>
-                          Kifogáskezelés (Auto-válaszhoz)
+                        <Text className="ml-section-label" mb={4}>
+                          Kifogáskezelés
                         </Text>
-                        <Stack gap={5}>
+                        <Stack gap={4}>
                           {selected.objectionHandlers.length === 0 ? (
                             <Text size="xs" c="dimmed">
                               Nincs megadva
@@ -490,86 +436,6 @@ export function ProjectsPage({ projects, onRefresh }: Props) {
                       </Box>
                     </SimpleGrid>
                   </Paper>
-
-                  {/* Offers & Discounts */}
-                  <Paper p="md">
-                    <Group justify="space-between" mb="sm">
-                      <Box>
-                        <Text fw={600} size="sm">
-                          Ajánlatok & Kedvezmények ({selected.offers.length})
-                        </Text>
-                        <Text size="xs" c="dimmed">
-                          A keresésekben és kampányokban választható konkrét akciók, ingyenes próbák
-                          vagy auditok.
-                        </Text>
-                      </Box>
-                      <Button
-                        size="xs"
-                        variant="default"
-                        leftSection={<IconPlus size={14} />}
-                        onClick={() => openNewOffer(selected.id)}
-                      >
-                        Új ajánlat / kedvezmény
-                      </Button>
-                    </Group>
-
-                    {selected.offers.length === 0 ? (
-                      <Text size="sm" c="dimmed">
-                        Adj hozzá legalább egy kedvezményt vagy belépő ajánlatot, amivel az AI
-                        megszólíthatja a cégeket.
-                      </Text>
-                    ) : (
-                      <SimpleGrid cols={{ base: 1, md: 2 }} spacing="sm">
-                        {selected.offers.map((offer) => (
-                          <Paper key={offer.id} p="sm">
-                            <Group justify="space-between" align="flex-start" wrap="nowrap">
-                              <Group gap={6}>
-                                <IconTag size={14} />
-                                <Text size="sm" fw={600}>
-                                  {offer.title}
-                                </Text>
-                              </Group>
-                              <Group gap={4} wrap="nowrap">
-                                <Badge color="forest" variant="filled" size="xs">
-                                  {offer.discountValue || offer.offerType}
-                                </Badge>
-                                <ActionIcon
-                                  size="xs"
-                                  variant="subtle"
-                                  color="gray"
-                                  onClick={() => openEditOffer(offer)}
-                                >
-                                  <IconEdit size={13} />
-                                </ActionIcon>
-                                <ActionIcon
-                                  size="xs"
-                                  variant="subtle"
-                                  color="red"
-                                  onClick={() => handleDeleteOffer(offer.id)}
-                                >
-                                  <IconTrash size={13} />
-                                </ActionIcon>
-                              </Group>
-                            </Group>
-                            <Text size="xs" c="dimmed" mt={6}>
-                              {offer.description}
-                            </Text>
-                            <Divider my={8} />
-                            <Group justify="space-between">
-                              <Text size="11px" c="dimmed">
-                                CTA: <strong>{offer.ctaText}</strong>
-                              </Text>
-                              {offer.active && (
-                                <Badge size="xs" color="green" leftSection={<IconCheck size={10} />}>
-                                  Aktív
-                                </Badge>
-                              )}
-                            </Group>
-                          </Paper>
-                        ))}
-                      </SimpleGrid>
-                    )}
-                  </Paper>
                 </Stack>
               </Grid.Col>
             )}
@@ -581,21 +447,21 @@ export function ProjectsPage({ projects, onRefresh }: Props) {
       <Modal
         opened={projectModalOpen}
         onClose={() => setProjectModalOpen(false)}
-        title={projectForm.id ? "Projekt szerkesztése" : "Új cég / projekt létrehozása"}
+        title={projectForm.id ? "Projekt szerkesztése" : "Új projekt létrehozása"}
         size="lg"
       >
         <Stack gap="sm">
           <SimpleGrid cols={2}>
             <TextInput
               label="Cég / Projekt neve"
-              placeholder="pl. FoglaljPro SaaS"
+              placeholder="pl. OkosŰrlap"
               required
               value={projectForm.name}
               onChange={(e) => setProjectForm({ ...projectForm, name: e.currentTarget.value })}
             />
             <TextInput
               label="Iparág / Kategória"
-              placeholder="pl. B2B SaaS, Webfejlesztés"
+              placeholder="pl. B2B SaaS, Automatizáció"
               value={projectForm.industry}
               onChange={(e) => setProjectForm({ ...projectForm, industry: e.currentTarget.value })}
             />
@@ -611,7 +477,7 @@ export function ProjectsPage({ projects, onRefresh }: Props) {
               }
             />
             <Select
-              label="Elsődleges kommunikációs nyelv"
+              label="Elsődleges nyelv"
               value={projectForm.language}
               onChange={(v) => setProjectForm({ ...projectForm, language: v || "hu" })}
               data={[
@@ -632,8 +498,8 @@ export function ProjectsPage({ projects, onRefresh }: Props) {
               }
             />
             <TextInput
-              label="Cél landing oldal (hova terelje az AI)"
-              placeholder="https://sajatceged.hu/ajanlat"
+              label="Cél landing oldal"
+              placeholder="https://sajatceged.hu"
               value={projectForm.landingUrl}
               onChange={(e) =>
                 setProjectForm({ ...projectForm, landingUrl: e.currentTarget.value })
@@ -643,7 +509,9 @@ export function ProjectsPage({ projects, onRefresh }: Props) {
 
           <Textarea
             label="Rövid leírás — mit csinál a terméked / szolgáltatásod?"
-            minRows={3}
+            autosize
+            minRows={2}
+            maxRows={5}
             placeholder="Írd le néhány mondatban, miben segítetek az ügyfeleknek..."
             value={projectForm.description}
             onChange={(e) =>
@@ -651,11 +519,25 @@ export function ProjectsPage({ projects, onRefresh }: Props) {
             }
           />
 
+          <Textarea
+            label="E-mail aláírás (ehhez a projekthez)"
+            description="Ezzel írja alá az AI a kampányleveleket és auto-válaszokat ennél a projektnél."
+            autosize
+            minRows={3}
+            maxRows={6}
+            placeholder={"Üdvözlettel,\nKiss Péter — OkosŰrlap\n+36 30 123 4567 • okosurlap.hu"}
+            value={projectForm.emailSignature}
+            onChange={(e) =>
+              setProjectForm({ ...projectForm, emailSignature: e.currentTarget.value })
+            }
+          />
+
           {projectForm.id && (
             <>
-              <Divider label="AI Értékesítési Profil (opcionálisan finomhangolható)" />
+              <Divider label="AI Értékesítési Profil (opcionálisan szerkeszthető)" />
               <Textarea
-                label="Értékajánlat (Value Proposition)"
+                label="Értékajánlat"
+                autosize
                 minRows={2}
                 value={projectForm.valueProposition}
                 onChange={(e) =>
@@ -664,6 +546,7 @@ export function ProjectsPage({ projects, onRefresh }: Props) {
               />
               <Textarea
                 label="Célközönség (ICP)"
+                autosize
                 minRows={2}
                 value={projectForm.targetAudience}
                 onChange={(e) =>
@@ -672,15 +555,17 @@ export function ProjectsPage({ projects, onRefresh }: Props) {
               />
               <Textarea
                 label="Megoldott problémák (soronként egy)"
-                minRows={3}
+                autosize
+                minRows={2}
                 value={projectForm.painPointsText}
                 onChange={(e) =>
                   setProjectForm({ ...projectForm, painPointsText: e.currentTarget.value })
                 }
               />
               <Textarea
-                label="Reklám / Pitch szögek (soronként egy)"
-                minRows={3}
+                label="Outreach szögek (soronként egy)"
+                autosize
+                minRows={2}
                 value={projectForm.pitchAnglesText}
                 onChange={(e) =>
                   setProjectForm({ ...projectForm, pitchAnglesText: e.currentTarget.value })
@@ -688,6 +573,7 @@ export function ProjectsPage({ projects, onRefresh }: Props) {
               />
               <Textarea
                 label="Kifogáskezelés (soronként egy)"
+                autosize
                 minRows={2}
                 value={projectForm.objectionHandlersText}
                 onChange={(e) =>
@@ -702,76 +588,6 @@ export function ProjectsPage({ projects, onRefresh }: Props) {
               Mégse
             </Button>
             <Button onClick={handleSaveProject} loading={saving}>
-              Mentés
-            </Button>
-          </Group>
-        </Stack>
-      </Modal>
-
-      {/* Offer Create/Edit Modal */}
-      <Modal
-        opened={offerModalOpen}
-        onClose={() => setOfferModalOpen(false)}
-        title={offerForm.id ? "Ajánlat szerkesztése" : "Új ajánlat / kedvezmény"}
-      >
-        <Stack gap="sm">
-          <TextInput
-            label="Ajánlat neve"
-            placeholder="pl. 25% induló kedvezmény + ingyenes beüzemelés"
-            required
-            value={offerForm.title}
-            onChange={(e) => setOfferForm({ ...offerForm, title: e.currentTarget.value })}
-          />
-          <SimpleGrid cols={2}>
-            <Select
-              label="Típus"
-              value={offerForm.offerType}
-              onChange={(v) => setOfferForm({ ...offerForm, offerType: v || "discount" })}
-              data={[
-                { value: "discount", label: "Kedvezmény (%)" },
-                { value: "free_trial", label: "Ingyenes próbaidőszak" },
-                { value: "audit", label: "Díjmentes audit / elemzés" },
-                { value: "bundle", label: "Csomagajánlat" },
-                { value: "custom", label: "Egyedi ajánlat" },
-              ]}
-            />
-            <TextInput
-              label="Érték / Címke"
-              placeholder="pl. -25% vagy 14 nap ingyen"
-              value={offerForm.discountValue}
-              onChange={(e) => setOfferForm({ ...offerForm, discountValue: e.currentTarget.value })}
-            />
-          </SimpleGrid>
-          <Textarea
-            label="Részletes leírás"
-            minRows={3}
-            value={offerForm.description}
-            onChange={(e) => setOfferForm({ ...offerForm, description: e.currentTarget.value })}
-          />
-          <SimpleGrid cols={2}>
-            <TextInput
-              label="CTA szöveg"
-              placeholder="pl. 15 perces demó kérése"
-              value={offerForm.ctaText}
-              onChange={(e) => setOfferForm({ ...offerForm, ctaText: e.currentTarget.value })}
-            />
-            <TextInput
-              label="Feltételek / Érvényesség"
-              placeholder="pl. Hónap végéig új ügyfeleknek"
-              value={offerForm.conditions}
-              onChange={(e) => setOfferForm({ ...offerForm, conditions: e.currentTarget.value })}
-            />
-          </SimpleGrid>
-          <Switch
-            label="Aktív ajánlat (kampányokban választható)"
-            checked={offerForm.active}
-            onChange={(e) => setOfferForm({ ...offerForm, active: e.currentTarget.checked })}
-          />
-          <Group justify="flex-end" mt="sm">
-            <Button variant="default" onClick={() => setOfferModalOpen(false)}>
-              Mégse
-            </Button>
-            <Button onClick={handleSaveOffer} loading={saving}>
               Mentés
             </Button>
           </Group>

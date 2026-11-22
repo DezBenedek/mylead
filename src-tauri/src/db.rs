@@ -215,18 +215,22 @@ impl Database {
                 lead_id TEXT,
                 created_at TEXT NOT NULL
             );
-
-            UPDATE searches SET status = 'completed' WHERE status = 'running';
             "#,
         )
         .map_err(|e| format!("Séma inicializálási hiba: {}", e))?;
 
         // Safe additive migrations for existing SQLite databases
         let migrations = [
+            "ALTER TABLE projects ADD COLUMN email_signature TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE campaigns ADD COLUMN offer_summary TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE campaigns ADD COLUMN offer_timing TEXT NOT NULL DEFAULT 'on_interest'",
+            "ALTER TABLE campaigns ADD COLUMN offer_delivery TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE email_messages ADD COLUMN scheduled_send_at TEXT",
             "ALTER TABLE email_messages ADD COLUMN auto_send_status TEXT",
             "ALTER TABLE email_messages ADD COLUMN ai_summary TEXT",
             "ALTER TABLE email_messages ADD COLUMN ai_rewrite_note TEXT",
+            "ALTER TABLE email_messages ADD COLUMN ai_priority_score INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE email_messages ADD COLUMN ai_tags TEXT NOT NULL DEFAULT '[]'",
         ];
         for sql in migrations {
             let _ = conn.execute(sql, []);
@@ -302,7 +306,7 @@ impl Database {
     pub fn list_projects(&self) -> Result<Vec<Project>, String> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT id, name, website_url, industry, language, description, booking_url, landing_url, value_proposition, target_audience, pain_points_solved, pitch_angles, objection_handlers, crawled_summary, crawled_pages_count, last_crawled_at, created_at, updated_at FROM projects ORDER BY updated_at DESC")
+            .prepare("SELECT id, name, website_url, industry, language, description, booking_url, landing_url, email_signature, value_proposition, target_audience, pain_points_solved, pitch_angles, objection_handlers, crawled_summary, crawled_pages_count, last_crawled_at, created_at, updated_at FROM projects ORDER BY updated_at DESC")
             .map_err(|e| e.to_string())?;
 
         let rows = stmt
@@ -323,17 +327,18 @@ impl Database {
                     r.get::<_, String>(11)?,
                     r.get::<_, String>(12)?,
                     r.get::<_, String>(13)?,
-                    r.get::<_, i64>(14)?,
-                    r.get::<_, Option<String>>(15)?,
-                    r.get::<_, String>(16)?,
+                    r.get::<_, String>(14)?,
+                    r.get::<_, i64>(15)?,
+                    r.get::<_, Option<String>>(16)?,
                     r.get::<_, String>(17)?,
+                    r.get::<_, String>(18)?,
                 ))
             })
             .map_err(|e| e.to_string())?;
 
         let mut projects = Vec::new();
         for row in rows {
-            let (id, name, website_url, industry, language, description, booking_url, landing_url, value_proposition, target_audience, pp_s, pa_s, oh_s, crawled_summary, crawled_pages_count, last_crawled_at, created_at, updated_at) =
+            let (id, name, website_url, industry, language, description, booking_url, landing_url, email_signature, value_proposition, target_audience, pp_s, pa_s, oh_s, crawled_summary, crawled_pages_count, last_crawled_at, created_at, updated_at) =
                 row.map_err(|e| e.to_string())?;
             let offers = Self::fetch_offers_for_project(&conn, &id)?;
             projects.push(Project {
@@ -345,6 +350,7 @@ impl Database {
                 description,
                 booking_url,
                 landing_url,
+                email_signature,
                 value_proposition,
                 target_audience,
                 pain_points_solved: serde_json::from_str(&pp_s).unwrap_or_default(),
@@ -380,7 +386,7 @@ impl Database {
 
             if exists {
                 conn.execute(
-                    "UPDATE projects SET name=?1, website_url=?2, industry=?3, language=?4, description=?5, booking_url=?6, landing_url=?7, value_proposition=COALESCE(?8, value_proposition), target_audience=COALESCE(?9, target_audience), pain_points_solved=COALESCE(?10, pain_points_solved), pitch_angles=COALESCE(?11, pitch_angles), objection_handlers=COALESCE(?12, objection_handlers), updated_at=?13 WHERE id=?14",
+                    "UPDATE projects SET name=?1, website_url=?2, industry=?3, language=?4, description=?5, booking_url=?6, landing_url=?7, email_signature=COALESCE(?8, email_signature), value_proposition=COALESCE(?9, value_proposition), target_audience=COALESCE(?10, target_audience), pain_points_solved=COALESCE(?11, pain_points_solved), pitch_angles=COALESCE(?12, pitch_angles), objection_handlers=COALESCE(?13, objection_handlers), updated_at=?14 WHERE id=?15",
                     params![
                         input.name,
                         input.website_url,
@@ -389,6 +395,7 @@ impl Database {
                         input.description,
                         input.booking_url,
                         input.landing_url,
+                        input.email_signature,
                         input.value_proposition,
                         input.target_audience,
                         input.pain_points_solved.map(|v| serde_json::to_string(&v).unwrap_or_else(|_| "[]".into())),
@@ -401,7 +408,7 @@ impl Database {
                 .map_err(|e| e.to_string())?;
             } else {
                 conn.execute(
-                    "INSERT INTO projects (id, name, website_url, industry, language, description, booking_url, landing_url, value_proposition, target_audience, pain_points_solved, pitch_angles, objection_handlers, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    "INSERT INTO projects (id, name, website_url, industry, language, description, booking_url, landing_url, email_signature, value_proposition, target_audience, pain_points_solved, pitch_angles, objection_handlers, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                     params![
                         &id,
                         input.name,
@@ -411,6 +418,7 @@ impl Database {
                         input.description,
                         input.booking_url,
                         input.landing_url,
+                        input.email_signature.unwrap_or_default(),
                         input.value_proposition.unwrap_or_default(),
                         input.target_audience.unwrap_or_default(),
                         serde_json::to_string(&input.pain_points_solved.unwrap_or_default()).unwrap_or_else(|_| "[]".into()),
@@ -664,6 +672,58 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM searches WHERE id = ?1", params![id])
             .map_err(|e| e.to_string())?;
+        // Clean up orphaned leads that belonged only to the deleted search and have no email threads
+        let _ = conn.execute(
+            r#"
+            DELETE FROM leads
+            WHERE NOT EXISTS (SELECT 1 FROM search_leads sl WHERE sl.lead_id = leads.id)
+              AND NOT EXISTS (SELECT 1 FROM email_messages em WHERE em.lead_id = leads.id)
+              AND status NOT IN ('in_campaign', 'replied', 'booked', 'won')
+              AND source NOT IN ('Kézi felvétel', 'Kézi import', 'AI Asszisztens')
+            "#,
+            [],
+        );
+        Ok(())
+    }
+
+    pub fn update_lead_identity(
+        &self,
+        lead_id: &str,
+        company_name: Option<&str>,
+        industry: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        if let Some(name) = company_name.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            let _ = conn.execute(
+                "UPDATE leads SET company_name = ?1 WHERE id = ?2",
+                params![name, lead_id],
+            );
+        }
+        if let Some(ind) = industry.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            let _ = conn.execute(
+                "UPDATE leads SET industry = ?1 WHERE id = ?2",
+                params![ind, lead_id],
+            );
+        }
+        Ok(())
+    }
+
+    pub fn remove_rejected_search_lead(&self, search_id: &str, lead_id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "DELETE FROM search_leads WHERE search_id = ?1 AND lead_id = ?2",
+            params![search_id, lead_id],
+        );
+        let _ = conn.execute(
+            r#"
+            DELETE FROM leads
+            WHERE id = ?1
+              AND NOT EXISTS (SELECT 1 FROM search_leads sl WHERE sl.lead_id = leads.id)
+              AND NOT EXISTS (SELECT 1 FROM email_messages em WHERE em.lead_id = leads.id)
+              AND status NOT IN ('in_campaign', 'replied', 'booked', 'won')
+            "#,
+            params![lead_id],
+        );
         Ok(())
     }
 
@@ -995,11 +1055,15 @@ impl Database {
     }
 
     pub fn find_lead_by_email(&self, email: &str) -> Result<Option<Lead>, String> {
+        let clean = email.trim().to_lowercase();
+        if clean.is_empty() {
+            return Ok(None);
+        }
         let id_opt: Option<String> = {
             let conn = self.conn.lock().unwrap();
             conn.query_row(
-                "SELECT id FROM leads WHERE LOWER(primary_email) = LOWER(?1) LIMIT 1",
-                params![email.trim()],
+                "SELECT id FROM leads WHERE LOWER(primary_email) = ?1 OR LOWER(contacts) LIKE ?2 LIMIT 1",
+                params![&clean, format!("%\"{}\"% ", clean).trim()],
                 |r| r.get(0),
             )
             .optional()
@@ -1009,6 +1073,24 @@ impl Database {
             Some(id) => Ok(Some(self.get_lead(&id)?)),
             None => Ok(None),
         }
+    }
+
+    pub fn update_email_decision_metadata(
+        &self,
+        message_id: &str,
+        intent: &str,
+        priority_score: i64,
+        tags: &[String],
+        summary: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".into());
+        conn.execute(
+            "UPDATE email_messages SET ai_intent = ?1, ai_priority_score = ?2, ai_tags = ?3, ai_summary = ?4 WHERE id = ?5",
+            params![intent, priority_score, tags_json, summary, message_id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     // ==================== SENDER ACCOUNTS ====================
@@ -1128,6 +1210,7 @@ impl Database {
                        c.search_id, s.name, c.sender_account_id, sa.name, c.status, c.tone,
                        c.language, c.auto_reply_mode, c.daily_limit, c.min_delay_sec, c.follow_up_days,
                        c.include_booking_link, c.custom_instructions,
+                       c.offer_summary, c.offer_timing, c.offer_delivery,
                        (SELECT COUNT(DISTINCT lead_id) FROM email_messages em WHERE em.campaign_id = c.id) as total_recipients,
                        (SELECT COUNT(*) FROM email_messages em WHERE em.campaign_id = c.id AND em.direction='outbound' AND em.status='sent') as sent_count,
                        (SELECT COUNT(*) FROM email_messages em WHERE em.campaign_id = c.id AND em.direction='outbound' AND em.status='failed') as failed_count,
@@ -1167,14 +1250,17 @@ impl Database {
                     follow_up_days: r.get(16)?,
                     include_booking_link: r.get::<_, i64>(17)? != 0,
                     custom_instructions: r.get(18)?,
-                    total_recipients: r.get(19)?,
-                    sent_count: r.get(20)?,
-                    failed_count: r.get(21)?,
-                    reply_count: r.get(22)?,
-                    positive_count: r.get(23)?,
-                    booked_count: r.get(24)?,
-                    created_at: r.get(25)?,
-                    updated_at: r.get(26)?,
+                    offer_summary: r.get(19)?,
+                    offer_timing: r.get(20)?,
+                    offer_delivery: r.get(21)?,
+                    total_recipients: r.get(22)?,
+                    sent_count: r.get(23)?,
+                    failed_count: r.get(24)?,
+                    reply_count: r.get(25)?,
+                    positive_count: r.get(26)?,
+                    booked_count: r.get(27)?,
+                    created_at: r.get(28)?,
+                    updated_at: r.get(29)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -1199,7 +1285,7 @@ impl Database {
         {
             let conn = self.conn.lock().unwrap();
             conn.execute(
-                "INSERT INTO campaigns (id, name, project_id, offer_id, search_id, sender_account_id, status, tone, language, auto_reply_mode, daily_limit, min_delay_sec, follow_up_days, include_booking_link, custom_instructions, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,'draft',?7,?8,?9,?10,?11,?12,?13,?14,?15,?15)",
+                "INSERT INTO campaigns (id, name, project_id, offer_id, search_id, sender_account_id, status, tone, language, auto_reply_mode, daily_limit, min_delay_sec, follow_up_days, include_booking_link, custom_instructions, offer_summary, offer_timing, offer_delivery, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,'draft',?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?18)",
                 params![
                     &id,
                     input.name,
@@ -1215,6 +1301,9 @@ impl Database {
                     input.follow_up_days,
                     if input.include_booking_link { 1 } else { 0 },
                     input.custom_instructions,
+                    input.offer_summary,
+                    if input.offer_timing.is_empty() { "on_interest" } else { input.offer_timing.as_str() },
+                    input.offer_delivery,
                     &now
                 ],
             )
@@ -1228,7 +1317,7 @@ impl Database {
         {
             let conn = self.conn.lock().unwrap();
             conn.execute(
-                "UPDATE campaigns SET name=COALESCE(?1, name), project_id=COALESCE(?2, project_id), offer_id=COALESCE(?3, offer_id), sender_account_id=COALESCE(?4, sender_account_id), status=COALESCE(?5, status), tone=COALESCE(?6, tone), auto_reply_mode=COALESCE(?7, auto_reply_mode), daily_limit=COALESCE(?8, daily_limit), include_booking_link=COALESCE(?9, include_booking_link), custom_instructions=COALESCE(?10, custom_instructions), updated_at=?11 WHERE id=?12",
+                "UPDATE campaigns SET name=COALESCE(?1, name), project_id=COALESCE(?2, project_id), offer_id=COALESCE(?3, offer_id), sender_account_id=COALESCE(?4, sender_account_id), status=COALESCE(?5, status), tone=COALESCE(?6, tone), auto_reply_mode=COALESCE(?7, auto_reply_mode), daily_limit=COALESCE(?8, daily_limit), include_booking_link=COALESCE(?9, include_booking_link), custom_instructions=COALESCE(?10, custom_instructions), offer_summary=COALESCE(?11, offer_summary), offer_timing=COALESCE(?12, offer_timing), offer_delivery=COALESCE(?13, offer_delivery), updated_at=?14 WHERE id=?15",
                 params![
                     input.name,
                     input.project_id,
@@ -1240,6 +1329,9 @@ impl Database {
                     input.daily_limit,
                     input.include_booking_link.map(|b| if b { 1i64 } else { 0i64 }),
                     input.custom_instructions,
+                    input.offer_summary,
+                    input.offer_timing,
+                    input.offer_delivery,
                     &now,
                     &input.id
                 ],
@@ -1366,6 +1458,39 @@ impl Database {
         Ok(id)
     }
 
+    fn map_email_row(r: &rusqlite::Row) -> rusqlite::Result<EmailMessage> {
+        let tags_raw: Option<String> = r.get(24).ok();
+        Ok(EmailMessage {
+            id: r.get(0)?,
+            campaign_id: r.get(1)?,
+            campaign_name: r.get(2)?,
+            lead_id: r.get(3)?,
+            lead_company: r.get(4)?,
+            lead_email: r.get(5)?,
+            direction: r.get(6)?,
+            status: r.get(7)?,
+            step_number: r.get(8)?,
+            subject: r.get(9)?,
+            body: r.get(10)?,
+            message_id_header: r.get(11)?,
+            in_reply_to: r.get(12)?,
+            ai_intent: r.get(13)?,
+            ai_suggested_reply: r.get(14)?,
+            booking_link_sent: r.get::<_, i64>(15)? != 0,
+            error_message: r.get(16)?,
+            sent_at: r.get(17)?,
+            created_at: r.get(18)?,
+            scheduled_send_at: r.get(19)?,
+            auto_send_status: r.get(20)?,
+            ai_summary: r.get(21)?,
+            ai_rewrite_note: r.get(22)?,
+            ai_priority_score: r.get::<_, i64>(23).unwrap_or(0),
+            ai_tags: tags_raw
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default(),
+        })
+    }
+
     pub fn get_email_message(&self, id: &str) -> Result<EmailMessage, String> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
@@ -1374,40 +1499,15 @@ impl Database {
                    em.direction, em.status, em.step_number, em.subject, em.body,
                    em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
                    em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
-                   em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note
+                   em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note,
+                   em.ai_priority_score, em.ai_tags
             FROM email_messages em
             JOIN leads l ON l.id = em.lead_id
             LEFT JOIN campaigns c ON c.id = em.campaign_id
             WHERE em.id = ?1
             "#,
             params![id],
-            |r| {
-                Ok(EmailMessage {
-                    id: r.get(0)?,
-                    campaign_id: r.get(1)?,
-                    campaign_name: r.get(2)?,
-                    lead_id: r.get(3)?,
-                    lead_company: r.get(4)?,
-                    lead_email: r.get(5)?,
-                    direction: r.get(6)?,
-                    status: r.get(7)?,
-                    step_number: r.get(8)?,
-                    subject: r.get(9)?,
-                    body: r.get(10)?,
-                    message_id_header: r.get(11)?,
-                    in_reply_to: r.get(12)?,
-                    ai_intent: r.get(13)?,
-                    ai_suggested_reply: r.get(14)?,
-                    booking_link_sent: r.get::<_, i64>(15)? != 0,
-                    error_message: r.get(16)?,
-                    sent_at: r.get(17)?,
-                    created_at: r.get(18)?,
-                    scheduled_send_at: r.get(19)?,
-                    auto_send_status: r.get(20)?,
-                    ai_summary: r.get(21)?,
-                    ai_rewrite_note: r.get(22)?,
-                })
-            },
+            Self::map_email_row,
         )
         .map_err(|_| "Üzenet nem található".to_string())
     }
@@ -1475,7 +1575,8 @@ impl Database {
                        em.direction, em.status, em.step_number, em.subject, em.body,
                        em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
                        em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
-                       em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note
+                       em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note,
+                       em.ai_priority_score, em.ai_tags
                 FROM email_messages em
                 JOIN leads l ON l.id = em.lead_id
                 LEFT JOIN campaigns c ON c.id = em.campaign_id
@@ -1485,33 +1586,7 @@ impl Database {
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map(params![lead_id], |r| {
-                Ok(EmailMessage {
-                    id: r.get(0)?,
-                    campaign_id: r.get(1)?,
-                    campaign_name: r.get(2)?,
-                    lead_id: r.get(3)?,
-                    lead_company: r.get(4)?,
-                    lead_email: r.get(5)?,
-                    direction: r.get(6)?,
-                    status: r.get(7)?,
-                    step_number: r.get(8)?,
-                    subject: r.get(9)?,
-                    body: r.get(10)?,
-                    message_id_header: r.get(11)?,
-                    in_reply_to: r.get(12)?,
-                    ai_intent: r.get(13)?,
-                    ai_suggested_reply: r.get(14)?,
-                    booking_link_sent: r.get::<_, i64>(15)? != 0,
-                    error_message: r.get(16)?,
-                    sent_at: r.get(17)?,
-                    created_at: r.get(18)?,
-                    scheduled_send_at: r.get(19)?,
-                    auto_send_status: r.get(20)?,
-                    ai_summary: r.get(21)?,
-                    ai_rewrite_note: r.get(22)?,
-                })
-            })
+            .query_map(params![lead_id], Self::map_email_row)
             .map_err(|e| e.to_string())?;
         let mut out = Vec::new();
         for r in rows {
@@ -1530,7 +1605,8 @@ impl Database {
                        em.direction, em.status, em.step_number, em.subject, em.body,
                        em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
                        em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
-                       em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note
+                       em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note,
+                       em.ai_priority_score, em.ai_tags
                 FROM email_messages em
                 JOIN leads l ON l.id = em.lead_id
                 LEFT JOIN campaigns c ON c.id = em.campaign_id
@@ -1544,33 +1620,7 @@ impl Database {
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map(params![&now_utc], |r| {
-                Ok(EmailMessage {
-                    id: r.get(0)?,
-                    campaign_id: r.get(1)?,
-                    campaign_name: r.get(2)?,
-                    lead_id: r.get(3)?,
-                    lead_company: r.get(4)?,
-                    lead_email: r.get(5)?,
-                    direction: r.get(6)?,
-                    status: r.get(7)?,
-                    step_number: r.get(8)?,
-                    subject: r.get(9)?,
-                    body: r.get(10)?,
-                    message_id_header: r.get(11)?,
-                    in_reply_to: r.get(12)?,
-                    ai_intent: r.get(13)?,
-                    ai_suggested_reply: r.get(14)?,
-                    booking_link_sent: r.get::<_, i64>(15)? != 0,
-                    error_message: r.get(16)?,
-                    sent_at: r.get(17)?,
-                    created_at: r.get(18)?,
-                    scheduled_send_at: r.get(19)?,
-                    auto_send_status: r.get(20)?,
-                    ai_summary: r.get(21)?,
-                    ai_rewrite_note: r.get(22)?,
-                })
-            })
+            .query_map(params![&now_utc], Self::map_email_row)
             .map_err(|e| e.to_string())?;
         let mut out = Vec::new();
         for r in rows {
@@ -1611,6 +1661,66 @@ impl Database {
             > 0
     }
 
+    pub fn list_pending_generating_messages(&self) -> Result<Vec<EmailMessage>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT em.id, em.campaign_id, c.name, em.lead_id, l.company_name, l.primary_email,
+                       em.direction, em.status, em.step_number, em.subject, em.body,
+                       em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
+                       em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
+                       em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note,
+                       em.ai_priority_score, em.ai_tags
+                FROM email_messages em
+                JOIN leads l ON l.id = em.lead_id
+                LEFT JOIN campaigns c ON c.id = em.campaign_id
+                WHERE em.direction = 'outbound' AND em.status = 'generating'
+                ORDER BY em.created_at ASC
+                "#,
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], Self::map_email_row)
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| e.to_string())?);
+        }
+        Ok(out)
+    }
+
+    pub fn finalize_generated_email(
+        &self,
+        id: &str,
+        subject: &str,
+        body: &str,
+        booking_link_sent: bool,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE email_messages SET status = 'draft', subject = ?1, body = ?2, booking_link_sent = ?3, error_message = NULL WHERE id = ?4",
+            params![subject, body, if booking_link_sent { 1 } else { 0 }, id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn mark_campaign_drafts_for_regeneration(
+        &self,
+        campaign_id: &str,
+        feedback: Option<&str>,
+    ) -> Result<usize, String> {
+        let conn = self.conn.lock().unwrap();
+        let cnt = conn
+            .execute(
+                "UPDATE email_messages SET status = 'generating', ai_rewrite_note = ?2 WHERE campaign_id = ?1 AND direction = 'outbound' AND status IN ('draft', 'generating', 'failed')",
+                params![campaign_id, feedback],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(cnt)
+    }
+
     pub fn list_campaign_messages(&self, campaign_id: &str) -> Result<Vec<EmailMessage>, String> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
@@ -1620,7 +1730,8 @@ impl Database {
                        em.direction, em.status, em.step_number, em.subject, em.body,
                        em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
                        em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
-                       em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note
+                       em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note,
+                       em.ai_priority_score, em.ai_tags
                 FROM email_messages em
                 JOIN leads l ON l.id = em.lead_id
                 LEFT JOIN campaigns c ON c.id = em.campaign_id
@@ -1630,33 +1741,7 @@ impl Database {
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map(params![campaign_id], |r| {
-                Ok(EmailMessage {
-                    id: r.get(0)?,
-                    campaign_id: r.get(1)?,
-                    campaign_name: r.get(2)?,
-                    lead_id: r.get(3)?,
-                    lead_company: r.get(4)?,
-                    lead_email: r.get(5)?,
-                    direction: r.get(6)?,
-                    status: r.get(7)?,
-                    step_number: r.get(8)?,
-                    subject: r.get(9)?,
-                    body: r.get(10)?,
-                    message_id_header: r.get(11)?,
-                    in_reply_to: r.get(12)?,
-                    ai_intent: r.get(13)?,
-                    ai_suggested_reply: r.get(14)?,
-                    booking_link_sent: r.get::<_, i64>(15)? != 0,
-                    error_message: r.get(16)?,
-                    sent_at: r.get(17)?,
-                    created_at: r.get(18)?,
-                    scheduled_send_at: r.get(19)?,
-                    auto_send_status: r.get(20)?,
-                    ai_summary: r.get(21)?,
-                    ai_rewrite_note: r.get(22)?,
-                })
-            })
+            .query_map(params![campaign_id], Self::map_email_row)
             .map_err(|e| e.to_string())?;
         let mut out = Vec::new();
         for r in rows {
@@ -1670,12 +1755,12 @@ impl Database {
         let mut stmt = conn
             .prepare(
                 r#"
-                SELECT em.id, em.campaign_id, c.name, o.title, em.lead_id, l.company_name, l.primary_email,
+                SELECT em.id, em.campaign_id, c.name, COALESCE(NULLIF(c.offer_summary, ''), o.title), em.lead_id, l.company_name, l.primary_email,
                        em.direction, em.status, em.step_number, em.subject, em.body,
                        em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
                        em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
                        em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note,
-                       l.status, l.fit_score
+                       l.status, l.fit_score, em.ai_priority_score, em.ai_tags
                 FROM email_messages em
                 JOIN leads l ON l.id = em.lead_id
                 LEFT JOIN campaigns c ON c.id = em.campaign_id
@@ -1688,6 +1773,8 @@ impl Database {
 
         let rows = stmt
             .query_map([], |r| {
+                let raw_tags: String = r.get::<_, Option<String>>(27)?.unwrap_or_else(|| "[]".to_string());
+                let ai_tags: Vec<String> = serde_json::from_str(&raw_tags).unwrap_or_default();
                 let msg = EmailMessage {
                     id: r.get(0)?,
                     campaign_id: r.get(1)?,
@@ -1712,6 +1799,8 @@ impl Database {
                     auto_send_status: r.get(21)?,
                     ai_summary: r.get(22)?,
                     ai_rewrite_note: r.get(23)?,
+                    ai_priority_score: r.get::<_, Option<i64>>(26)?.unwrap_or(0),
+                    ai_tags,
                 };
                 Ok((
                     msg,
@@ -1738,6 +1827,9 @@ impl Database {
                 last_message_at: ts.clone(),
                 last_direction: msg.direction.clone(),
                 latest_intent: msg.ai_intent.clone(),
+                priority_score: (fit_score / 2).clamp(20, 48),
+                ai_tags: vec![],
+                decision_summary: None,
                 has_pending_draft: false,
                 pending_reply_id: None,
                 scheduled_send_at: None,
@@ -1750,6 +1842,40 @@ impl Database {
             entry.last_direction = msg.direction.clone();
             if msg.ai_intent.is_some() {
                 entry.latest_intent = msg.ai_intent.clone();
+            }
+            if msg.direction == "inbound" {
+                if msg.ai_priority_score > 0 {
+                    entry.priority_score = msg.ai_priority_score;
+                } else if let Some(ref intent) = msg.ai_intent {
+                    entry.priority_score = match intent.as_str() {
+                        "booking_request" => 94,
+                        "interested" => 85,
+                        "question" => 74,
+                        "objection" => 58,
+                        "not_interested" => 22,
+                        "unsubscribe" => 10,
+                        "out_of_office" => 15,
+                        _ => 52,
+                    };
+                }
+                if !msg.ai_tags.is_empty() {
+                    entry.ai_tags = msg.ai_tags.clone();
+                } else if entry.ai_tags.is_empty() {
+                    if let Some(ref intent) = msg.ai_intent {
+                        entry.ai_tags = match intent.as_str() {
+                            "booking_request" => vec!["Időpontkérés".to_string(), "Forró lead".to_string()],
+                            "interested" => vec!["Érdeklődik".to_string(), "Potenciális ügyfél".to_string()],
+                            "question" => vec!["Kérdés".to_string(), "Válaszra vár".to_string()],
+                            "objection" => vec!["Kifogás".to_string(), "Utánkövetendő".to_string()],
+                            "not_interested" => vec!["Elutasítás".to_string()],
+                            "unsubscribe" => vec!["Leiratkozás".to_string()],
+                            _ => vec!["Beérkező".to_string()],
+                        };
+                    }
+                }
+                if msg.ai_summary.as_ref().is_some_and(|s| !s.trim().is_empty()) {
+                    entry.decision_summary = msg.ai_summary.clone();
+                }
             }
             if offer_title.is_some() {
                 entry.offer_title = offer_title;

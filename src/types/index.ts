@@ -32,6 +32,7 @@ export interface Project {
   description: string;
   bookingUrl: string;
   landingUrl: string;
+  emailSignature: string;
   valueProposition: string;
   targetAudience: string;
   painPointsSolved: string[];
@@ -54,6 +55,7 @@ export interface ProjectInput {
   description: string;
   bookingUrl: string;
   landingUrl: string;
+  emailSignature?: string | null;
   valueProposition?: string | null;
   targetAudience?: string | null;
   painPointsSolved?: string[] | null;
@@ -270,6 +272,9 @@ export interface Campaign {
   followUpDays: number;
   includeBookingLink: boolean;
   customInstructions: string;
+  offerSummary: string;
+  offerTiming: "first_email" | "on_interest" | "on_objection" | "custom" | string;
+  offerDelivery: string;
   totalRecipients: number;
   sentCount: number;
   failedCount: number;
@@ -295,6 +300,9 @@ export interface CampaignInput {
   followUpDays: number;
   includeBookingLink: boolean;
   customInstructions: string;
+  offerSummary: string;
+  offerTiming: string;
+  offerDelivery: string;
   leadIds: string[];
 }
 
@@ -322,6 +330,8 @@ export interface EmailMessage {
   autoSendStatus?: "scheduled" | "paused" | "cancelled" | "sent" | "failed" | string | null;
   aiSummary?: string | null;
   aiRewriteNote?: string | null;
+  aiPriorityScore?: number;
+  aiTags?: string[];
 }
 
 export interface InboxThread {
@@ -336,6 +346,9 @@ export interface InboxThread {
   lastMessageAt: string;
   lastDirection: string;
   latestIntent: string | null;
+  priorityScore?: number;
+  aiTags?: string[];
+  decisionSummary?: string | null;
   hasPendingDraft: boolean;
   pendingReplyId?: string | null;
   scheduledSendAt?: string | null;
@@ -384,6 +397,9 @@ export interface CampaignUpdateInput {
   dailyLimit?: number | null;
   includeBookingLink?: boolean | null;
   customInstructions?: string | null;
+  offerSummary?: string | null;
+  offerTiming?: string | null;
+  offerDelivery?: string | null;
 }
 
 export interface AppSettings {
@@ -399,6 +415,7 @@ export interface AppSettings {
   cliSearchEngine: string;
   defaultLanguage: string;
   companySignature: string;
+  signatureFinePrint?: string;
   imapPollMinutes: number;
   autoReplyEnabled: boolean;
   autoReplyWorkdays: number[];
@@ -411,6 +428,11 @@ export interface AppSettings {
   aiReplyInstructions: string;
   defaultTone: string;
   defaultDailyLimit: number;
+  decisionModelProvider?: string;
+  decisionModelApi?: string; // "decisions" (Decisions API) | "chat" (legacy Structured Outputs)
+  decisionModelApiKey?: string;
+  decisionModelId?: string;
+  decisionAutoSortInbox?: boolean;
 }
 
 export interface DiscoveryToolStatus {

@@ -27,7 +27,7 @@ pub struct DiscoveredCompany {
     pub source: String,
 }
 
-/// Aggregators, social networks, news portals, and business directories to exclude from direct B2B company leads
+/// Aggregators, social networks, news portals, authorities, PDF repositories, and business directories to exclude from direct B2B company leads
 const NOISE_DOMAINS: &[&str] = &[
     "facebook.com",
     "instagram.com",
@@ -39,6 +39,8 @@ const NOISE_DOMAINS: &[&str] = &[
     "twitter.com",
     "pinterest.com",
     "reddit.com",
+    "quora.com",
+    "gyakorikerdesek.hu",
     "wikipedia.org",
     "wikimedia.org",
     "google.com",
@@ -74,10 +76,52 @@ const NOISE_DOMAINS: &[&str] = &[
     "index.hu",
     "telex.hu",
     "24.hu",
+    "444.hu",
     "hvg.hu",
     "portfolio.hu",
     "origo.hu",
     "blikk.hu",
+    "forbes.hu",
+    "forbes.com",
+    "economx.hu",
+    "penzcentrum.hu",
+    "mfor.hu",
+    "privatbankar.hu",
+    "piacesprofit.hu",
+    "uzletem.hu",
+    "haszon.hu",
+    "hrportal.hu",
+    "behaviour.hu",
+    "eduline.hu",
+    "felvi.hu",
+    "uniside.hu",
+    "femina.hu",
+    "nlc.hu",
+    "divany.hu",
+    "theguardian.com",
+    "guardian.co.uk",
+    "bbc.com",
+    "bbc.co.uk",
+    "reuters.com",
+    "bloomberg.com",
+    "nytimes.com",
+    "bt.com",
+    "pdfcoffee.com",
+    "scribd.com",
+    "slideshare.net",
+    "issuu.com",
+    "calameo.com",
+    "docplayer.hu",
+    "academia.edu",
+    "researchgate.net",
+    "gov.hu",
+    "gov.uk",
+    "nkfh.gov.hu",
+    "naih.hu",
+    "nav.gov.hu",
+    "ksh.hu",
+    "lechnerkozpont.hu",
+    "jogtar.hu",
     "jofogas.hu",
     "vatera.hu",
     "arukereso.hu",
@@ -119,10 +163,13 @@ pub fn resolve_tool_binary(binary: &str, custom_path: &str) -> Option<PathBuf> {
     None
 }
 
-fn is_noise_domain(domain: &str) -> bool {
+pub fn is_noise_domain(domain: &str) -> bool {
     let d = domain.trim().to_lowercase();
     if d.is_empty() {
         return false;
+    }
+    if d.ends_with(".gov.hu") || d.ends_with(".gov") || d.ends_with(".gov.uk") || d.ends_with(".edu") {
+        return true;
     }
     NOISE_DOMAINS
         .iter()
@@ -140,31 +187,186 @@ fn to_root_homepage(raw_url: &str) -> String {
     raw_url.trim().to_string()
 }
 
-fn clean_company_title(raw: &str, domain: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return domain.to_string();
+fn normalize_alnum(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| match c {
+            'á' => 'a',
+            'é' => 'e',
+            'í' => 'i',
+            'ó' | 'ö' | 'ő' => 'o',
+            'ú' | 'ü' | 'ű' => 'u',
+            _ => c,
+        })
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect()
+}
+
+pub fn humanize_domain_brand(domain: &str) -> String {
+    let stem = domain
+        .trim()
+        .trim_start_matches("www.")
+        .split('.')
+        .next()
+        .unwrap_or(domain)
+        .replace(['-', '_'], " ");
+    let words: Vec<String> = stem
+        .split_whitespace()
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect();
+    let joined = words.join(" ");
+    if joined.is_empty() {
+        domain.to_string()
+    } else {
+        joined
     }
-    // Strip common SEO suffixes like " | Fogászat Budapest - Főoldal"
-    let separators = [" | ", " — ", " – ", " - ", " :: ", " • "];
-    let mut best = trimmed.to_string();
+}
+
+/// Checks if a title is merely a generic subpage label or SEO keyword phrase rather than a real company/person name
+pub fn is_generic_seo_or_subpage_title(s: &str) -> bool {
+    let lower = s.trim().to_lowercase();
+    if lower.is_empty() {
+        return true;
+    }
+    let exact_generics = [
+        "főoldal", "főlap", "kezdőlap", "home", "welcome", "üdvözöljük", "kapcsolat", "contact",
+        "árak", "árlista", "árazás", "szolgáltatások", "szolgáltatásaink", "nyílt nap", "gyik",
+        "faq", "gyakori kérdések", "blog", "hírek", "cikkek", "rólunk", "bemutatkozás",
+        "jelentkezés", "regisztráció", "időpontfoglalás", "adatvédelem", "impresszum",
+        "coaching árak", "coaching szolgáltatások", "vezetőfejlesztő tréningek és képzések",
+        "coaching, coach képzés, coach mesterképzés", "business és life coach képzés",
+        "tanulási coach képzés", "nemzetközi business coach", "coaching budapesten",
+        "business coach képzés budapesten", "coach és tréner (gyakorlati fókuszú)",
+        "kognitív szemléletű business és life coach képzés",
+    ];
+    if exact_generics.contains(&lower.as_str()) {
+        return true;
+    }
+
+    // Has legal entity or clear brand marker -> NOT generic unless it ends with ": Főlap" etc.
+    let has_entity_marker = [
+        " kft", " zrt", " bt.", " nyrt", "akadémia", "academy", "intézet", "központ", "center",
+        "centrum", "consulting", "group", "csoport", "stúdió", "studio", "lab", "műhely",
+    ]
+    .iter()
+    .any(|m| lower.contains(m));
+
+    if !has_entity_marker {
+        let seo_prefixes = [
+            "mennyibe kerül", "hogyan ", "mi az a ", "miért ", "weboldal készítés",
+            "webfejlesztési szolgáltatások", "egyedi webáruház", "laravel webáruház",
+            "szekcionált garázskapu", "mobilgarázs", "földmérés professzionálisan",
+            "budapesti coach képzések", "coach budapest", "coaching árak",
+            "coaching szolgáltatások", "vezetőfejlesztő tréningek", "business és life coach",
+            "business coach képzés", "tanulási coach képzés", "kognitív szemléletű",
+            "coach és tréner", "nemzetközi business coach",
+        ];
+        if seo_prefixes.iter().any(|p| lower.starts_with(p)) {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn clean_company_title(raw: &str, domain: &str) -> String {
+    let trimmed = raw
+        .trim()
+        .replace(": Főlap", "")
+        .replace(": Főoldal", "")
+        .replace(" - Főoldal", "")
+        .replace(" | Főoldal", "")
+        .replace(" – Főoldal", "")
+        .replace("♥", "—");
+    if trimmed.is_empty() {
+        return humanize_domain_brand(domain);
+    }
+
+    let dom_stem = normalize_alnum(
+        domain
+            .trim()
+            .trim_start_matches("www.")
+            .split('.')
+            .next()
+            .unwrap_or(""),
+    );
+
+    let separators = [" | ", " — ", " – ", " - ", " :: ", " • ", ": "];
+    let mut segments: Vec<String> = vec![trimmed.clone()];
     for sep in separators {
-        if let Some((left, right)) = best.split_once(sep) {
-            let l = left.trim();
-            let r = right.trim();
-            // Prefer the shorter brand-like segment unless it's generic like "Főoldal" or "Kezdőlap"
-            let generic_left = ["főoldal", "kezdőlap", "home", "kapcsolat", "árak", "szolgáltatások"]
-                .iter()
-                .any(|g| l.to_lowercase() == *g);
-            if generic_left && !r.is_empty() {
-                best = r.to_string();
-            } else if l.len() >= 3 {
-                best = l.to_string();
+        let mut next_segs = Vec::new();
+        for seg in segments {
+            if seg.contains(sep) {
+                for part in seg.split(sep) {
+                    let p = part.trim();
+                    if !p.is_empty() {
+                        next_segs.push(p.to_string());
+                    }
+                }
+            } else {
+                next_segs.push(seg);
+            }
+        }
+        segments = next_segs;
+    }
+
+    if segments.len() > 1 {
+        let score_segment = |seg: &str| -> i32 {
+            let mut sc = 0i32;
+            let lower = seg.to_lowercase();
+            let alnum = normalize_alnum(seg);
+
+            if is_generic_seo_or_subpage_title(seg) {
+                sc -= 60;
+            }
+            if !dom_stem.is_empty() && dom_stem.len() >= 3 && alnum.len() >= 3 {
+                if alnum == dom_stem {
+                    sc += 70;
+                } else if alnum.contains(&dom_stem) || dom_stem.contains(&alnum) {
+                    sc += 45;
+                }
+            }
+            if [
+                "kft", "zrt", "akadémia", "academy", "consulting", "group", "csoport", "központ",
+                "center", "centrum", "stúdió", "studio", "lab", "school", "műhely", "dr.",
+            ]
+            .iter()
+            .any(|m| lower.contains(m))
+            {
+                sc += 35;
+            }
+            let word_count = seg.split_whitespace().count();
+            if (1..=4).contains(&word_count) && seg.len() >= 3 && seg.len() <= 45 {
+                sc += 15;
+            } else if word_count >= 6 {
+                sc -= 20;
+            }
+            sc
+        };
+
+        if let Some(best_seg) = segments.iter().max_by_key(|s| score_segment(s)) {
+            if !is_generic_seo_or_subpage_title(best_seg) && best_seg.len() >= 3 {
+                let mut out = best_seg.trim().to_string();
+                if out.len() > 75 {
+                    out = out.chars().take(75).collect::<String>().trim().to_string();
+                }
+                return out;
             }
         }
     }
-    if best.len() > 80 {
-        best = best.chars().take(80).collect::<String>().trim().to_string();
+
+    if is_generic_seo_or_subpage_title(&trimmed) && !domain.trim().is_empty() {
+        return humanize_domain_brand(domain);
+    }
+
+    let mut best = trimmed;
+    if best.len() > 75 {
+        best = best.chars().take(75).collect::<String>().trim().to_string();
     }
     best
 }
@@ -373,7 +575,7 @@ pub async fn discover_companies_for_round(
     settings: &AppSettings,
     round: usize,
 ) -> Result<Vec<DiscoveredCompany>, String> {
-    let limit = search.max_results.clamp(1, 60) as usize;
+    let limit = search.max_results.max(1) as usize;
     let mut expanded = search.clone();
 
     if round > 1 {
@@ -388,9 +590,10 @@ pub async fn discover_companies_for_round(
             "Debrecen", "Győr", "Szeged", "Pécs", "Miskolc", "Székesfehérvár",
             "Kecskemét", "Nyíregyháza", "Szombathely", "Veszprém", "Eger", "Sopron",
         ];
+        // Avoid bare "Bt" which matches British Telecom (bt.com / UK news) in search engines
         let modifiers = [
-            "szolgáltatások", "árlista", "kapcsolat", "referenciák",
-            "Kft", "Bt", "stúdió", "központ", "magán", "szakértő",
+            "szolgáltatások", "kapcsolat", "jelentkezés", "időpont",
+            "Kft", "központ", "stúdió", "akadémia", "iroda", "szakértő",
         ];
 
         let modifier = modifiers[(round - 2) % modifiers.len()];
@@ -517,16 +720,16 @@ async fn discover_via_ddgs(search: &SearchJob, limit: usize) -> Result<Vec<Disco
         .trim()
         .to_string();
 
-    // Multi-angle Hungarian/B2B queries to maximize real company websites (not just news/articles)
+    // Multi-angle Hungarian/B2B queries to maximize real company websites (not news/articles/foreign telecoms)
     let queries = vec![
-        base_q.clone(),
-        format!("{} kapcsolat OR árak OR szolgáltatások", base_q),
+        format!("{} kapcsolat OR jelentkezés", base_q),
+        format!("{} szolgáltatások OR árak -hirek -cikk -pdf", base_q),
         if !search.industry.trim().is_empty()
             && !search.industry.eq_ignore_ascii_case(&search.query)
         {
-            format!("{} {} Kft OR Bt OR rendelő OR stúdió", search.industry.trim(), search.location.trim())
+            format!("{} {} Kft OR központ OR stúdió kapcsolat", search.industry.trim(), search.location.trim())
         } else {
-            format!("{} cég OR vállalkozás OR hivatalos oldal", base_q)
+            format!("{} Kft OR központ OR akadémia OR stúdió", base_q)
         },
     ];
 
@@ -588,8 +791,9 @@ print(json.dumps(out, ensure_ascii=False))
     for r in rows {
         let href = r["href"].as_str().unwrap_or_default().trim().to_string();
         let title = r["title"].as_str().unwrap_or_default().trim().to_string();
+        let href_lower = href.to_lowercase();
         let domain = extract_domain(&href);
-        if domain.is_empty() || is_noise_domain(&domain) {
+        if domain.is_empty() || is_noise_domain(&domain) || href_lower.ends_with(".pdf") {
             continue;
         }
         out.push(DiscoveredCompany {
@@ -781,17 +985,18 @@ async fn discover_via_ai_cli(
 
     let (engine_name, bin_path) = chosen;
     let prompt = format!(
-        r#"Használd a beépített webkeresődet, és keress pontosan {limit} VALÓDI, létező céget/vállalkozást a következő feltételekkel:
+        r#"Használd a beépített webkeresődet, és keress pontosan {limit} VALÓDI, létező céget/vállalkozást, amelyek SZIGORÚAN megfelelnek az alábbi keresési feltételeknek:
 - Téma / kulcsszó: {query}
 - Iparág: {industry}
 - Város / régió: {location}
 - Cél cégméret: {size}
-- Keresett probléma / fókusz: {problem}
+- Keresett probléma / szűrőfeltétel: {problem}
 
 FONTOS SZABÁLYOK:
-1. KIZÁRÓLAG valódi cégek saját hivatalos weboldalát add vissza (NE Facebook, NE Aranyoldalak, NE Céginformáció, NE gyűjtőoldal).
-2. Ne találj ki domain neveket — csak olyan cégeket adj vissza, amiket a webkeresésed ténylegesen megtalált!
-3. Kizárólag érvényes JSON objektumot adj vissza semmilyen magyarázat nélkül, pontosan ebben a formátumban:
+1. KIZÁRÓLAG olyan valódi cégek saját hivatalos weboldalát add vissza, amelyek TÉNYLEG a megadott iparágban ({industry} / {query}) működnek és megfelelnek a keresett problémának ({problem})! Soha ne adj vissza más iparágú céget, hírportált, hatóságot, gyűjtőoldalt vagy PDF-et!
+2. A "company_name" mezőben MINDIG a cég, márka vagy szakember VALÓDI, hivatalos nevét add meg (pl. "Gordio Csoport", "Sugár Márton Coaching", "ASCON Consulting") — SOHA ne adj meg aloldal-címet vagy SEO kulcsszót (mint "Coaching árak" vagy "Főoldal")!
+3. Ne találj ki domain neveket — csak olyan cégeket adj vissza, amiket a webkeresésed ténylegesen megtalált!
+4. Kizárólag érvényes JSON objektumot adj vissza semmilyen magyarázat nélkül, pontosan ebben a formátumban:
 {{"companies":[{{"company_name":"...","website_url":"https://...","industry":"...","location":"...","address":"...","phone":"...","email":"..."}}]}}"#,
         limit = limit.min(20),
         query = search.query,
@@ -1258,6 +1463,8 @@ async fn discover_via_osm_upgraded(search: &SearchJob, limit: usize) -> Result<V
         r#"["craft"]"#
     } else if kw_lower.contains("it") || kw_lower.contains("szoftver") || kw_lower.contains("marketing") || kw_lower.contains("ügynökség") || kw_lower.contains("web") {
         r#"["office"~"it|advertising_agency|company|consulting"]"#
+    } else if kw_lower.contains("coach") || kw_lower.contains("tréning") || kw_lower.contains("trening") || kw_lower.contains("képzés") || kw_lower.contains("kepzes") || kw_lower.contains("oktat") {
+        r#"["office"~"consulting|educational_institution|therapist|company"]["name"~"coach|Coach|tréning|Tréning|képz|Képz|akadémia|Akadémia|tanácsad|Consulting"]"#
     } else if kw_lower.contains("logisztik") || kw_lower.contains("fuvar") || kw_lower.contains("szállít") {
         r#"["office"~"logistics|moving_company|company"]"#
     } else if kw_lower.contains("bútor") || kw_lower.contains("lakberendez") || kw_lower.contains("bolt") || kw_lower.contains("shop") {
@@ -1265,6 +1472,12 @@ async fn discover_via_osm_upgraded(search: &SearchJob, limit: usize) -> Result<V
     } else {
         r#"["office"]["website"]"#
     };
+    let is_generic_office_fallback = tag_filter == r#"["office"]["website"]"#;
+    let kw_tokens: Vec<String> = kw_lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() >= 4)
+        .map(|w| w.to_string())
+        .collect();
 
     let overpass_query = format!(
         "[out:json][timeout:10];(node{tag}(around:14000,{lat},{lon});way{tag}(around:14000,{lat},{lon}););out center {lim};",
@@ -1299,6 +1512,18 @@ async fn discover_via_osm_upgraded(search: &SearchJob, limit: usize) -> Result<V
                             let name = tags["name"].as_str().unwrap_or_default().trim().to_string();
                             if name.is_empty() {
                                 continue;
+                            }
+                            if is_generic_office_fallback && !kw_tokens.is_empty() {
+                                let hay = format!(
+                                    "{} {} {}",
+                                    name,
+                                    tags["description"].as_str().unwrap_or_default(),
+                                    tags["office"].as_str().unwrap_or_default()
+                                )
+                                .to_lowercase();
+                                if !kw_tokens.iter().any(|t| hay.contains(t)) {
+                                    continue;
+                                }
                             }
                             let website = tags["website"]
                                 .as_str()

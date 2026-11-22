@@ -226,7 +226,7 @@ export function AnalyticsPage({ analytics, campaigns, senderAccounts }: Props) {
                       <Table.Tr key={c.id}>
                         <Table.Td fw={500}>{c.name}</Table.Td>
                         <Table.Td>
-                          <Text size="xs" fw={500}>{c.offerTitle || "Egyedi ajánlat"}</Text>
+                          <Text size="xs" fw={500}>{c.offerSummary || c.offerTitle || "Nincs külön ajánlat"}</Text>
                           <Text size="11px" c="dimmed">
                             {c.projectName}
                           </Text>

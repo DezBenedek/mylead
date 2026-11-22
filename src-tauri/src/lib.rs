@@ -24,13 +24,42 @@ pub fn run() {
             app.manage(database);
             app.manage(assistant::SearchControlRegistry::default());
 
-            // Background Auto-Reply Scheduler (checks every 25s) & Periodic IMAP Poller
+            // Background Startup Recovery + Auto-Reply Scheduler (checks every 25s) & Periodic IMAP Poller
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                // Immediately resume any unfinished work & sync IMAP after app startup!
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                commands::spawn_pending_email_generator(app_handle.clone());
+                {
+                    let interrupted_searches: Vec<String> = {
+                        let db = app_handle.state::<Database>();
+                        db.list_searches()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|s| s.status == "running")
+                            .map(|s| s.id)
+                            .collect()
+                    };
+                    for sid in interrupted_searches {
+                        let _ = assistant::spawn_search_job(app_handle.clone(), sid, false);
+                    }
+                }
+                {
+                    let db = app_handle.state::<Database>();
+                    let has_imap = db
+                        .list_sender_accounts()
+                        .map(|list| list.iter().any(|a| a.imap_enabled))
+                        .unwrap_or(false);
+                    if has_imap {
+                        let _ = commands::sync_imap_inbox_inner(&app_handle, &db, None).await;
+                    }
+                }
+
                 let mut tick_count: u64 = 0;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(25)).await;
                     tick_count += 1;
+                    commands::spawn_pending_email_generator(app_handle.clone());
                     commands::dispatch_due_scheduled_messages(&app_handle).await;
 
                     // Periodic IMAP polling based on settings.imap_poll_minutes
@@ -86,6 +115,7 @@ pub fn run() {
             commands::create_campaign_with_drafts,
             commands::update_campaign,
             commands::add_leads_to_campaign,
+            commands::regenerate_campaign_drafts,
             commands::update_email_draft,
             commands::regenerate_email_draft,
             commands::delete_campaign,
@@ -94,6 +124,7 @@ pub fn run() {
             commands::send_direct_email,
             commands::list_inbox_threads,
             commands::sync_imap_inbox,
+            commands::reclassify_inbox_threads,
             commands::simulate_inbound_reply,
             commands::send_inbox_reply,
             commands::save_inbox_reply_draft,
@@ -109,6 +140,7 @@ pub fn run() {
             commands::test_ai_settings,
             commands::detect_local_ai_clis,
             commands::fetch_ai_models,
+            commands::fetch_decision_models,
             commands::detect_discovery_tools,
             commands::install_gmaps_scraper,
             commands::list_suppressions,

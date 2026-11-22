@@ -93,13 +93,13 @@ export function DashboardPage({ analytics, loadingDemo, onLoadDemo, onNavigate }
               <SimpleGrid cols={{ base: 1, sm: 3 }} spacing="sm">
                 <Paper p="sm">
                   <Text size="xs" c="dimmed" fw={600}>
-                    1. PROJEKT & AJÁNLATOK
+                    1. PROJEKT
                   </Text>
                   <Text size="sm" fw={600} mt={4}>
                     Weboldal feltérképezés
                   </Text>
                   <Text size="xs" c="dimmed" mt={4}>
-                    Add meg a céged URL-jét és kedvezményeit — az AI felépíti a reklámstratégiát.
+                    Add meg a céged URL-jét és aláírását — az AI felépíti a stratégiát.
                   </Text>
                 </Paper>
                 <Paper p="sm">

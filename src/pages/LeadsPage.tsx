@@ -54,6 +54,8 @@ interface Props {
   settings: AppSettings;
   initialSearchFilter: string | null;
   activeLeadWorkers: Record<string, SearchLiveEvent>;
+  enrichingLeadIds: string[];
+  onEnrichLeads: (leadIds: string[], projectId?: string | null) => void;
   onSelectLead: (lead: Lead) => void;
   onRefresh: () => Promise<void>;
   onCreateCampaignForLeads: (leadIds: string[]) => void;
@@ -68,6 +70,8 @@ export function LeadsPage({
   settings,
   initialSearchFilter,
   activeLeadWorkers,
+  enrichingLeadIds,
+  onEnrichLeads,
   onSelectLead,
   onRefresh,
   onCreateCampaignForLeads,
@@ -80,7 +84,6 @@ export function LeadsPage({
   const [textQuery, setTextQuery] = useState("");
   const [onlyWithEmail, setOnlyWithEmail] = useState(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
-  const [enriching, setEnriching] = useState(false);
   const [bulkStatusTarget, setBulkStatusTarget] = useState<string>("");
 
   // Direct Email & Add to Campaign modals
@@ -151,22 +154,9 @@ export function LeadsPage({
     );
   };
 
-  const handleBulkEnrich = async () => {
+  const handleBulkEnrich = () => {
     if (selectedIds.length === 0) return;
-    setEnriching(true);
-    try {
-      const updated = await api.enrichLeads(selectedIds, projects[0]?.id || null);
-      await onRefresh();
-      notifications.show({
-        title: "Mély gazdagítás kész",
-        message: `${updated.length} cég teljes adatlapja és okosűrlap-értékelése felépült.`,
-        color: "forest",
-      });
-    } catch (e) {
-      notifications.show({ title: "Hiba", message: String(e), color: "red" });
-    } finally {
-      setEnriching(false);
-    }
+    onEnrichLeads(selectedIds, projects[0]?.id || null);
   };
 
   const handleBulkStatus = async (status: string) => {
@@ -449,10 +439,10 @@ export function LeadsPage({
                   <Button
                     size="xs"
                     leftSection={<IconRefresh size={14} />}
-                    loading={enriching}
+                    loading={selectedIds.some((id) => enrichingLeadIds.includes(id))}
                     onClick={handleBulkEnrich}
                   >
-                    Mély kutatás
+                    Mély kutatás ({selectedIds.length})
                   </Button>
                   <Button
                     size="xs"
@@ -601,6 +591,17 @@ export function LeadsPage({
                         </Table.Td>
                         <Table.Td ta="right" onClick={(e) => e.stopPropagation()}>
                           <Group gap={4} justify="flex-end" wrap="nowrap">
+                            <Tooltip label="Mély kutatás / Okosűrlap elemzés (párhuzamosan is indítható)">
+                              <ActionIcon
+                                size="sm"
+                                variant="subtle"
+                                color="forest"
+                                loading={enrichingLeadIds.includes(l.id) || !!worker}
+                                onClick={() => onEnrichLeads([l.id], projects[0]?.id || null)}
+                              >
+                                <IconRefresh size={14} />
+                              </ActionIcon>
+                            </Tooltip>
                             <Tooltip
                               label={
                                 l.primaryEmail

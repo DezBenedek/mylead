@@ -63,7 +63,7 @@ export function AppShellLayout({
         { id: "dashboard", label: "Áttekintés", icon: <IconLayoutDashboard size={16} stroke={1.7} /> },
         {
           id: "projects",
-          label: "Projektek & Ajánlatok",
+          label: "Projektek",
           icon: <IconBriefcase size={16} stroke={1.7} />,
           count: counts.projects,
         },
@@ -273,10 +273,16 @@ export function AppShellLayout({
         </Box>
       </Box>
 
-      {/* Main Scrollable Content Area */}
-      <ScrollArea style={{ flex: 1, height: "100vh" }} type="auto">
-        {children}
-      </ScrollArea>
+      {/* Main Content Area (full-height split pane for Inbox, scrollable for other pages) */}
+      {active === "inbox" ? (
+        <Box style={{ flex: 1, height: "100vh", overflow: "hidden", minWidth: 0 }}>
+          {children}
+        </Box>
+      ) : (
+        <ScrollArea style={{ flex: 1, height: "100vh" }} type="auto">
+          {children}
+        </ScrollArea>
+      )}
     </Box>
   );
 }

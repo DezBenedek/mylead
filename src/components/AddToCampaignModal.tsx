@@ -45,13 +45,17 @@ export function AddToCampaignModal({
     setBusy(true);
     try {
       const updated = await api.addLeadsToCampaign(targetId, leadIds, generateDrafts);
-      await onAdded();
       onClose();
       notifications.show({
-        title: "Kampányba véve",
-        message: `${updated.name} — jelenleg ${updated.totalRecipients} címzett.`,
+        title: generateDrafts
+          ? "Kampányba véve — AI levélírás folyamatban!"
+          : "Kampányba véve",
+        message: generateDrafts
+          ? `${updated.name}: az AI több szálon generálja a személyre szabott leveleket a háttérben.`
+          : `${updated.name} — jelenleg ${updated.totalRecipients} címzett.`,
         color: "forest",
       });
+      await onAdded();
     } catch (e) {
       notifications.show({ title: "Hiba", message: String(e), color: "red" });
     } finally {
@@ -82,7 +86,7 @@ export function AddToCampaignModal({
               onChange={(v) => setCampaignId(v || "")}
               data={campaigns.map((c) => ({
                 value: c.id,
-                label: `${c.name}${c.offerTitle ? ` — ${c.offerTitle}` : ""} (${c.totalRecipients} címzett)`,
+                label: `${c.name}${c.offerSummary || c.offerTitle ? ` — ${c.offerSummary || c.offerTitle}` : ""} (${c.totalRecipients} címzett)`,
               }))}
             />
             <Switch

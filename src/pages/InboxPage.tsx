@@ -1,16 +1,16 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActionIcon,
   Badge,
   Box,
   Button,
   Checkbox,
-  Divider,
-  Grid,
   Group,
+  Menu,
   Modal,
   NumberInput,
   Paper,
+  ScrollArea,
   SegmentedControl,
   Select,
   SimpleGrid,
@@ -19,15 +19,18 @@ import {
   Text,
   Textarea,
   TextInput,
-  Title,
   Tooltip,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import {
   IconAdjustments,
+  IconArrowsSort,
+  IconBolt,
   IconCalendarEvent,
   IconCheck,
+  IconChevronDown,
   IconClock,
+  IconFlame,
   IconMailPlus,
   IconPlayerPause,
   IconPlayerPlay,
@@ -35,7 +38,7 @@ import {
   IconSearch,
   IconSend,
   IconSparkles,
-  IconTestPipe,
+  IconTag,
   IconTrash,
   IconUser,
   IconWand,
@@ -77,13 +80,13 @@ const WEEKDAY_LABELS = [
   { day: 7, short: "V" },
 ];
 
-const QUICK_REWRITE_CHIPS = [
-  { label: "Rövidebben", note: "Írd sokkal tömörebbre, max 4-5 mondatba, lényegre törően." },
+const QUICK_REWRITE_PRESETS = [
+  { label: "Rövidebben (4-5 mondat)", note: "Írd sokkal tömörebbre, max 4-5 mondatba, lényegre törően." },
   { label: "Közvetlenebb (tegező)", note: "Írd át közvetlen, barátságos tegező stílusra." },
-  { label: "Hivatalosabb", note: "Írd át udvarias, magázódó üzleti stílusra." },
+  { label: "Hivatalosabb (magázó)", note: "Írd át udvarias, magázódó üzleti stílusra." },
   {
     label: "Okosűrlap fókusz",
-    note: "Emeld ki konkrétan, hogyan segít az okosűrlap ennek a cégnek (gyors előszűrés, kevesebb manuális kör, több foglalás).",
+    note: "Emeld ki konkrétan, hogyan segít az okosűrlap ennek a cégnek (előszűrés, gyorsabb ajánlatadás, több foglalás).",
   },
   {
     label: "Időpontfoglalóval",
@@ -104,6 +107,9 @@ export function InboxPage({
     threads[0]?.leadId ?? null
   );
   const [threadFilter, setThreadFilter] = useState<string>("all");
+  const [sortMode, setSortMode] = useState<"priority" | "recent">(
+    settings.decisionAutoSortInbox !== false ? "priority" : "recent"
+  );
   const [searchQuery, setSearchQuery] = useState("");
   const [, setTick] = useState(0);
 
@@ -114,6 +120,8 @@ export function InboxPage({
   const [showCustomSchedule, setShowCustomSchedule] = useState(false);
 
   const [syncing, setSyncing] = useState(false);
+  const [reclassifying, setReclassifying] = useState(false);
+  const [lastAutoSyncAt, setLastAutoSyncAt] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [rewriting, setRewriting] = useState(false);
   const [generating, setGenerating] = useState(false);
@@ -125,28 +133,58 @@ export function InboxPage({
   const [rulesModalOpen, setRulesModalOpen] = useState(false);
   const [rulesForm, setRulesForm] = useState<AppSettings>(settings);
   const [savingRules, setSavingRules] = useState(false);
-
-  // Simulate inbound reply modal
-  const [simOpen, setSimOpen] = useState(false);
-  const [simLeadId, setSimLeadId] = useState<string>("");
-  const [simBody, setSimBody] = useState(
-    "Üdvözlöm! Érdekesnek hangzik az okosűrlap. Meg tudnák mondani, hogyan működik a gyakorlatban, mennyibe kerül, és mennyi idő alatt építhető be az oldalunkra?"
-  );
-  const [simulating, setSimulating] = useState(false);
+  const lastServerSettingsJsonRef = useRef<string>(JSON.stringify(settings));
+  const activeComposerKeyRef = useRef<string>("");
 
   useEffect(() => {
-    setRulesForm(settings);
-  }, [settings]);
+    const incomingJson = JSON.stringify(settings);
+    if (incomingJson !== lastServerSettingsJsonRef.current && !rulesModalOpen) {
+      lastServerSettingsJsonRef.current = incomingJson;
+      setRulesForm(settings);
+      setSortMode(settings.decisionAutoSortInbox !== false ? "priority" : "recent");
+    }
+  }, [settings, rulesModalOpen]);
 
-  // Refresh relative countdown badges every 15 seconds
   useEffect(() => {
     const id = setInterval(() => setTick((t) => t + 1), 15000);
     return () => clearInterval(id);
   }, []);
 
+  const hasImapAccount = useMemo(
+    () => senderAccounts.some((a) => a.imapEnabled),
+    [senderAccounts]
+  );
+
+  // Quiet automatic IMAP sync (runs automatically on mount & every 45s without button press)
+  const runQuietImapSync = useCallback(async () => {
+    if (!hasImapAccount) return;
+    try {
+      const count = await api.syncImapInbox();
+      setLastAutoSyncAt(
+        new Date().toLocaleTimeString("hu-HU", { hour: "2-digit", minute: "2-digit" })
+      );
+      if (count > 0) {
+        await onRefresh();
+        notifications.show({
+          title: "Új beérkező e-mail érkezett!",
+          message: `${count} új válasz automatikusan letöltve, rangsorolva és felcímkézve.`,
+          color: "forest",
+        });
+      }
+    } catch {
+      // Quiet background poll ignores transient IMAP errors
+    }
+  }, [hasImapAccount, onRefresh]);
+
+  useEffect(() => {
+    runQuietImapSync();
+    const timer = setInterval(runQuietImapSync, 45000);
+    return () => clearInterval(timer);
+  }, [runQuietImapSync]);
+
   const filteredThreads = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
-    return threads.filter((t) => {
+    const list = threads.filter((t) => {
       if (threadFilter === "scheduled" && t.autoSendStatus !== "scheduled") return false;
       if (
         threadFilter === "paused" &&
@@ -156,19 +194,32 @@ export function InboxPage({
       }
       if (
         threadFilter === "hot" &&
-        !["interested", "booking_request", "question"].includes(t.latestIntent || "")
+        !(
+          (t.priorityScore ?? 0) >= 75 ||
+          ["interested", "booking_request", "question"].includes(t.latestIntent || "")
+        )
       ) {
         return false;
       }
       if (q) {
-        const hay = `${t.leadCompany} ${t.leadEmail} ${t.offerTitle || ""} ${t.messages
-          .map((m) => `${m.subject} ${m.body}`)
-          .join(" ")}`.toLowerCase();
+        const tagText = (t.aiTags || []).join(" ");
+        const hay = `${t.leadCompany} ${t.leadEmail} ${t.offerTitle || ""} ${tagText} ${
+          t.decisionSummary || ""
+        } ${t.messages.map((m) => `${m.subject} ${m.body}`).join(" ")}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
     });
-  }, [threads, threadFilter, searchQuery]);
+
+    return [...list].sort((a, b) => {
+      if (sortMode === "priority") {
+        const pa = a.priorityScore ?? 0;
+        const pb = b.priorityScore ?? 0;
+        if (pb !== pa) return pb - pa;
+      }
+      return b.lastMessageAt.localeCompare(a.lastMessageAt);
+    });
+  }, [threads, threadFilter, searchQuery, sortMode]);
 
   const selected =
     filteredThreads.find((t) => t.leadId === selectedLeadId) ??
@@ -187,19 +238,27 @@ export function InboxPage({
         .find(
           (m) =>
             m.direction === "outbound" &&
-            (m.status === "queued" || (m.status === "draft" && (m.stepNumber >= 2 || !!m.autoSendStatus)))
+            (m.status === "queued" ||
+              (m.status === "draft" && (m.stepNumber >= 2 || !!m.autoSendStatus)))
         ) || null
     );
   }, [selected]);
 
   const timelineMessages = useMemo(() => {
     if (!selected) return [];
-    // Show sent & received messages in timeline (pending scheduled/draft reply gets its dedicated control studio below!)
-    return selected.messages.filter((m) => m.id !== pendingMsg?.id && (m.status === "sent" || m.status === "received"));
+    return selected.messages.filter(
+      (m) => m.id !== pendingMsg?.id && (m.status === "sent" || m.status === "received")
+    );
   }, [selected, pendingMsg]);
 
   useEffect(() => {
     if (!selected) return;
+    const composerKey = `${selected.leadId}:${pendingMsg?.id || "none"}`;
+    if (composerKey === activeComposerKeyRef.current) {
+      return;
+    }
+    activeComposerKeyRef.current = composerKey;
+
     if (pendingMsg) {
       setReplySubject(pendingMsg.subject);
       setReplyBody(pendingMsg.body);
@@ -222,7 +281,13 @@ export function InboxPage({
     }
     setAiComment("");
     setShowCustomSchedule(false);
-  }, [selected?.leadId, pendingMsg?.id, pendingMsg?.body, pendingMsg?.subject, pendingMsg?.scheduledSendAt]);
+  }, [
+    selected?.leadId,
+    pendingMsg?.id,
+    pendingMsg?.body,
+    pendingMsg?.subject,
+    pendingMsg?.scheduledSendAt,
+  ]);
 
   const scheduledCount = threads.filter((t) => t.autoSendStatus === "scheduled").length;
   const pausedCount = threads.filter(
@@ -235,28 +300,57 @@ export function InboxPage({
     if (days.length === 5 && !days.includes(6) && !days.includes(7)) return "H–P";
     return WEEKDAY_LABELS.filter((w) => days.includes(w.day))
       .map((w) => w.short)
-      .join(", ");
+      .join(",");
   }, [settings.autoReplyWorkdays]);
 
   const handleImapSync = async () => {
     setSyncing(true);
     try {
       const count = await api.syncImapInbox();
+      setLastAutoSyncAt(
+        new Date().toLocaleTimeString("hu-HU", { hour: "2-digit", minute: "2-digit" })
+      );
       await onRefresh();
       notifications.show({
-        title: "IMAP szinkronizálás kész",
-        message: `${count} új beérkező levél feldolgozva és AI válasszal ütemezve.`,
+        title: "Postafiók frissítve",
+        message:
+          count > 0
+            ? `${count} új beérkező e-mail letöltve és AI Decision Modellel rangsorolva.`
+            : "Nincs új beérkező e-mail.",
         color: "forest",
       });
     } catch (e) {
-      notifications.show({ title: "IMAP információ", message: String(e), color: "orange" });
+      notifications.show({ title: "IMAP szinkron", message: String(e), color: "orange" });
     } finally {
       setSyncing(false);
     }
   };
 
+  const handleReclassifyAll = async () => {
+    setReclassifying(true);
+    try {
+      const count = await api.reclassifyInboxThreads();
+      await onRefresh();
+      notifications.show({
+        title: "OpenRouter Decisions kész",
+        message: `${count} beérkező üzenet újra rangsorolva és felcímkézve.`,
+        color: "forest",
+      });
+    } catch (e) {
+      notifications.show({ title: "Rangsorolási hiba", message: String(e), color: "red" });
+    } finally {
+      setReclassifying(false);
+    }
+  };
+
   const handleControlAutoSend = async (
-    action: "pause" | "cancel" | "resume" | "reschedule_random" | "reschedule_custom" | "send_now",
+    action:
+      | "pause"
+      | "cancel"
+      | "resume"
+      | "reschedule_random"
+      | "reschedule_custom"
+      | "send_now",
     dryRun?: boolean
   ) => {
     if (!pendingMsg) return;
@@ -269,17 +363,16 @@ export function InboxPage({
       await api.controlScheduledReply(pendingMsg.id, action, customIso, dryRun);
       await onRefresh();
       setShowCustomSchedule(false);
-      const msgs: Record<string, string> = {
-        pause: "Automatikus küldés megállítva — a tervezet megmaradt szerkesztésre.",
-        cancel: "Időzített válasz törölve.",
-        resume: "AI válasz újra időzítve a munkaidő-ablakba (20p–2ó).",
-        reschedule_random: "Új véletlen időpont beállítva munkaidőn belül.",
-        reschedule_custom: "Egyedi küldési időpont mentve.",
-        send_now: dryRun ? "Szimulált válasz rögzítve." : "Válasz azonnal elküldve!",
-      };
       notifications.show({
-        title: action === "pause" || action === "cancel" ? "Auto-küldés leállítva" : "Frissítve",
-        message: msgs[action] || "",
+        title:
+          action === "pause"
+            ? "Auto-küldés megállítva"
+            : action === "cancel"
+            ? "Tervezet törölve"
+            : action === "send_now"
+            ? "Válasz elküldve"
+            : "Időzítés frissítve",
+        message: "",
         color: action === "pause" || action === "cancel" ? "orange" : "forest",
       });
     } catch (e) {
@@ -303,7 +396,7 @@ export function InboxPage({
       );
       await onRefresh();
       notifications.show({
-        title: keepScheduled ? "Átírt válasz mentve (időzítve marad)" : "Tervezet mentve (megállítva)",
+        title: keepScheduled ? "Mentve & időzítve" : "Tervezet mentve",
         message: "",
         color: "forest",
       });
@@ -330,13 +423,9 @@ export function InboxPage({
       setReplyBody(rewritten.body);
       setAiComment("");
       await onRefresh();
-      notifications.show({
-        title: "AI átírta a választ a megjegyzésed alapján",
-        message: pendingMsg?.autoSendStatus === "scheduled" ? "Az időzítés aktív maradt (ellenőrizheted vagy megállíthatod)." : "",
-        color: "forest",
-      });
+      notifications.show({ title: "AI átírta a választ", message: "", color: "forest" });
     } catch (e) {
-      notifications.show({ title: "AI átírási hiba", message: String(e), color: "red" });
+      notifications.show({ title: "Átírási hiba", message: String(e), color: "red" });
     } finally {
       setRewriting(false);
     }
@@ -348,13 +437,7 @@ export function InboxPage({
     try {
       await api.generateInboxReplyWithAi(selected.leadId, selected.campaignId);
       await onRefresh();
-      notifications.show({
-        title: "AI válasz legenerálva",
-        message: settings.autoReplyEnabled
-          ? "Munkaidőn belüli random időzítéssel beállítva — bármikor megállítható vagy átírható."
-          : "Tervezetként elmentve.",
-        color: "forest",
-      });
+      notifications.show({ title: "AI válasz legenerálva", message: "", color: "forest" });
     } catch (e) {
       notifications.show({ title: "Hiba", message: String(e), color: "red" });
     } finally {
@@ -362,7 +445,7 @@ export function InboxPage({
     }
   };
 
-  const handleSendReplyNow = async (dryRun: boolean) => {
+  const handleSendReplyNow = async () => {
     if (!selected || !replyBody.trim()) return;
     setSending(true);
     try {
@@ -371,13 +454,13 @@ export function InboxPage({
         selected.campaignId,
         replySubject,
         replyBody,
-        dryRun,
+        false,
         pendingMsg?.id || null
       );
       await onRefresh();
       setReplyBody("");
       notifications.show({
-        title: dryRun ? "Szimulált válasz rögzítve" : "Válasz elküldve",
+        title: "Válasz elküldve",
         message: selected.leadEmail,
         color: "forest",
       });
@@ -388,36 +471,13 @@ export function InboxPage({
     }
   };
 
-  const handleSimulateInbound = async () => {
-    if (!simLeadId || !simBody.trim()) return;
-    setSimulating(true);
-    try {
-      const thread = await api.simulateInboundReply(simLeadId, null, simBody);
-      await onRefresh();
-      setSelectedLeadId(thread.leadId);
-      setSimOpen(false);
-      notifications.show({
-        title: "Beérkező válasz feldolgozva (AI)",
-        message:
-          thread.autoSendStatus === "scheduled" && thread.scheduledSendAt
-            ? `AI válasz elkészült és időzítve: ${formatShortDate(thread.scheduledSendAt)} (${formatCountdown(thread.scheduledSendAt)})`
-            : `Szándék: ${INTENT_META[thread.latestIntent || ""]?.label || thread.latestIntent || "Feldolgozva"}`,
-        color: "forest",
-      });
-    } catch (e) {
-      notifications.show({ title: "Hiba", message: String(e), color: "red" });
-    } finally {
-      setSimulating(false);
-    }
-  };
-
   const handleSaveRules = async () => {
     setSavingRules(true);
     try {
       await api.saveSettings(rulesForm);
       await onRefresh();
       setRulesModalOpen(false);
-      notifications.show({ title: "Auto-válasz szabályok mentve", message: "", color: "forest" });
+      notifications.show({ title: "Szabályok mentve", message: "", color: "forest" });
     } catch (e) {
       notifications.show({ title: "Hiba", message: String(e), color: "red" });
     } finally {
@@ -428,17 +488,11 @@ export function InboxPage({
   const insertBookingLink = () => {
     const url = projects[0]?.bookingUrl;
     if (!url) {
-      notifications.show({
-        title: "Nincs időpontfoglaló link",
-        message: "Állítsd be a projekt adatlapján a foglalási linket!",
-        color: "orange",
-      });
+      notifications.show({ title: "Nincs foglaló link beállítva a projektben", message: "", color: "orange" });
       return;
     }
     setReplyBody((prev) =>
-      prev
-        ? `${prev}\n\nItt tudnak közvetlenül időpontot foglalni: ${url}`
-        : `Itt tudnak közvetlenül időpontot foglalni egy 15 perces egyeztetésre: ${url}`
+      prev ? `${prev}\n\nIdőpontfoglalás: ${url}` : `Itt tud időpontot választani: ${url}`
     );
   };
 
@@ -446,9 +500,7 @@ export function InboxPage({
     const url = projects[0]?.landingUrl || projects[0]?.websiteUrl;
     if (!url) return;
     setReplyBody((prev) =>
-      prev
-        ? `${prev}\n\nRészletek és példák: ${url}`
-        : `A részleteket és az aktuális ajánlatunkat itt találják: ${url}`
+      prev ? `${prev}\n\nRészletek: ${url}` : `Részletek: ${url}`
     );
   };
 
@@ -456,647 +508,765 @@ export function InboxPage({
   const isPaused = !!pendingMsg && pendingMsg.autoSendStatus !== "scheduled";
 
   return (
-    <Box>
-      <Box className="ml-page-header">
-        <Group justify="space-between" wrap="wrap" gap="sm">
-          <Box>
-            <Title order={3} style={{ letterSpacing: "-0.02em" }}>
-              Beérkező levelek & AI Auto-válasz
-            </Title>
-            <Text size="sm" c="dimmed">
-              Beérkező kérdésekre az AI automatikusan választ készít és munkaidőn belül random
-              időzíti — bármikor megállíthatod, manuálisan átírhatod, vagy megjegyzéssel
-              újraírathatod.
-            </Text>
-          </Box>
-          <Group gap="xs" wrap="wrap">
-            <Button
-              size="xs"
-              variant="default"
-              leftSection={<IconAdjustments size={14} />}
-              onClick={() => setRulesModalOpen(true)}
-            >
-              Auto-válasz szabályok
-            </Button>
-            <Button
-              size="xs"
-              variant="default"
-              leftSection={<IconMailPlus size={14} />}
-              disabled={leads.length === 0}
-              onClick={() => setComposeOpen(true)}
-            >
-              Új üzenet
-            </Button>
-            <Button
-              size="xs"
-              variant="default"
-              leftSection={<IconTestPipe size={14} />}
-              onClick={() => {
-                setSimLeadId(selected?.leadId || leads.find((l) => l.primaryEmail)?.id || "");
-                setSimOpen(true);
-              }}
-            >
-              Beérkező teszt
-            </Button>
-            <Button
-              size="xs"
-              leftSection={<IconRefresh size={14} />}
-              loading={syncing}
-              onClick={handleImapSync}
-            >
-              IMAP szinkron
-            </Button>
-          </Group>
+    <Box style={{ display: "flex", flexDirection: "column", height: "100vh", overflow: "hidden" }}>
+      {/* Single Ultra-Compact 50px Top Bar */}
+      <Group
+        justify="space-between"
+        px="md"
+        py={9}
+        wrap="nowrap"
+        style={{
+          borderBottom: "1px solid var(--ml-border)",
+          backgroundColor: "var(--ml-surface)",
+          minHeight: 50,
+          flexShrink: 0,
+        }}
+      >
+        <Group gap="sm" wrap="nowrap" style={{ minWidth: 0 }}>
+          <Text fw={700} size="md" style={{ letterSpacing: "-0.02em", whiteSpace: "nowrap" }}>
+            Beérkező
+          </Text>
+          <Badge
+            size="sm"
+            variant={settings.autoReplyEnabled ? "light" : "default"}
+            color={settings.autoReplyEnabled ? "forest" : "gray"}
+            leftSection={<IconClock size={11} />}
+            style={{ cursor: "pointer" }}
+            onClick={() => setRulesModalOpen(true)}
+          >
+            {workdaySummary} {String(settings.autoReplyStartHour).padStart(2, "0")}–
+            {String(settings.autoReplyEndHour).padStart(2, "0")}h • {settings.autoReplyMinDelayMin}–
+            {settings.autoReplyMaxDelayMin}p
+          </Badge>
+          <Switch
+            size="xs"
+            checked={settings.autoReplyEnabled}
+            label="Auto-válasz"
+            onChange={async (e) => {
+              await api.saveSettings({ ...settings, autoReplyEnabled: e.currentTarget.checked });
+              await onRefresh();
+            }}
+          />
+          <Badge
+            size="xs"
+            variant="dot"
+            color={hasImapAccount ? "green" : "gray"}
+            title={
+              hasImapAccount
+                ? `Automatikus háttér-szinkron aktív (${settings.imapPollMinutes || 1} percenként)`
+                : "Nincs aktív IMAP fiók bekapcsolva a Beállításokban"
+            }
+          >
+            {hasImapAccount
+              ? lastAutoSyncAt
+                ? `Auto-IMAP (${lastAutoSyncAt})`
+                : "Auto-IMAP aktív"
+              : "IMAP kikapcsolva"}
+          </Badge>
         </Group>
-      </Box>
 
-      <Box className="ml-page-body">
-        <Stack gap="md">
-          {/* Live Auto-Reply Schedule Status Strip */}
-          <Paper p="sm">
-            <Group justify="space-between" wrap="wrap" gap="sm">
-              <Group gap="sm" wrap="wrap">
-                <Badge
-                  size="sm"
-                  color={settings.autoReplyEnabled ? "forest" : "gray"}
-                  variant="filled"
-                  leftSection={<IconClock size={11} />}
-                >
-                  {settings.autoReplyEnabled
-                    ? "AI Auto-válasz időzítés AKTÍV"
-                    : "AI Auto-válasz SZÜNETELTETVE"}
-                </Badge>
-                <Text size="xs" c="dimmed">
-                  Munkaidő: <strong>{workdaySummary}</strong>{" "}
-                  <span className="ml-tabular">
-                    {String(settings.autoReplyStartHour).padStart(2, "0")}:00–
-                    {String(settings.autoReplyEndHour).padStart(2, "0")}:00
-                  </span>{" "}
-                  • Véletlen késleltetés:{" "}
-                  <strong className="ml-tabular">
-                    {settings.autoReplyMinDelayMin}–{settings.autoReplyMaxDelayMin} perc
-                  </strong>
-                </Text>
-              </Group>
+        <Group gap={6} wrap="nowrap">
+          <Tooltip label="Auto-válasz és Decision Model szabályok">
+            <ActionIcon variant="default" size="md" onClick={() => setRulesModalOpen(true)}>
+              <IconAdjustments size={15} />
+            </ActionIcon>
+          </Tooltip>
+          <Tooltip
+            label={`OpenRouter Decisions (${
+              settings.decisionModelId || "google/gemini-2.5-flash"
+            }) futtatása a beérkező üzenetek újrarangsorolásához és címkézéséhez`}
+          >
+            <Button
+              size="xs"
+              variant="light"
+              color="forest"
+              leftSection={<IconBolt size={14} />}
+              loading={reclassifying}
+              disabled={threads.length === 0}
+              onClick={handleReclassifyAll}
+            >
+              AI Rangsorolás
+            </Button>
+          </Tooltip>
+          <Button
+            size="xs"
+            variant="default"
+            leftSection={<IconMailPlus size={14} />}
+            disabled={leads.length === 0}
+            onClick={() => setComposeOpen(true)}
+          >
+            Új üzenet
+          </Button>
+          <Button
+            size="xs"
+            leftSection={<IconRefresh size={14} />}
+            loading={syncing}
+            onClick={handleImapSync}
+          >
+            Frissítés
+          </Button>
+        </Group>
+      </Group>
+
+      {/* Full-Height Split-Pane Mail Client Body */}
+      {threads.length === 0 ? (
+        <Box p="xl">
+          <Paper p="lg" maw={520}>
+            <Stack gap="sm">
+              <Text fw={600} size="sm">
+                Még nincs aktív levelezés
+              </Text>
+              <Text size="xs" c="dimmed">
+                Az alkalmazás a háttérben automatikusan lekéri az új beérkező e-maileket, az
+                OpenRouter Decisions pedig azonnal rangsorolja (1–100) és felcímkézi őket.
+              </Text>
               <Group gap="xs">
-                {scheduledCount > 0 && (
-                  <Badge size="sm" color="yellow" variant="light">
-                    ⏰ {scheduledCount} időzített küldésre vár
-                  </Badge>
-                )}
-                {pausedCount > 0 && (
-                  <Badge size="sm" color="gray" variant="light">
-                    ⏸ {pausedCount} megállított / tervezet
-                  </Badge>
-                )}
-                <Switch
+                <Button
                   size="xs"
-                  label="Auto-időzítés"
-                  checked={settings.autoReplyEnabled}
-                  onChange={async (e) => {
-                    const next = { ...settings, autoReplyEnabled: e.currentTarget.checked };
-                    await api.saveSettings(next);
-                    await onRefresh();
-                  }}
-                />
+                  leftSection={<IconRefresh size={14} />}
+                  loading={syncing}
+                  onClick={handleImapSync}
+                >
+                  Frissítés most
+                </Button>
+                <Button
+                  size="xs"
+                  variant="default"
+                  leftSection={<IconMailPlus size={14} />}
+                  disabled={leads.length === 0}
+                  onClick={() => setComposeOpen(true)}
+                >
+                  Új üzenet küldése
+                </Button>
               </Group>
-            </Group>
+            </Stack>
           </Paper>
-
-          {threads.length === 0 ? (
-            <Paper p="xl">
-              <Stack gap="sm" maw={560}>
-                <Title order={4}>Még nincs aktív levelezés</Title>
-                <Text size="sm" c="dimmed">
-                  Amint küldesz üzenetet egy leadnek, elindítasz egy kampányt, vagy beérkezik egy
-                  ügyfélválasz IMAP-on, az AI automatikusan megírja és munkaidőre időzíti a választ.
-                </Text>
-                <Group>
+        </Box>
+      ) : (
+        <Box style={{ display: "flex", flex: 1, minHeight: 0, overflow: "hidden" }}>
+          {/* Left Compact Thread List */}
+          <Box
+            style={{
+              width: 315,
+              minWidth: 285,
+              borderRight: "1px solid var(--ml-border)",
+              backgroundColor: "var(--ml-canvas)",
+              display: "flex",
+              flexDirection: "column",
+            }}
+          >
+            <Stack gap={6} p={10} style={{ borderBottom: "1px solid var(--ml-border)" }}>
+              <Group gap={6} wrap="nowrap">
+                <TextInput
+                  size="xs"
+                  placeholder="Keresés név, címke, tartalom..."
+                  leftSection={<IconSearch size={13} />}
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.currentTarget.value)}
+                  style={{ flex: 1 }}
+                />
+                <Tooltip
+                  label={
+                    sortMode === "priority"
+                      ? "Rendezés: OpenRouter Decisions prioritás szerint (Kattints az időrendhez)"
+                      : "Rendezés: Legutóbbi üzenet szerint (Kattints az AI prioritás szerinti rendezéshez)"
+                  }
+                >
                   <Button
-                    leftSection={<IconTestPipe size={15} />}
-                    disabled={leads.length === 0}
-                    onClick={() => {
-                      setSimLeadId(leads.find((l) => l.primaryEmail)?.id || leads[0]?.id || "");
-                      setSimOpen(true);
-                    }}
-                  >
-                    Szimulálj egy beérkező kérdést most
-                  </Button>
-                  <Button
-                    variant="default"
-                    leftSection={<IconMailPlus size={15} />}
-                    disabled={leads.length === 0}
-                    onClick={() => setComposeOpen(true)}
-                  >
-                    Új üzenet írása leadnek
-                  </Button>
-                </Group>
-              </Stack>
-            </Paper>
-          ) : (
-            <Grid gutter="md">
-              {/* Left Thread List with Filters */}
-              <Grid.Col span={{ base: 12, md: 4 }}>
-                <Stack gap="xs">
-                  <TextInput
                     size="xs"
-                    placeholder="Keresés beszélgetésekben..."
-                    leftSection={<IconSearch size={14} />}
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.currentTarget.value)}
-                  />
-                  <SegmentedControl
-                    size="xs"
-                    fullWidth
-                    value={threadFilter}
-                    onChange={setThreadFilter}
-                    data={[
-                      { value: "all", label: `Összes (${threads.length})` },
-                      { value: "scheduled", label: `Időzített (${scheduledCount})` },
-                      { value: "paused", label: `Tervezet (${pausedCount})` },
-                      { value: "hot", label: "Érdeklődő" },
-                    ]}
-                  />
+                    variant={sortMode === "priority" ? "light" : "default"}
+                    color={sortMode === "priority" ? "forest" : "gray"}
+                    px={8}
+                    leftSection={<IconArrowsSort size={13} />}
+                    onClick={() =>
+                      setSortMode((prev) => (prev === "priority" ? "recent" : "priority"))
+                    }
+                  >
+                    {sortMode === "priority" ? "AI Rangsor" : "Időrend"}
+                  </Button>
+                </Tooltip>
+              </Group>
+              <SegmentedControl
+                size="xs"
+                fullWidth
+                value={threadFilter}
+                onChange={setThreadFilter}
+                data={[
+                  { value: "all", label: `Mind (${threads.length})` },
+                  { value: "hot", label: "🔥 Fókusz" },
+                  { value: "scheduled", label: `⏰ ${scheduledCount}` },
+                  { value: "paused", label: `⏸ ${pausedCount}` },
+                ]}
+              />
+            </Stack>
 
-                  {filteredThreads.length === 0 ? (
-                    <Paper p="md">
-                      <Text size="xs" c="dimmed" ta="center">
-                        Nincs a szűrőnek megfelelő beszélgetés.
-                      </Text>
-                    </Paper>
-                  ) : (
-                    filteredThreads.map((t) => {
-                      const active = selected?.leadId === t.leadId;
-                      const intentMeta = t.latestIntent ? INTENT_META[t.latestIntent] : null;
-                      return (
-                        <Paper
-                          key={t.leadId}
-                          p="sm"
-                          onClick={() => setSelectedLeadId(t.leadId)}
-                          style={{
-                            cursor: "pointer",
-                            borderColor: active
-                              ? "#166534"
-                              : t.autoSendStatus === "scheduled"
-                              ? "#d97706"
-                              : undefined,
-                          }}
-                        >
-                          <Group justify="space-between" wrap="nowrap">
-                            <Text size="sm" fw={600} truncate>
+            <ScrollArea style={{ flex: 1 }} p={8}>
+              <Stack gap={6}>
+                {filteredThreads.length === 0 ? (
+                  <Text size="xs" c="dimmed" ta="center" py="md">
+                    Nincs találat.
+                  </Text>
+                ) : (
+                  filteredThreads.map((t) => {
+                    const active = selected?.leadId === t.leadId;
+                    const intentMeta = t.latestIntent ? INTENT_META[t.latestIntent] : null;
+                    const prio = t.priorityScore ?? 50;
+                    const prioColor =
+                      prio >= 80
+                        ? "red"
+                        : prio >= 65
+                        ? "orange"
+                        : prio >= 50
+                        ? "forest"
+                        : "gray";
+                    const tags = t.aiTags || [];
+                    return (
+                      <Box
+                        key={t.leadId}
+                        p="xs"
+                        onClick={() => setSelectedLeadId(t.leadId)}
+                        style={{
+                          cursor: "pointer",
+                          borderRadius: 6,
+                          border: active
+                            ? "1px solid #166534"
+                            : prio >= 80
+                            ? "1px solid rgba(220, 38, 38, 0.45)"
+                            : t.autoSendStatus === "scheduled"
+                            ? "1px solid #d97706"
+                            : "1px solid var(--ml-border)",
+                          backgroundColor: active ? "var(--ml-surface)" : "transparent",
+                        }}
+                      >
+                        <Group justify="space-between" wrap="nowrap" gap={4}>
+                          <Group gap={5} wrap="nowrap" style={{ minWidth: 0 }}>
+                            <Badge
+                              size="xs"
+                              color={prioColor}
+                              variant={prio >= 75 ? "filled" : "light"}
+                              className="ml-tabular"
+                              leftSection={prio >= 80 ? <IconFlame size={10} /> : undefined}
+                              style={{ flexShrink: 0 }}
+                            >
+                              {prio}
+                            </Badge>
+                            <Text size="xs" fw={600} truncate>
                               {t.leadCompany}
                             </Text>
-                            <Text
-                              size="11px"
-                              c="dimmed"
-                              className="ml-tabular"
-                              style={{ whiteSpace: "nowrap" }}
+                          </Group>
+                          <Text
+                            size="10px"
+                            c="dimmed"
+                            className="ml-tabular"
+                            style={{ whiteSpace: "nowrap" }}
+                          >
+                            {formatShortDate(t.lastMessageAt)}
+                          </Text>
+                        </Group>
+                        <Text size="11px" c="dimmed" className="ml-mono" truncate mt={1}>
+                          {t.leadEmail}
+                        </Text>
+                        {t.decisionSummary && (
+                          <Text size="11px" c="dimmed" lineClamp={1} mt={2} fw={500}>
+                            {t.decisionSummary}
+                          </Text>
+                        )}
+                        <Group gap={4} mt={5} wrap="wrap">
+                          {intentMeta && (
+                            <Badge size="xs" color={intentMeta.color}>
+                              {intentMeta.label}
+                            </Badge>
+                          )}
+                          {tags.slice(0, 3).map((tag) => (
+                            <Badge
+                              key={tag}
+                              size="xs"
+                              variant="outline"
+                              color="dark"
+                              style={{ textTransform: "none" }}
                             >
-                              {formatShortDate(t.lastMessageAt)}
+                              #{tag}
+                            </Badge>
+                          ))}
+                          {t.autoSendStatus === "scheduled" && t.scheduledSendAt && (
+                            <Badge size="xs" color="yellow" variant="filled">
+                              ⏰ {formatShortDate(t.scheduledSendAt)}
+                            </Badge>
+                          )}
+                          {t.hasPendingDraft && t.autoSendStatus !== "scheduled" && (
+                            <Badge size="xs" variant="outline" color="gray">
+                              ⏸ Tervezet
+                            </Badge>
+                          )}
+                        </Group>
+                      </Box>
+                    );
+                  })
+                )}
+              </Stack>
+            </ScrollArea>
+          </Box>
+
+          {/* Right Conversation + Spacious Reply Composer */}
+          {selected && (
+            <Box
+              style={{
+                flex: 1,
+                minWidth: 0,
+                display: "flex",
+                flexDirection: "column",
+                backgroundColor: "var(--ml-surface)",
+                overflow: "hidden",
+              }}
+            >
+              {/* Compact 44px Thread Header */}
+              <Group
+                justify="space-between"
+                px="md"
+                py={8}
+                wrap="nowrap"
+                style={{
+                  borderBottom: "1px solid var(--ml-border)",
+                  flexShrink: 0,
+                }}
+              >
+                <Group gap={8} wrap="nowrap" style={{ minWidth: 0 }}>
+                  <Badge
+                    size="sm"
+                    color={
+                      (selected.priorityScore ?? 50) >= 80
+                        ? "red"
+                        : (selected.priorityScore ?? 50) >= 65
+                        ? "orange"
+                        : "forest"
+                    }
+                    variant="filled"
+                    className="ml-tabular"
+                  >
+                    AI Prioritás: {selected.priorityScore ?? 50}/100
+                  </Badge>
+                  <Text fw={700} size="sm" truncate>
+                    {selected.leadCompany}
+                  </Text>
+                  <Text size="xs" c="dimmed" className="ml-mono" truncate>
+                    {selected.leadEmail}
+                  </Text>
+                  {selected.latestIntent && INTENT_META[selected.latestIntent] && (
+                    <Badge size="xs" color={INTENT_META[selected.latestIntent].color}>
+                      {INTENT_META[selected.latestIntent].label}
+                    </Badge>
+                  )}
+                </Group>
+
+                <Group gap={6} wrap="nowrap">
+                  <Select
+                    size="xs"
+                    w={145}
+                    value={selected.leadStatus}
+                    onChange={async (v) => {
+                      if (!v) return;
+                      await api.updateLead({ id: selected.leadId, status: v });
+                      await onRefresh();
+                    }}
+                    data={Object.entries(LEAD_STATUS_META).map(([value, meta]) => ({
+                      value,
+                      label: meta.label,
+                    }))}
+                  />
+                  <Tooltip label="Lead adatlap">
+                    <ActionIcon
+                      variant="default"
+                      size="md"
+                      onClick={() => {
+                        const found = leads.find((l) => l.id === selected.leadId);
+                        if (found) onSelectLead(found);
+                      }}
+                    >
+                      <IconUser size={14} />
+                    </ActionIcon>
+                  </Tooltip>
+                </Group>
+              </Group>
+
+              {/* OpenRouter Decisions Bar (Tags & Summary) */}
+              {((selected.aiTags && selected.aiTags.length > 0) || selected.decisionSummary) && (
+                <Group
+                  justify="space-between"
+                  px="md"
+                  py={6}
+                  gap="xs"
+                  wrap="wrap"
+                  style={{
+                    borderBottom: "1px solid var(--ml-border)",
+                    backgroundColor: "var(--ml-canvas)",
+                    flexShrink: 0,
+                  }}
+                >
+                  <Group gap={6} wrap="wrap">
+                    <Badge
+                      size="xs"
+                      variant="light"
+                      color="forest"
+                      leftSection={<IconTag size={10} />}
+                    >
+                      OpenRouter Decisions ({settings.decisionModelId || "google/gemini-2.5-flash"})
+                    </Badge>
+                    {(selected.aiTags || []).map((tag) => (
+                      <Badge
+                        key={tag}
+                        size="xs"
+                        variant="outline"
+                        color="dark"
+                        style={{ textTransform: "none" }}
+                      >
+                        #{tag}
+                      </Badge>
+                    ))}
+                  </Group>
+                  {selected.decisionSummary && (
+                    <Text size="xs" c="dimmed" fw={500}>
+                      {selected.decisionSummary}
+                    </Text>
+                  )}
+                </Group>
+              )}
+
+              {/* Scrollable Messages Timeline */}
+              <ScrollArea style={{ flex: 1, minHeight: 140 }} px="md" py="sm">
+                <Stack gap="xs">
+                  {timelineMessages.length === 0 ? (
+                    <Text size="xs" c="dimmed">
+                      Még nincs elküldött üzenet — lent szerkesztheted a tervezetet.
+                    </Text>
+                  ) : (
+                    timelineMessages.map((m) => {
+                      const isInbound = m.direction === "inbound";
+                      const msgTags = m.aiTags || [];
+                      return (
+                        <Box
+                          key={m.id}
+                          p="sm"
+                          style={{
+                            borderRadius: 6,
+                            border: "1px solid var(--ml-border)",
+                            backgroundColor: isInbound
+                              ? "var(--ml-canvas)"
+                              : "var(--ml-surface)",
+                            borderLeft: isInbound
+                              ? "3px solid #166534"
+                              : "3px solid var(--ml-border-strong)",
+                          }}
+                        >
+                          <Group justify="space-between" mb={4} wrap="wrap" gap={4}>
+                            <Group gap={6} wrap="wrap">
+                              <Text size="xs" fw={700}>
+                                {isInbound ? selected.leadCompany : "Te"}
+                              </Text>
+                              <Text size="xs" c="dimmed" truncate maw={360}>
+                                {m.subject}
+                              </Text>
+                              {isInbound && (m.aiPriorityScore ?? 0) > 0 && (
+                                <Badge
+                                  size="xs"
+                                  color={(m.aiPriorityScore ?? 0) >= 80 ? "red" : "forest"}
+                                  variant="light"
+                                >
+                                  Prioritás: {m.aiPriorityScore}/100
+                                </Badge>
+                              )}
+                              {isInbound &&
+                                msgTags.map((tg) => (
+                                  <Badge
+                                    key={tg}
+                                    size="xs"
+                                    variant="outline"
+                                    color="gray"
+                                    style={{ textTransform: "none" }}
+                                  >
+                                    #{tg}
+                                  </Badge>
+                                ))}
+                              {m.bookingLinkSent && (
+                                <Badge size="xs" color="green">
+                                  Foglalóval
+                                </Badge>
+                              )}
+                            </Group>
+                            <Text size="11px" c="dimmed" className="ml-tabular">
+                              {formatShortDate(m.sentAt || m.createdAt)}
                             </Text>
                           </Group>
-                          <Text size="xs" c="dimmed" className="ml-mono" truncate>
-                            {t.leadEmail}
+                          <Text size="sm" style={{ whiteSpace: "pre-wrap", lineHeight: 1.5 }}>
+                            {m.body}
                           </Text>
-                          <Group gap={5} mt={6} wrap="wrap">
-                            {intentMeta && (
-                              <Badge size="xs" color={intentMeta.color}>
-                                {intentMeta.label}
-                              </Badge>
-                            )}
-                            {t.autoSendStatus === "scheduled" && t.scheduledSendAt && (
-                              <Badge
-                                size="xs"
-                                color="yellow"
-                                variant="filled"
-                                leftSection={<IconClock size={10} />}
-                              >
-                                {formatShortDate(t.scheduledSendAt)}
-                              </Badge>
-                            )}
-                            {t.hasPendingDraft && t.autoSendStatus !== "scheduled" && (
-                              <Badge size="xs" variant="outline" color="gray">
-                                ⏸ Megállítva / Tervezet
-                              </Badge>
-                            )}
-                            {t.bookingLinkSent && (
-                              <Badge size="xs" color="green" variant="dot">
-                                Foglaló elküldve
-                              </Badge>
-                            )}
-                          </Group>
-                        </Paper>
+                        </Box>
                       );
                     })
                   )}
                 </Stack>
-              </Grid.Col>
+              </ScrollArea>
 
-              {/* Right Conversation View & AI Auto-Reply Control Studio */}
-              {selected && (
-                <Grid.Col span={{ base: 12, md: 8 }}>
-                  <Paper p="md">
-                    {/* Thread Header */}
+              {/* Compact, Spacious Reply Composer Studio */}
+              <Box
+                px="md"
+                py="xs"
+                style={{
+                  borderTop: "1px solid var(--ml-border-strong)",
+                  backgroundColor: "var(--ml-canvas)",
+                  flexShrink: 0,
+                }}
+              >
+                <Stack gap={7}>
+                  {/* Tight 1-line Auto-Send Status Bar (when scheduled or paused) */}
+                  {isScheduled && pendingMsg && (
                     <Group
                       justify="space-between"
-                      pb="sm"
+                      px="xs"
+                      py={5}
                       wrap="wrap"
-                      gap="xs"
-                      style={{ borderBottom: "1px solid var(--ml-border)" }}
+                      gap={6}
+                      style={{
+                        borderRadius: 5,
+                        border: "1px solid #d97706",
+                        backgroundColor: "rgba(217, 119, 6, 0.10)",
+                      }}
                     >
-                      <Box>
-                        <Group gap={8} wrap="wrap">
-                          <Title order={4}>{selected.leadCompany}</Title>
-                          {selected.latestIntent && INTENT_META[selected.latestIntent] && (
-                            <Badge size="xs" color={INTENT_META[selected.latestIntent].color}>
-                              {INTENT_META[selected.latestIntent].label}
-                            </Badge>
-                          )}
-                        </Group>
-                        <Text size="xs" c="dimmed" className="ml-mono">
-                          {selected.leadEmail}
-                          {selected.offerTitle ? ` • Ajánlat: ${selected.offerTitle}` : ""}
+                      <Group gap={6}>
+                        <IconClock size={14} color="#b45309" />
+                        <Text size="xs" fw={600} c="orange.9">
+                          Auto-küldés: {formatShortDate(pendingMsg.scheduledSendAt)} (
+                          {formatCountdown(pendingMsg.scheduledSendAt)})
                         </Text>
-                      </Box>
-
-                      <Group gap="xs">
-                        <Select
-                          size="xs"
-                          w={150}
-                          value={selected.leadStatus}
-                          onChange={async (v) => {
-                            if (!v) return;
-                            await api.updateLead({ id: selected.leadId, status: v });
-                            await onRefresh();
-                          }}
-                          data={Object.entries(LEAD_STATUS_META).map(([value, meta]) => ({
-                            value,
-                            label: meta.label,
-                          }))}
-                        />
-                        <Tooltip label="Lead adatlap megnyitása">
-                          <ActionIcon
-                            variant="default"
-                            size="md"
-                            onClick={() => {
-                              const found = leads.find((l) => l.id === selected.leadId);
-                              if (found) onSelectLead(found);
-                            }}
-                          >
-                            <IconUser size={15} />
-                          </ActionIcon>
-                        </Tooltip>
+                      </Group>
+                      <Group gap={5}>
+                        <Button
+                          size="compact-xs"
+                          color="red"
+                          leftSection={<IconPlayerPause size={12} />}
+                          loading={controlling}
+                          onClick={() => handleControlAutoSend("pause")}
+                        >
+                          Megállítás
+                        </Button>
+                        <Button
+                          size="compact-xs"
+                          variant="default"
+                          loading={controlling}
+                          onClick={() => handleControlAutoSend("reschedule_random")}
+                        >
+                          Új idő
+                        </Button>
+                        <Button
+                          size="compact-xs"
+                          variant="subtle"
+                          onClick={() => setShowCustomSchedule((v) => !v)}
+                        >
+                          Egyedi
+                        </Button>
                       </Group>
                     </Group>
+                  )}
 
-                    {/* Messages Timeline */}
-                    <Stack gap="sm" my="md">
-                      {timelineMessages.length === 0 ? (
-                        <Text size="xs" c="dimmed">
-                          Még nincs elküldött vagy beérkezett üzenet — lent az előkészített levél
-                          látható.
-                        </Text>
-                      ) : (
-                        timelineMessages.map((m) => {
-                          const isInbound = m.direction === "inbound";
-                          return (
-                            <Box
-                              key={m.id}
-                              p="sm"
-                              style={{
-                                borderRadius: 6,
-                                border: "1px solid var(--ml-border)",
-                                backgroundColor: isInbound
-                                  ? "var(--ml-canvas)"
-                                  : "var(--ml-surface)",
-                                borderLeft: isInbound
-                                  ? "3px solid #166534"
-                                  : "3px solid var(--ml-border-strong)",
-                              }}
-                            >
-                              <Group justify="space-between" mb={4}>
-                                <Group gap={8}>
-                                  <Text size="xs" fw={700}>
-                                    {isInbound ? selected.leadCompany : "Te (MyLead)"}
-                                  </Text>
-                                  {m.aiIntent && INTENT_META[m.aiIntent] && (
-                                    <Badge size="xs" color={INTENT_META[m.aiIntent].color}>
-                                      {INTENT_META[m.aiIntent].label}
-                                    </Badge>
-                                  )}
-                                  {m.bookingLinkSent && (
-                                    <Badge size="xs" color="green">
-                                      Időpontfoglaló linkkel
-                                    </Badge>
-                                  )}
-                                </Group>
-                                <Text size="11px" c="dimmed" className="ml-tabular">
-                                  {formatShortDate(m.sentAt || m.createdAt)}
-                                </Text>
-                              </Group>
-                              {m.aiSummary && (
-                                <Text size="11px" c="forest.9" mb={4}>
-                                  AI összefoglaló: {m.aiSummary}
-                                </Text>
-                              )}
-                              <Text size="xs" fw={600} c="dimmed" mb={6}>
-                                {m.subject}
-                              </Text>
-                              <Text size="sm" style={{ whiteSpace: "pre-wrap", lineHeight: 1.55 }}>
-                                {m.body}
-                              </Text>
-                            </Box>
-                          );
-                        })
-                      )}
-                    </Stack>
-
-                    <Divider my="sm" label="AI Auto-válasz & Manuális szerkesztő" />
-
-                    {/* Scheduled / Paused Auto-Send Control Banner */}
-                    {isScheduled && pendingMsg && (
-                      <Paper
-                        p="sm"
-                        mb="sm"
-                        style={{
-                          borderColor: "#d97706",
-                          backgroundColor: "rgba(217, 119, 6, 0.08)",
-                        }}
-                      >
-                        <Group justify="space-between" wrap="wrap" gap="xs">
-                          <Box>
-                            <Group gap={6}>
-                              <IconClock size={15} color="#b45309" />
-                              <Text size="xs" fw={700} c="orange.9">
-                                Automatikus AI válasz időzítve:{" "}
-                                {formatShortDate(pendingMsg.scheduledSendAt)} (
-                                {formatCountdown(pendingMsg.scheduledSendAt)})
-                              </Text>
-                            </Group>
-                            <Text size="11px" c="dimmed" mt={2}>
-                              Munkaidőn belül ({workdaySummary} {settings.autoReplyStartHour}–
-                              {settings.autoReplyEndHour}h) automatikusan kimegy, hacsak meg nem
-                              állítod.
-                            </Text>
-                          </Box>
-                          <Group gap={6} wrap="wrap">
-                            <Button
-                              size="xs"
-                              color="red"
-                              variant="filled"
-                              leftSection={<IconPlayerPause size={13} />}
-                              loading={controlling}
-                              onClick={() => handleControlAutoSend("pause")}
-                            >
-                              Auto-küldés megállítása
-                            </Button>
-                            <Button
-                              size="xs"
-                              variant="default"
-                              leftSection={<IconRefresh size={13} />}
-                              loading={controlling}
-                              onClick={() => handleControlAutoSend("reschedule_random")}
-                            >
-                              Új random idő
-                            </Button>
-                            <Button
-                              size="xs"
-                              variant="subtle"
-                              onClick={() => setShowCustomSchedule((v) => !v)}
-                            >
-                              Egyedi idő
-                            </Button>
-                          </Group>
-                        </Group>
-
-                        {showCustomSchedule && (
-                          <Group mt="xs" gap="xs" align="flex-end">
-                            <TextInput
-                              type="datetime-local"
-                              size="xs"
-                              label="Egyedi kiküldési időpont"
-                              value={customScheduleInput}
-                              onChange={(e) => setCustomScheduleInput(e.currentTarget.value)}
-                            />
-                            <Button
-                              size="xs"
-                              loading={controlling}
-                              onClick={() => handleControlAutoSend("reschedule_custom")}
-                            >
-                              Időpont mentése
-                            </Button>
-                          </Group>
-                        )}
-                      </Paper>
-                    )}
-
-                    {isPaused && pendingMsg && (
-                      <Paper
-                        p="sm"
-                        mb="sm"
-                        style={{
-                          backgroundColor: "var(--ml-canvas)",
-                          borderColor: "var(--ml-border-strong)",
-                        }}
-                      >
-                        <Group justify="space-between" wrap="wrap" gap="xs">
-                          <Box>
-                            <Text size="xs" fw={700}>
-                              ⏸ Auto-küldés megállítva — nem megy ki magától
-                            </Text>
-                            {pendingMsg.errorMessage ? (
-                              <Text size="11px" c="red" mt={2}>
-                                Hiba: {pendingMsg.errorMessage}
-                              </Text>
-                            ) : (
-                              <Text size="11px" c="dimmed" mt={2}>
-                                Szabadon átírhatod manuálisan vagy AI megjegyzéssel, majd
-                                visszakapcsolhatod az időzítést vagy elküldheted azonnal.
-                              </Text>
-                            )}
-                          </Box>
-                          <Group gap={6}>
-                            <Button
-                              size="xs"
-                              color="forest"
-                              variant="light"
-                              leftSection={<IconPlayerPlay size={13} />}
-                              loading={controlling}
-                              onClick={() => handleControlAutoSend("resume")}
-                            >
-                              Időzítés indítása (20p–2ó)
-                            </Button>
-                            <ActionIcon
-                              size="md"
-                              variant="subtle"
-                              color="red"
-                              title="Tervezet törlése"
-                              loading={controlling}
-                              onClick={() => handleControlAutoSend("cancel")}
-                            >
-                              <IconTrash size={14} />
-                            </ActionIcon>
-                          </Group>
-                        </Group>
-                      </Paper>
-                    )}
-
-                    {/* AI Rewrite with User Comment Bar */}
-                    <Paper p="sm" mb="sm" style={{ backgroundColor: "var(--ml-canvas)" }}>
-                      <Stack gap={6}>
-                        <Group gap="xs" align="flex-end">
-                          <TextInput
-                            size="xs"
-                            label="Megjegyzés az AI-nak — hogyan írja át a választ?"
-                            placeholder="pl. Említsd meg a 14 napos próbát, legyen barátságosabb és rövidebb..."
-                            value={aiComment}
-                            onChange={(e) => setAiComment(e.currentTarget.value)}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter" && aiComment.trim()) {
-                                e.preventDefault();
-                                handleAiRewrite();
-                              }
-                            }}
-                            style={{ flex: 1 }}
-                          />
-                          <Button
-                            size="xs"
-                            variant="filled"
-                            color="forest"
-                            leftSection={<IconWand size={13} />}
-                            loading={rewriting}
-                            disabled={!aiComment.trim() || !replyBody.trim()}
-                            onClick={() => handleAiRewrite()}
-                          >
-                            AI írja át
-                          </Button>
-                          <Button
-                            size="xs"
-                            variant="default"
-                            leftSection={<IconSparkles size={13} />}
-                            loading={generating}
-                            onClick={handleGenerateFreshReply}
-                          >
-                            Új AI válasz
-                          </Button>
-                        </Group>
-                        <Group gap={5} wrap="wrap">
-                          <Text size="10.5px" c="dimmed">
-                            Gyors átírás:
-                          </Text>
-                          {QUICK_REWRITE_CHIPS.map((chip) => (
-                            <Button
-                              key={chip.label}
-                              size="compact-xs"
-                              variant="default"
-                              disabled={rewriting || !replyBody.trim()}
-                              onClick={() => handleAiRewrite(chip.note)}
-                            >
-                              {chip.label}
-                            </Button>
-                          ))}
-                        </Group>
-                      </Stack>
-                    </Paper>
-
-                    {/* Manual Editor */}
-                    <Stack gap="xs">
-                      <Group justify="space-between" wrap="wrap" gap={6}>
-                        <Text size="xs" c="dimmed">
-                          Manuálisan is bármikor átírhatod a tárgyat és a szöveget:
-                        </Text>
-                        <Group gap={6}>
-                          <Button
-                            size="compact-xs"
-                            variant="default"
-                            leftSection={<IconWorld size={12} />}
-                            onClick={insertLandingLink}
-                          >
-                            + Weboldal link
-                          </Button>
-                          <Button
-                            size="compact-xs"
-                            variant="default"
-                            leftSection={<IconCalendarEvent size={12} />}
-                            onClick={insertBookingLink}
-                          >
-                            + Időpontfoglaló link
-                          </Button>
-                        </Group>
-                      </Group>
-
+                  {showCustomSchedule && isScheduled && pendingMsg && (
+                    <Group gap={6}>
                       <TextInput
+                        type="datetime-local"
                         size="xs"
-                        value={replySubject}
-                        onChange={(e) => setReplySubject(e.currentTarget.value)}
-                        placeholder="Tárgy"
+                        value={customScheduleInput}
+                        onChange={(e) => setCustomScheduleInput(e.currentTarget.value)}
                       />
-                      <Textarea
-                        minRows={7}
-                        value={replyBody}
-                        onChange={(e) => setReplyBody(e.currentTarget.value)}
-                        placeholder="Válasz szövege..."
-                      />
+                      <Button
+                        size="xs"
+                        loading={controlling}
+                        onClick={() => handleControlAutoSend("reschedule_custom")}
+                      >
+                        Mentés
+                      </Button>
+                    </Group>
+                  )}
 
-                      <Group justify="space-between" wrap="wrap" gap="xs" mt={4}>
-                        <Group gap={6}>
-                          <Button
-                            size="xs"
-                            variant="default"
-                            leftSection={<IconCheck size={13} />}
-                            loading={savingDraft}
-                            disabled={!replyBody.trim()}
-                            onClick={() => handleSaveManualEdit(isScheduled)}
-                          >
-                            {isScheduled
-                              ? "Átírás mentése (időzítve marad)"
-                              : "Mentés tervezetként"}
-                          </Button>
-                          {!isScheduled && (
-                            <Button
-                              size="xs"
-                              variant="light"
-                              color="forest"
-                              leftSection={<IconClock size={13} />}
-                              loading={savingDraft}
-                              disabled={!replyBody.trim()}
-                              onClick={() => handleSaveManualEdit(true)}
-                            >
-                              Mentés & Random időzítés (20p–2ó)
-                            </Button>
-                          )}
-                        </Group>
-
-                        <Group gap={6}>
-                          <Button
-                            size="xs"
-                            variant="default"
-                            leftSection={<IconTestPipe size={14} />}
-                            loading={sending}
-                            disabled={!replyBody.trim()}
-                            onClick={() => handleSendReplyNow(true)}
-                          >
-                            Szimulált küldés
-                          </Button>
-                          <Button
-                            size="xs"
-                            leftSection={<IconSend size={14} />}
-                            loading={sending}
-                            disabled={!replyBody.trim()}
-                            onClick={() => handleSendReplyNow(false)}
-                          >
-                            Küldés most (SMTP / SES)
-                          </Button>
-                        </Group>
+                  {isPaused && pendingMsg && (
+                    <Group
+                      justify="space-between"
+                      px="xs"
+                      py={4}
+                      style={{
+                        borderRadius: 5,
+                        border: "1px solid var(--ml-border-strong)",
+                        backgroundColor: "var(--ml-surface)",
+                      }}
+                    >
+                      <Text size="xs" c={pendingMsg.errorMessage ? "red" : "dimmed"} fw={500}>
+                        {pendingMsg.errorMessage
+                          ? `⚠ Megállítva: ${pendingMsg.errorMessage}`
+                          : "⏸ Auto-küldés megállítva — nem megy ki magától"}
+                      </Text>
+                      <Group gap={5}>
+                        <Button
+                          size="compact-xs"
+                          variant="light"
+                          color="forest"
+                          leftSection={<IconPlayerPlay size={12} />}
+                          loading={controlling}
+                          onClick={() => handleControlAutoSend("resume")}
+                        >
+                          Időzítés (20p–2ó)
+                        </Button>
+                        <ActionIcon
+                          size="sm"
+                          variant="subtle"
+                          color="red"
+                          title="Tervezet törlése"
+                          loading={controlling}
+                          onClick={() => handleControlAutoSend("cancel")}
+                        >
+                          <IconTrash size={13} />
+                        </ActionIcon>
                       </Group>
-                    </Stack>
-                  </Paper>
-                </Grid.Col>
-              )}
-            </Grid>
+                    </Group>
+                  )}
+
+                  {/* Single 1-Line AI Rewrite + Quick Presets Menu */}
+                  <Group gap={6} wrap="nowrap">
+                    <TextInput
+                      size="xs"
+                      placeholder="Megjegyzés az AI-nak az átíráshoz (pl. rövidebben, tegezve, 20% kedvezménnyel)..."
+                      value={aiComment}
+                      onChange={(e) => setAiComment(e.currentTarget.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && aiComment.trim()) {
+                          e.preventDefault();
+                          handleAiRewrite();
+                        }
+                      }}
+                      style={{ flex: 1 }}
+                    />
+                    <Button
+                      size="xs"
+                      variant="light"
+                      color="forest"
+                      leftSection={<IconWand size={13} />}
+                      loading={rewriting}
+                      disabled={!aiComment.trim() || !replyBody.trim()}
+                      onClick={() => handleAiRewrite()}
+                    >
+                      AI átírás
+                    </Button>
+                    <Menu shadow="md" width={210} position="top-end">
+                      <Menu.Target>
+                        <Button
+                          size="xs"
+                          variant="default"
+                          rightSection={<IconChevronDown size={12} />}
+                          disabled={rewriting || !replyBody.trim()}
+                        >
+                          Gyors
+                        </Button>
+                      </Menu.Target>
+                      <Menu.Dropdown>
+                        {QUICK_REWRITE_PRESETS.map((p) => (
+                          <Menu.Item key={p.label} onClick={() => handleAiRewrite(p.note)}>
+                            {p.label}
+                          </Menu.Item>
+                        ))}
+                      </Menu.Dropdown>
+                    </Menu>
+                    <Tooltip label="Teljesen új AI válasz generálása">
+                      <ActionIcon
+                        size="md"
+                        variant="default"
+                        loading={generating}
+                        onClick={handleGenerateFreshReply}
+                      >
+                        <IconSparkles size={14} />
+                      </ActionIcon>
+                    </Tooltip>
+                  </Group>
+
+                  {/* Subject + Inline Link Shortcuts */}
+                  <Group gap={6} wrap="nowrap">
+                    <TextInput
+                      size="xs"
+                      value={replySubject}
+                      onChange={(e) => setReplySubject(e.currentTarget.value)}
+                      placeholder="Tárgy"
+                      style={{ flex: 1 }}
+                    />
+                    <Tooltip label="Weboldal link beszúrása">
+                      <ActionIcon size="md" variant="default" onClick={insertLandingLink}>
+                        <IconWorld size={14} />
+                      </ActionIcon>
+                    </Tooltip>
+                    <Tooltip label="Időpontfoglaló link beszúrása">
+                      <ActionIcon size="md" variant="default" onClick={insertBookingLink}>
+                        <IconCalendarEvent size={14} />
+                      </ActionIcon>
+                    </Tooltip>
+                  </Group>
+
+                  {/* Spacious, Comfortable Editable Reply Textarea */}
+                  <Textarea
+                    size="sm"
+                    autosize
+                    minRows={7}
+                    maxRows={13}
+                    value={replyBody}
+                    onChange={(e) => setReplyBody(e.currentTarget.value)}
+                    placeholder="Válasz szövege (manuálisan is bármikor átírható)..."
+                    styles={{
+                      input: {
+                        backgroundColor: "var(--ml-surface)",
+                        lineHeight: 1.5,
+                      },
+                    }}
+                  />
+
+                  {/* Single Clean Action Footer Row */}
+                  <Group justify="space-between" wrap="nowrap">
+                    <Group gap={6}>
+                      <Button
+                        size="xs"
+                        variant="default"
+                        leftSection={<IconCheck size={13} />}
+                        loading={savingDraft}
+                        disabled={!replyBody.trim()}
+                        onClick={() => handleSaveManualEdit(isScheduled)}
+                      >
+                        {isScheduled ? "Átírás mentése" : "Mentés"}
+                      </Button>
+                      {!isScheduled && (
+                        <Button
+                          size="xs"
+                          variant="light"
+                          color="forest"
+                          leftSection={<IconClock size={13} />}
+                          loading={savingDraft}
+                          disabled={!replyBody.trim()}
+                          onClick={() => handleSaveManualEdit(true)}
+                        >
+                          Időzítés (20p–2ó)
+                        </Button>
+                      )}
+                    </Group>
+
+                    <Group gap={6}>
+                      <Button
+                        size="xs"
+                        leftSection={<IconSend size={13} />}
+                        loading={sending}
+                        disabled={!replyBody.trim()}
+                        onClick={handleSendReplyNow}
+                      >
+                        Küldés most
+                      </Button>
+                    </Group>
+                  </Group>
+                </Stack>
+              </Box>
+            </Box>
           )}
-        </Stack>
-      </Box>
+        </Box>
+      )}
 
       {/* Direct New Message Modal */}
       <DirectEmailModal
@@ -1110,24 +1280,70 @@ export function InboxPage({
         onSent={onRefresh}
       />
 
-      {/* Quick Auto-Reply Schedule Rules Modal */}
+      {/* Compact Auto-Reply Schedule & Decision Model Rules Modal */}
       <Modal
         opened={rulesModalOpen}
         onClose={() => setRulesModalOpen(false)}
-        title="AI Auto-válasz időzítési szabályok"
+        title="AI Auto-válasz & OpenRouter Decisions"
         size="md"
       >
         <Stack gap="sm">
           <Switch
-            label="Automatikus AI válaszgenerálás & munkaidős időzítés bekapcsolása"
+            label="Automatikus AI válasz & munkaidős időzítés"
             checked={rulesForm.autoReplyEnabled}
             onChange={(e) =>
               setRulesForm({ ...rulesForm, autoReplyEnabled: e.currentTarget.checked })
             }
           />
+          <Switch
+            label="Beérkező levelek automatikus rendezése OpenRouter Decisions prioritás szerint"
+            checked={rulesForm.decisionAutoSortInbox ?? true}
+            onChange={(e) =>
+              setRulesForm({ ...rulesForm, decisionAutoSortInbox: e.currentTarget.checked })
+            }
+          />
+          <Select
+            size="xs"
+            label="OpenRouter Decisions (Beérkező e-mailek rangsorolása & címkézése)"
+            searchable
+            value={rulesForm.decisionModelId || "google/gemini-2.5-flash"}
+            onChange={(v) =>
+              setRulesForm({
+                ...rulesForm,
+                decisionModelProvider: "openrouter",
+                decisionModelId: v || "google/gemini-2.5-flash",
+              })
+            }
+            data={[
+              {
+                value: "google/gemini-2.5-flash",
+                label: "Google: Gemini 2.5 Flash (Ajánlott — gyors, strict json_schema)",
+              },
+              {
+                value: "openai/gpt-4o-mini",
+                label: "OpenAI: GPT-4o Mini",
+              },
+              {
+                value: "anthropic/claude-3.5-haiku",
+                label: "Anthropic: Claude 3.5 Haiku",
+              },
+              {
+                value: "deepseek/deepseek-chat-v3-0324",
+                label: "DeepSeek: V3 0324",
+              },
+              {
+                value: "meta-llama/llama-3.3-70b-instruct",
+                label: "Meta: Llama 3.3 70B Instruct",
+              },
+              {
+                value: "openrouter/auto",
+                label: "OpenRouter Auto Router",
+              },
+            ]}
+          />
           <Box>
             <Text size="xs" fw={500} mb={6}>
-              Aktív munkanapok (alapértelmezett: Hétfő–Szombat)
+              Munkanapok
             </Text>
             <Group gap="xs">
               {WEEKDAY_LABELS.map((w) => {
@@ -1151,21 +1367,19 @@ export function InboxPage({
           </Box>
           <SimpleGrid cols={2}>
             <NumberInput
-              label="Munkaidő kezdete (óra)"
+              label="Kezdés (óra)"
               min={0}
               max={22}
               value={rulesForm.autoReplyStartHour}
               onChange={(v) => setRulesForm({ ...rulesForm, autoReplyStartHour: Number(v) || 8 })}
             />
             <NumberInput
-              label="Munkaidő vége (óra)"
+              label="Vége (óra)"
               min={1}
               max={24}
               value={rulesForm.autoReplyEndHour}
               onChange={(v) => setRulesForm({ ...rulesForm, autoReplyEndHour: Number(v) || 18 })}
             />
-          </SimpleGrid>
-          <SimpleGrid cols={2}>
             <NumberInput
               label="Min. késleltetés (perc)"
               min={1}
@@ -1186,19 +1400,13 @@ export function InboxPage({
             />
           </SimpleGrid>
           <Textarea
-            label="Globális AI válasz-szabályok / stílus instrukció"
-            placeholder="pl. Mindig legyél udvarias, ne ígérj fix árat hívás nélkül, emeld ki az okosűrlapot..."
-            minRows={3}
+            label="Globális AI válasz instrukciók"
+            autosize
+            minRows={2}
+            maxRows={5}
             value={rulesForm.aiReplyInstructions || ""}
             onChange={(e) =>
               setRulesForm({ ...rulesForm, aiReplyInstructions: e.currentTarget.value })
-            }
-          />
-          <Switch
-            label="Teszt (szimulált) mód az automatikus háttér-küldéshez"
-            checked={rulesForm.autoReplyDefaultDryRun}
-            onChange={(e) =>
-              setRulesForm({ ...rulesForm, autoReplyDefaultDryRun: e.currentTarget.checked })
             }
           />
           <Group justify="flex-end" mt="xs">
@@ -1206,49 +1414,7 @@ export function InboxPage({
               Mégse
             </Button>
             <Button loading={savingRules} onClick={handleSaveRules}>
-              Szabályok mentése
-            </Button>
-          </Group>
-        </Stack>
-      </Modal>
-
-      {/* Simulate Inbound Reply Modal */}
-      <Modal
-        opened={simOpen}
-        onClose={() => setSimOpen(false)}
-        title="Beérkező ügyfélválasz szimulálása (AI auto-válasz teszt)"
-        size="md"
-      >
-        <Stack gap="sm">
-          <Select
-            label="Melyik cégtől érkezik a válasz?"
-            searchable
-            value={simLeadId}
-            onChange={(v) => setSimLeadId(v || "")}
-            data={leads.map((l) => ({
-              value: l.id,
-              label: `${l.companyName} (${l.primaryEmail || "nincs email"})`,
-            }))}
-          />
-          <Textarea
-            label="Beérkező levél szövege"
-            minRows={5}
-            value={simBody}
-            onChange={(e) => setSimBody(e.currentTarget.value)}
-          />
-          <Text size="xs" c="dimmed">
-            Az AI automatikusan felismeri a szándékot, megírja a választ és véletlenszerűen
-            beütemezi a munkaidőbe ({workdaySummary} {settings.autoReplyStartHour}–
-            {settings.autoReplyEndHour}h, {settings.autoReplyMinDelayMin}–
-            {settings.autoReplyMaxDelayMin} perc késleltetéssel) — amit ezután egy gombbal
-            megállíthatsz vagy átírhatsz!
-          </Text>
-          <Group justify="flex-end">
-            <Button variant="default" onClick={() => setSimOpen(false)}>
-              Mégse
-            </Button>
-            <Button loading={simulating} onClick={handleSimulateInbound}>
-              Feldolgozás & AI időzítés
+              Mentés
             </Button>
           </Group>
         </Stack>

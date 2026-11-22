@@ -1,7 +1,7 @@
 use crate::models::SenderAccount;
 use chrono::Utc;
 use hmac::{Hmac, Mac};
-use lettre::message::header::ContentType;
+use lettre::message::MultiPart;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use mail_parser::MessageParser;
@@ -23,19 +23,90 @@ pub struct InboundEmail {
     pub _received_at: String,
 }
 
+fn escape_html_and_linkify(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len() + 32);
+    for ch in text.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped.replace('\n', "<br>")
+}
+
+/// Formats an outbound email into both `text/plain` and `text/html`, rendering the signature fine print
+/// (cégadatok, adószám, székhely, jogi/GDPR megjegyzés — or any text after `\n---\n`) in small 11px muted font.
+pub fn format_email_plain_and_html(body: &str, fine_print: Option<&str>) -> (String, String) {
+    let trimmed_body = body.trim();
+    let (main_part, inline_fine_part) = if let Some(idx) = trimmed_body.find("\n---\n") {
+        (
+            trimmed_body[..idx].trim().to_string(),
+            Some(trimmed_body[idx + 5..].trim().to_string()),
+        )
+    } else {
+        (trimmed_body.to_string(), None)
+    };
+
+    let extra_fp = fine_print
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !trimmed_body.contains(*s));
+
+    let combined_fine_print = match (inline_fine_part, extra_fp) {
+        (Some(a), Some(b)) if !a.is_empty() => Some(format!("{}\n{}", a, b)),
+        (Some(a), None) if !a.is_empty() => Some(a),
+        (_, Some(b)) => Some(b.to_string()),
+        _ => None,
+    };
+
+    let plain_out = match &combined_fine_print {
+        Some(fp) => format!("{}\n\n---\n{}", main_part, fp),
+        None => main_part.clone(),
+    };
+
+    let main_paragraphs_html = main_part
+        .split("\n\n")
+        .map(|p| {
+            format!(
+                "<p style=\"margin:0 0 14px 0;\">{}</p>",
+                escape_html_and_linkify(p.trim())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+
+    let fine_print_html = match &combined_fine_print {
+        Some(fp) => format!(
+            "<div style=\"margin-top:20px;padding-top:10px;border-top:1px solid #e5e7eb;font-size:11px;line-height:1.45;color:#6b7280;\">{}</div>",
+            escape_html_and_linkify(fp)
+        ),
+        None => String::new(),
+    };
+
+    let html_out = format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body style=\"margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.6;color:#1f2937;\"><div>{}{}</div></body></html>",
+        main_paragraphs_html, fine_print_html
+    );
+
+    (plain_out, html_out)
+}
+
 pub async fn send_email(
     account: &SenderAccount,
     to_email: &str,
     subject: &str,
     body: &str,
     in_reply_to: Option<&str>,
+    fine_print: Option<&str>,
 ) -> Result<String, String> {
     if to_email.trim().is_empty() || !to_email.contains('@') {
         return Err("Érvénytelen címzett e-mail cím".to_string());
     }
     match account.provider.as_str() {
-        "ses" => send_via_amazon_ses(account, to_email, subject, body).await,
-        _ => send_via_smtp(account, to_email, subject, body, in_reply_to).await,
+        "ses" => send_via_amazon_ses(account, to_email, subject, body, fine_print).await,
+        _ => send_via_smtp(account, to_email, subject, body, in_reply_to, fine_print).await,
     }
 }
 
@@ -45,6 +116,7 @@ async fn send_via_smtp(
     subject: &str,
     body: &str,
     in_reply_to: Option<&str>,
+    fine_print: Option<&str>,
 ) -> Result<String, String> {
     if account.smtp_host.trim().is_empty() {
         return Err("SMTP szerver host nincs megadva".to_string());
@@ -67,8 +139,7 @@ async fn send_via_smtp(
         .from(from_formatted.parse().map_err(|e| format!("Hibás feladó cím: {}", e))?)
         .to(to_email.trim().parse().map_err(|e| format!("Hibás címzett cím: {}", e))?)
         .subject(subject)
-        .message_id(Some(msg_id.clone()))
-        .header(ContentType::TEXT_PLAIN);
+        .message_id(Some(msg_id.clone()));
 
     if !account.reply_to.trim().is_empty() {
         if let Ok(rt) = account.reply_to.trim().parse() {
@@ -82,8 +153,10 @@ async fn send_via_smtp(
         }
     }
 
+    let (plain_body, html_body) = format_email_plain_and_html(body, fine_print);
+
     let email = builder
-        .body(body.to_string())
+        .multipart(MultiPart::alternative_plain_html(plain_body, html_body))
         .map_err(|e| format!("E-mail összeállítási hiba: {}", e))?;
 
     let creds = Credentials::new(
@@ -140,6 +213,7 @@ async fn send_via_amazon_ses(
     to_email: &str,
     subject: &str,
     body: &str,
+    fine_print: Option<&str>,
 ) -> Result<String, String> {
     let region = if account.ses_region.trim().is_empty() {
         "eu-central-1"
@@ -160,6 +234,8 @@ async fn send_via_amazon_ses(
         format!("{} <{}>", account.from_name.trim(), account.from_email.trim())
     };
 
+    let (plain_body, html_body) = format_email_plain_and_html(body, fine_print);
+
     let mut payload_obj = json!({
         "FromEmailAddress": from_addr,
         "Destination": {
@@ -169,7 +245,8 @@ async fn send_via_amazon_ses(
             "Simple": {
                 "Subject": { "Data": subject, "Charset": "UTF-8" },
                 "Body": {
-                    "Text": { "Data": body, "Charset": "UTF-8" }
+                    "Text": { "Data": plain_body, "Charset": "UTF-8" },
+                    "Html": { "Data": html_body, "Charset": "UTF-8" }
                 }
             }
         }

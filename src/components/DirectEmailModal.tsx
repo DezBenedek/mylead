@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Badge,
   Button,
@@ -20,7 +20,6 @@ import {
   IconClock,
   IconSend,
   IconSparkles,
-  IconTestPipe,
   IconWand,
   IconWorld,
 } from "@tabler/icons-react";
@@ -48,21 +47,7 @@ export function DirectEmailModal({
   onClose,
   onSent,
 }: Props) {
-  const allOffers = useMemo(
-    () =>
-      projects.flatMap((p) =>
-        p.offers.map((o) => ({
-          ...o,
-          projectName: p.name,
-          bookingUrl: p.bookingUrl,
-          landingUrl: p.landingUrl || p.websiteUrl,
-        }))
-      ),
-    [projects]
-  );
-
   const [selectedLeadId, setSelectedLeadId] = useState<string>(lead?.id || "");
-  const [offerId, setOfferId] = useState<string>(allOffers[0]?.id || "");
   const [senderAccountId, setSenderAccountId] = useState<string>(
     senderAccounts.find((a) => a.isDefault)?.id || senderAccounts[0]?.id || ""
   );
@@ -77,12 +62,10 @@ export function DirectEmailModal({
   const [sending, setSending] = useState(false);
 
   const activeLead = lead || leads.find((l) => l.id === selectedLeadId) || null;
-  const activeOffer = allOffers.find((o) => o.id === offerId) || allOffers[0] || null;
 
   useEffect(() => {
     if (opened) {
       setSelectedLeadId(lead?.id || leads.find((l) => l.primaryEmail)?.id || "");
-      setOfferId(allOffers[0]?.id || "");
       setSenderAccountId(
         senderAccounts.find((a) => a.isDefault)?.id || senderAccounts[0]?.id || ""
       );
@@ -105,7 +88,7 @@ export function DirectEmailModal({
     try {
       const gen = await api.generateDirectEmailDraft(
         activeLead.id,
-        offerId || null,
+        null,
         tone,
         aiNote.trim()
       );
@@ -169,7 +152,7 @@ export function DirectEmailModal({
       await api.sendDirectEmail({
         leadId: activeLead.id,
         senderAccountId: senderAccountId || null,
-        offerId: offerId || null,
+        offerId: null,
         subject: subject.trim(),
         body: body.trim(),
         dryRun,
@@ -242,17 +225,7 @@ export function DirectEmailModal({
           </Paper>
         )}
 
-        <SimpleGrid cols={{ base: 1, sm: 3 }} spacing="xs">
-          <Select
-            label="Ajánlat (AI kontextus)"
-            clearable
-            value={offerId || null}
-            onChange={(v) => setOfferId(v || "")}
-            data={allOffers.map((o) => ({
-              value: o.id,
-              label: `${o.title}${o.discountValue ? ` (${o.discountValue})` : ""}`,
-            }))}
-          />
+        <SimpleGrid cols={{ base: 1, sm: 2 }} spacing="xs">
           <Select
             label="Hangnem"
             value={tone}
@@ -321,8 +294,8 @@ export function DirectEmailModal({
         <BoxWithQuickLinks
           body={body}
           onChange={setBody}
-          landingUrl={activeOffer?.landingUrl || projects[0]?.landingUrl || projects[0]?.websiteUrl || ""}
-          bookingUrl={activeOffer?.bookingUrl || projects[0]?.bookingUrl || ""}
+          landingUrl={projects[0]?.landingUrl || projects[0]?.websiteUrl || ""}
+          bookingUrl={projects[0]?.bookingUrl || ""}
         />
 
         <Divider label="Kiküldés időzítése" />
@@ -355,25 +328,14 @@ export function DirectEmailModal({
             Mégse
           </Button>
           {scheduleMode === "now" ? (
-            <>
-              <Button
-                variant="default"
-                leftSection={<IconTestPipe size={14} />}
-                loading={sending}
-                disabled={!activeLead || !body.trim()}
-                onClick={() => handleSend(true)}
-              >
-                Szimulált küldés
-              </Button>
-              <Button
-                leftSection={<IconSend size={14} />}
-                loading={sending}
-                disabled={!activeLead || !body.trim()}
-                onClick={() => handleSend(false)}
-              >
-                Küldés most (SMTP / SES)
-              </Button>
-            </>
+            <Button
+              leftSection={<IconSend size={14} />}
+              loading={sending}
+              disabled={!activeLead || !body.trim()}
+              onClick={() => handleSend(false)}
+            >
+              Küldés most (SMTP / SES)
+            </Button>
           ) : (
             <Button
               leftSection={<IconClock size={14} />}
@@ -439,7 +401,9 @@ function BoxWithQuickLinks({
         </Group>
       </Group>
       <Textarea
+        autosize
         minRows={8}
+        maxRows={16}
         value={body}
         onChange={(e) => onChange(e.currentTarget.value)}
         placeholder="Írd meg manuálisan a levelet, vagy kattints felül az AI levél írása gombra..."

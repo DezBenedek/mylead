@@ -80,44 +80,138 @@ fn extract_clean_text(doc: &Html) -> String {
     ws.replace_all(&joined, " ").trim().to_string()
 }
 
-fn extract_emails(text: &str, html: &str) -> Vec<String> {
+fn decode_cfemail(hex: &str) -> Option<String> {
+    if hex.len() < 6 || hex.len() % 2 != 0 {
+        return None;
+    }
+    let key = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let mut bytes = Vec::with_capacity((hex.len() - 2) / 2);
+    let mut idx = 2;
+    while idx + 2 <= hex.len() {
+        let b = u8::from_str_radix(&hex[idx..idx + 2], 16).ok()?;
+        bytes.push(b ^ key);
+        idx += 2;
+    }
+    let decoded = String::from_utf8(bytes).ok()?;
+    if decoded.contains('@') && decoded.contains('.') {
+        Some(decoded.trim().to_lowercase())
+    } else {
+        None
+    }
+}
+
+fn normalize_obfuscated_emails(input: &str) -> String {
+    let mut s = input
+        .replace("&#64;", "@")
+        .replace("&#x40;", "@")
+        .replace("&#X40;", "@")
+        .replace("&#46;", ".")
+        .replace("&commat;", "@");
+
+    if let Ok(re_at) = Regex::new(r"(?i)\s*(?:\(kukac\)|\[kukac\]|\{kukac\}|\(at\)|\[at\])\s*") {
+        s = re_at.replace_all(&s, "@").to_string();
+    }
+    if let Ok(re_dot) = Regex::new(r"(?i)\s*(?:\(pont\)|\[pont\]|\(dot\)|\[dot\])\s*") {
+        s = re_dot.replace_all(&s, ".").to_string();
+    }
+    s
+}
+
+fn extract_emails(text: &str, html: &str, site_domain: &str) -> Vec<String> {
     let re = Regex::new(r"(?i)[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,10}").unwrap();
+    let re_cf = Regex::new(r#"data-cfemail=["']([0-9a-fA-F]{6,})["']"#).unwrap();
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    let blacklist_ext = [".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif", ".css", ".js", ".woff", ".avif"];
+    let blacklist_ext = [
+        ".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif", ".css", ".js", ".woff", ".woff2", ".avif",
+    ];
     let blacklist_domains = [
-        "example.com", "sentry.io", "wixpress.com", "domain.com", "email.com",
-        "yoursite.com", "wordpress.org", "w3.org", "schema.org",
+        "example.com",
+        "sentry.io",
+        "wixpress.com",
+        "domain.com",
+        "email.com",
+        "yoursite.com",
+        "yourwebpage.com",
+        "wordpress.org",
+        "w3.org",
+        "schema.org",
+        "naih.hu",
+        "mediacenter.hu",
+        "rackforest.com",
+        "tarhely.eu",
+        "sybell.hu",
+        "mhosting.hu",
+        "dotroll.com",
+        "nethely.hu",
+        "posta.hu",
+        "nmhh.hu",
+        "nav.gov.hu",
+        "nkfh.gov.hu",
+        "fogyasztovedelem.hu",
+        "bekeltetotestulet.hu",
+        "guardian.co.uk",
+        "theguardian.com",
+        "pdfcoffee.com",
     ];
 
-    for source in [text, html] {
-        for cap in re.find_iter(source) {
-            let email = cap.as_str().to_lowercase();
-            if blacklist_ext.iter().any(|ext| email.ends_with(ext)) {
-                continue;
-            }
-            if blacklist_domains.iter().any(|d| email.contains(d)) {
-                continue;
-            }
-            if email.len() > 80 {
-                continue;
-            }
-            if seen.insert(email.clone()) {
-                out.push(email);
+    let mut candidates = Vec::new();
+    for cap in re_cf.captures_iter(html) {
+        if let Some(m) = cap.get(1) {
+            if let Some(dec) = decode_cfemail(m.as_str()) {
+                candidates.push(dec);
             }
         }
     }
+
+    let norm_text = normalize_obfuscated_emails(text);
+    let norm_html = normalize_obfuscated_emails(html);
+    for source in [&norm_text, &norm_html] {
+        for cap in re.find_iter(source) {
+            candidates.push(cap.as_str().to_lowercase());
+        }
+    }
+
+    for email in candidates {
+        if blacklist_ext.iter().any(|ext| email.ends_with(ext)) {
+            continue;
+        }
+        if blacklist_domains.iter().any(|d| email.ends_with(d) || email.contains(d)) {
+            continue;
+        }
+        if email.len() > 80 || email.starts_with("noreply@") || email.starts_with("no-reply@") {
+            continue;
+        }
+        if seen.insert(email.clone()) {
+            out.push(email);
+        }
+    }
+
+    let site_stem = site_domain
+        .trim()
+        .trim_start_matches("www.")
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+
     out.sort_by_key(|e| {
-        if e.starts_with("info@")
+        let email_dom = e.split('@').nth(1).unwrap_or("");
+        let matches_site = !site_stem.is_empty() && site_stem.len() >= 3 && email_dom.contains(&site_stem);
+        let is_primary_prefix = e.starts_with("info@")
             || e.starts_with("iroda@")
             || e.starts_with("kapcsolat@")
             || e.starts_with("hello@")
+            || e.starts_with("office@")
+            || e.starts_with("jelentkezes@")
+            || e.starts_with("kepzes@")
             || e.starts_with("sales@")
-            || e.starts_with("recepcio@")
-        {
-            0
-        } else {
-            1
+            || e.starts_with("recepcio@");
+        match (matches_site, is_primary_prefix) {
+            (true, true) => 0,
+            (true, false) => 1,
+            (false, true) => 2,
+            (false, false) => 3,
         }
     });
     out.truncate(10);
@@ -243,48 +337,87 @@ fn detect_tech_and_signals(html_lower: &str, text_lower: &str) -> (Vec<String>, 
 
 fn find_interesting_subpages(doc: &Html, base_url: &Url, max_links: usize) -> Vec<String> {
     let a_sel = Selector::parse("a[href]").unwrap();
-    let keywords = [
-        "about", "rolunk", "rólunk", "csapat", "team", "kapcsolat", "contact", "impresszum",
-        "arak", "árak", "pricing", "szolgaltatas", "szolgáltatás", "services", "features",
-        "termek", "product", "karrier", "career", "referencia", "velemeny", "adatvedel",
+    let high_priority = [
+        "kapcsolat", "contact", "elerhetoseg", "elérhetőség", "impresszum",
+        "jelentkezes", "jelentkezés", "regisztracio", "regisztráció", "idopont", "időpont",
+    ];
+    let med_priority = [
+        "arak", "árak", "arlista", "árlista", "pricing", "szolgaltatas", "szolgáltatás",
+        "services", "kepzes", "képzés", "trening", "tréning", "coaching", "tanfolyam",
+    ];
+    let low_priority = [
+        "about", "rolunk", "rólunk", "csapat", "team", "features", "termek", "product",
+        "referencia", "velemeny", "adatvedel", "adatkezel", "aszf", "ászf",
     ];
     let base_host = base_url.host_str().unwrap_or_default().trim_start_matches("www.");
     let mut seen = HashSet::new();
     seen.insert(base_url.path().trim_end_matches('/').to_string());
-    let mut urls = Vec::new();
+    let mut scored_urls: Vec<(i32, String)> = Vec::new();
 
     for el in doc.select(&a_sel) {
         if let Some(href) = el.value().attr("href") {
-            if href.starts_with('#')
-                || href.starts_with("mailto:")
-                || href.starts_with("tel:")
-                || href.starts_with("javascript:")
+            let trimmed = href.trim();
+            if trimmed.starts_with('#')
+                || trimmed.starts_with("mailto:")
+                || trimmed.starts_with("tel:")
+                || trimmed.starts_with("javascript:")
             {
                 continue;
             }
-            if let Ok(resolved) = base_url.join(href) {
+            if let Ok(mut resolved) = base_url.join(trimmed) {
+                resolved.set_fragment(None);
                 let host = resolved.host_str().unwrap_or_default().trim_start_matches("www.");
-                if host != base_host {
-                    continue;
-                }
                 let path_lower = resolved.path().to_lowercase();
-                if path_lower.ends_with(".pdf") || path_lower.ends_with(".jpg") || path_lower.ends_with(".png") {
+                if path_lower.ends_with(".pdf")
+                    || path_lower.ends_with(".jpg")
+                    || path_lower.ends_with(".png")
+                    || path_lower.ends_with(".css")
+                    || path_lower.ends_with(".js")
+                    || path_lower.contains("/wp-content/")
+                {
                     continue;
                 }
                 let text_lower = el.text().collect::<String>().to_lowercase();
-                if keywords.iter().any(|k| path_lower.contains(k) || text_lower.contains(k)) {
-                    let norm_path = resolved.path().trim_end_matches('/').to_string();
-                    if seen.insert(norm_path) {
-                        urls.push(resolved.to_string());
-                        if urls.len() >= max_links {
-                            break;
-                        }
+
+                // Allow external privacy/impressum links on owner's sister domain (e.g. drmeszarosadam.hu/adatvedelem on coachkepzes.hu)
+                let is_external_legal = host != base_host
+                    && (path_lower.contains("adatvedel") || path_lower.contains("impresszum"))
+                    && !host.contains("google")
+                    && !host.contains("facebook")
+                    && !host.contains("cookie");
+
+                if host != base_host && !is_external_legal {
+                    continue;
+                }
+
+                let priority = if high_priority.iter().any(|k| path_lower.contains(k) || text_lower.contains(k)) {
+                    Some(1)
+                } else if med_priority.iter().any(|k| path_lower.contains(k) || text_lower.contains(k)) {
+                    Some(2)
+                } else if low_priority.iter().any(|k| path_lower.contains(k) || text_lower.contains(k)) || is_external_legal {
+                    Some(3)
+                } else {
+                    None
+                };
+
+                if let Some(prio) = priority {
+                    let dedup_key = format!("{}::{}", host, resolved.path().trim_end_matches('/'));
+                    if resolved.path().trim_end_matches('/') != base_url.path().trim_end_matches('/')
+                        && seen.insert(dedup_key)
+                    {
+                        scored_urls.push((prio, resolved.to_string()));
                     }
                 }
             }
         }
     }
-    urls
+
+    scored_urls.sort_by_key(|(prio, _)| *prio);
+    scored_urls
+        .into_iter()
+        .take(max_links)
+        .map(|(_, u)| u)
+        .collect()
 }
 
 fn extract_social_links(doc: &Html) -> Vec<String> {
@@ -434,9 +567,10 @@ where
         )
     };
 
+    let site_domain = extract_domain(&final_url);
     let mut all_html_lower = html.to_lowercase();
     let mut all_text = clean_text.chars().take(6000).collect::<String>();
-    let mut all_emails: Vec<String> = extract_emails(&all_text, &html);
+    let mut all_emails: Vec<String> = extract_emails(&all_text, &html, &site_domain);
     let mut all_phones: Vec<String> = extract_phones(&all_text);
     let mut titles = if title.is_empty() { vec![] } else { vec![title.clone()] };
     let mut pages_crawled = 1i64;
@@ -447,8 +581,10 @@ where
     for (idx, sub) in subpages.iter().enumerate() {
         on_page(idx + 2, total_planned, sub);
         if let Ok(sub_resp) = client.get(sub).send().await {
-            if sub_resp.status().is_success() {
-                if let Ok(sub_html) = sub_resp.text().await {
+            let status_ok = sub_resp.status().is_success();
+            if let Ok(sub_html) = sub_resp.text().await {
+                // Accept subpage content if status is 2xx OR if it rendered substantial HTML before a footer PHP error
+                if status_ok || sub_html.len() > 2000 {
                     pages_crawled += 1;
                     let sub_doc = Html::parse_document(&sub_html);
                     let sub_text = extract_clean_text(&sub_doc);
@@ -460,7 +596,7 @@ where
 
                     all_html_lower.push_str(&sub_html.to_lowercase());
 
-                    for em in extract_emails(&sub_text, &sub_html) {
+                    for em in extract_emails(&sub_text, &sub_html, &site_domain) {
                         if !all_emails.contains(&em) {
                             all_emails.push(em);
                         }
@@ -482,6 +618,41 @@ where
                         let ts = st.text().collect::<String>().trim().to_string();
                         if !ts.is_empty() && !titles.contains(&ts) {
                             titles.push(ts);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback contact route probing if no email was found on homepage or linked subpages
+    if all_emails.is_empty() {
+        if let Ok(base_parsed) = Url::parse(&final_url) {
+            for fallback_path in ["/kapcsolat", "/impresszum", "/contact", "/adatvedelmi-tajekoztato"] {
+                if let Ok(probe_url) = base_parsed.join(fallback_path) {
+                    let probe_str = probe_url.to_string();
+                    if subpages.iter().any(|s| s.trim_end_matches('/') == probe_str.trim_end_matches('/')) {
+                        continue;
+                    }
+                    if let Ok(resp) = client.get(&probe_str).send().await {
+                        if resp.status().is_success() {
+                            if let Ok(probe_html) = resp.text().await {
+                                let probe_doc = Html::parse_document(&probe_html);
+                                let probe_text = extract_clean_text(&probe_doc);
+                                for em in extract_emails(&probe_text, &probe_html, &site_domain) {
+                                    if !all_emails.contains(&em) {
+                                        all_emails.push(em);
+                                    }
+                                }
+                                for ph in extract_phones(&probe_text) {
+                                    if !all_phones.contains(&ph) {
+                                        all_phones.push(ph);
+                                    }
+                                }
+                                if !all_emails.is_empty() {
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
