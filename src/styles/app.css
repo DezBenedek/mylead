@@ -234,3 +234,31 @@ body,
   background-color: rgba(82, 82, 91, 0.3);
   color: #a1a1aa;
 }
+
+/* Modern AI-chat stílusú, egybeolvadó prompt mező */
+.ml-assistant-composer {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  padding: 6px 7px;
+  background-color: var(--ml-canvas);
+  border: 1px solid var(--ml-border-strong);
+  border-radius: 18px;
+  transition:
+    border-color 120ms ease,
+    box-shadow 120ms ease;
+}
+
+.ml-assistant-composer:focus-within {
+  border-color: #166534;
+  box-shadow: 0 0 0 2px rgba(22, 101, 52, 0.12);
+}
+
+[data-mantine-color-scheme="dark"] .ml-assistant-composer:focus-within {
+  border-color: #4ea46d;
+  box-shadow: 0 0 0 2px rgba(78, 164, 109, 0.18);
+}
+
+.ml-assistant-composer textarea {
+  resize: none;
+}

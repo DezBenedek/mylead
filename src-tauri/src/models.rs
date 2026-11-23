@@ -414,6 +414,10 @@ pub struct EmailMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InboxThread {
+    /// Stable identifier of one conversation (lead + campaign / subject thread).
+    /// A single lead can have several separate conversations.
+    #[serde(default)]
+    pub thread_key: String,
     pub lead_id: String,
     pub lead_company: String,
     pub lead_email: String,
@@ -423,6 +427,9 @@ pub struct InboxThread {
     pub campaign_name: Option<String>,
     #[serde(default)]
     pub offer_title: Option<String>,
+    /// Subject of the latest message in this conversation (used to tell parallel conversations apart).
+    #[serde(default)]
+    pub subject: String,
     pub last_message_at: String,
     pub last_direction: String,
     pub latest_intent: Option<String>,

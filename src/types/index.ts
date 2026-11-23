@@ -335,6 +335,8 @@ export interface EmailMessage {
 }
 
 export interface InboxThread {
+  /** Unique key of this conversation (one person can have several). */
+  threadKey: string;
   leadId: string;
   leadCompany: string;
   leadEmail: string;
@@ -343,6 +345,8 @@ export interface InboxThread {
   campaignId: string | null;
   campaignName: string | null;
   offerTitle?: string | null;
+  /** Subject of the latest message in this conversation. */
+  subject: string;
   lastMessageAt: string;
   lastDirection: string;
   latestIntent: string | null;

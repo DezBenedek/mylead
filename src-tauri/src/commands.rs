@@ -1324,6 +1324,43 @@ pub fn list_inbox_threads(db: State<Database>) -> Result<Vec<InboxThread>, Strin
     db.list_inbox_threads()
 }
 
+/// Full chronological message history with one person (all conversations).
+#[tauri::command]
+pub fn list_lead_message_history(
+    db: State<Database>,
+    lead_id: String,
+) -> Result<Vec<EmailMessage>, String> {
+    let mut messages = db.list_lead_messages(&lead_id)?;
+    messages.retain(|m| m.status != "generating");
+    Ok(messages)
+}
+
+/// Deletes every message that belongs to the selected conversation.
+#[tauri::command]
+pub fn delete_inbox_conversation(
+    app: AppHandle,
+    db: State<Database>,
+    message_ids: Vec<String>,
+) -> Result<usize, String> {
+    if message_ids.is_empty() {
+        return Err("Nincs törölhető üzenet ebben a beszélgetésben.".to_string());
+    }
+    let first_message = message_ids
+        .first()
+        .and_then(|id| db.get_email_message(id).ok());
+    let deleted = db.delete_email_messages(&message_ids)?;
+    if let Some(msg) = first_message {
+        db.log_activity(
+            "reply",
+            "Beszélgetés törölve",
+            &format!("{} — {}", msg.lead_company, msg.subject),
+            Some(&msg.lead_id),
+        );
+    }
+    let _ = app.emit("inbox-updated", ());
+    Ok(deleted)
+}
+
 #[tauri::command]
 pub async fn sync_imap_inbox(app: AppHandle, db: State<'_, Database>, sender_account_id: Option<String>) -> Result<usize, String> {
     let count = sync_imap_inbox_inner(&app, &db, sender_account_id.as_deref()).await?;
@@ -1500,9 +1537,33 @@ pub(crate) async fn process_inbound_reply(
     in_reply_to: Option<&str>,
 ) -> Result<(), String> {
     let settings = db.get_settings()?;
+    // Do not blindly attach a reply to "the first campaign" — resolve the
+    // conversation from the message being answered, then from the latest
+    // outbound message sent to this lead. Direct (campaign-less) threads stay
+    // direct so they do not get merged into an unrelated campaign.
     let campaign = match campaign_id_opt {
         Some(cid) => db.get_campaign(cid).ok(),
-        None => db.list_campaigns()?.into_iter().next(),
+        None => {
+            let from_parent = in_reply_to
+                .and_then(|header| db.find_email_message_by_header(header).ok().flatten())
+                .filter(|parent| parent.lead_id == lead.id)
+                .and_then(|parent| parent.campaign_id)
+                .and_then(|cid| db.get_campaign(&cid).ok());
+            from_parent.or_else(|| {
+                let history = db.list_lead_messages(&lead.id).unwrap_or_default();
+                let wanted_subject = crate::db::normalize_subject_root(subject);
+                history
+                    .iter()
+                    .rev()
+                    .find(|m| {
+                        m.direction == "outbound"
+                            && crate::db::normalize_subject_root(&m.subject) == wanted_subject
+                    })
+                    .or_else(|| history.iter().rev().find(|m| m.direction == "outbound"))
+                    .and_then(|m| m.campaign_id.clone())
+                    .and_then(|cid| db.get_campaign(&cid).ok())
+            })
+        }
     };
     let project = match &campaign {
         Some(c) => db.get_project(&c.project_id)?,
@@ -1790,6 +1851,22 @@ pub fn save_inbox_reply_draft(
         } else {
             None
         };
+        let wanted_subject = crate::db::normalize_subject_root(&subject);
+        let reply_target = db
+            .list_lead_messages(&lead_id)
+            .unwrap_or_default()
+            .into_iter()
+            .rev()
+            .find(|m| {
+                m.direction == "inbound"
+                    && m.message_id_header.is_some()
+                    && if campaign_id.is_some() {
+                        m.campaign_id.as_deref() == campaign_id.as_deref()
+                    } else {
+                        crate::db::normalize_subject_root(&m.subject) == wanted_subject
+                    }
+            })
+            .and_then(|m| m.message_id_header);
         db.insert_email_message_full(
             campaign_id.as_deref(),
             &lead_id,
@@ -1799,7 +1876,7 @@ pub fn save_inbox_reply_draft(
             &subject,
             &body,
             None,
-            None,
+            reply_target.as_deref(),
             None,
             None,
             false,
@@ -1884,8 +1961,15 @@ pub async fn rewrite_inbox_reply_with_ai(
     let camp_id = message_id
         .as_deref()
         .and_then(|mid| db.get_email_message(mid).ok())
-        .and_then(|m| m.campaign_id)
-        .or_else(|| history.iter().rev().find_map(|m| m.campaign_id.clone()));
+        .map(|m| m.campaign_id)
+        .unwrap_or_else(|| {
+            let wanted = crate::db::normalize_subject_root(&current_subject);
+            history
+                .iter()
+                .rev()
+                .find(|m| crate::db::normalize_subject_root(&m.subject) == wanted)
+                .and_then(|m| m.campaign_id.clone())
+        });
     let campaign = camp_id.as_deref().and_then(|cid| db.get_campaign(cid).ok());
     let project = match &campaign {
         Some(c) => db.get_project(&c.project_id).ok(),
@@ -1922,15 +2006,39 @@ pub async fn generate_inbox_reply_with_ai(
     db: State<'_, Database>,
     lead_id: String,
     campaign_id: Option<String>,
+    subject: Option<String>,
 ) -> Result<InboxThread, String> {
     let lead = db.get_lead(&lead_id)?;
     let settings = db.get_settings()?;
-    let history = db.list_lead_messages(&lead_id).unwrap_or_default();
+    let all_history = db.list_lead_messages(&lead_id).unwrap_or_default();
+
+    // Keep the AI reply inside the selected conversation only.
+    let wanted_subject = subject
+        .as_deref()
+        .map(crate::db::normalize_subject_root)
+        .filter(|s| !s.is_empty());
+    let conversation_history: Vec<EmailMessage> = all_history
+        .iter()
+        .filter(|m| {
+            if campaign_id.is_some() {
+                m.campaign_id.as_deref() == campaign_id.as_deref()
+            } else if let Some(ref wanted) = wanted_subject {
+                m.campaign_id.is_none() && crate::db::normalize_subject_root(&m.subject) == *wanted
+            } else {
+                m.campaign_id.is_none()
+            }
+        })
+        .cloned()
+        .collect();
+    let history = if conversation_history.is_empty() {
+        all_history
+    } else {
+        conversation_history
+    };
     let last_inbound = history.iter().rev().find(|m| m.direction == "inbound");
 
     let camp = campaign_id
         .as_deref()
-        .or_else(|| history.iter().rev().find_map(|m| m.campaign_id.as_deref()))
         .and_then(|cid| db.get_campaign(cid).ok());
     let project = match &camp {
         Some(c) => db.get_project(&c.project_id)?,
@@ -1996,6 +2104,8 @@ pub async fn generate_inbox_reply_with_ai(
         db.update_email_message_content(&pend.id, &reply_subject, &body, None)?;
         if settings.auto_reply_enabled {
             db.update_email_schedule(&pend.id, "queued", Some("scheduled"), Some(&scheduled_at), None)?;
+        } else {
+            db.update_email_schedule(&pend.id, "draft", Some("paused"), None, None)?;
         }
     } else {
         db.insert_email_message_full(
@@ -2050,14 +2160,32 @@ pub async fn send_inbox_reply(
     }
 
     let lead = db.get_lead(&lead_id)?;
-    let campaign = match &campaign_id {
-        Some(cid) => db.get_campaign(cid).ok(),
-        None => db.list_campaigns()?.into_iter().next(),
-    };
+    // Keep the reply inside the selected conversation: use the requested
+    // campaign (or none for direct threads) instead of falling back to the
+    // first campaign of the workspace.
+    let campaign = campaign_id
+        .as_deref()
+        .and_then(|cid| db.get_campaign(cid).ok());
     let project = match &campaign {
         Some(c) => db.get_project(&c.project_id).ok(),
         None => db.list_projects()?.into_iter().next(),
     };
+    let wanted_subject = crate::db::normalize_subject_root(&subject);
+    let reply_target = db
+        .list_lead_messages(&lead_id)
+        .unwrap_or_default()
+        .into_iter()
+        .rev()
+        .find(|m| {
+            m.direction == "inbound"
+                && m.message_id_header.is_some()
+                && if campaign_id.is_some() {
+                    m.campaign_id.as_deref() == campaign_id.as_deref()
+                } else {
+                    crate::db::normalize_subject_root(&m.subject) == wanted_subject
+                }
+        })
+        .and_then(|m| m.message_id_header);
 
     let booking_sent = project
         .as_ref()
@@ -2084,7 +2212,7 @@ pub async fn send_inbox_reply(
             &lead.primary_email,
             &subject,
             &body,
-            None,
+            reply_target.as_deref(),
             Some(fine_print.as_str()),
         )
         .await?;
@@ -2101,7 +2229,7 @@ pub async fn send_inbox_reply(
         &subject,
         &body,
         Some(&msg_id),
-        None,
+        reply_target.as_deref(),
         None,
         None,
         booking_sent,

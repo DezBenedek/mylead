@@ -123,6 +123,8 @@ pub fn run() {
             commands::generate_direct_email_draft,
             commands::send_direct_email,
             commands::list_inbox_threads,
+            commands::list_lead_message_history,
+            commands::delete_inbox_conversation,
             commands::sync_imap_inbox,
             commands::reclassify_inbox_threads,
             commands::simulate_inbound_reply,

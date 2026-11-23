@@ -1699,37 +1699,55 @@ pub fn enforce_hungarian_email_quality(
     email
 }
 
-fn extract_sender_name_from_signature(signature: &str) -> Option<String> {
-    for line in signature.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let lower = trimmed.to_lowercase();
-        if lower.starts_with("üdv")
-            || lower.starts_with("köszönet")
-            || lower.starts_with("tisztelettel")
-            || lower.starts_with("best")
-            || lower.starts_with("regards")
-        {
-            continue;
-        }
-        let candidate = trimmed
-            .split(|c: char| c == ',' || c == '•' || c == '|' || c == '—' || c == '–')
-            .next()
-            .unwrap_or(trimmed)
-            .trim();
-        let cand_lower = candidate.to_lowercase();
-        if candidate.len() >= 3
-            && candidate.split_whitespace().count() <= 4
-            && !cand_lower.contains("csapat")
-            && !cand_lower.contains("team")
-            && !cand_lower.contains("http")
-        {
-            return Some(candidate.to_string());
+/// Ensures the configured signature is always present at the end of an email body without duplicating it.
+pub fn ensure_signature_present(body: &str, signature: &str) -> String {
+    let trimmed_body = body.trim();
+    let trimmed_sig = signature.trim();
+    if trimmed_sig.is_empty() || trimmed_body.is_empty() {
+        return trimmed_body.to_string();
+    }
+
+    if trimmed_body.ends_with(trimmed_sig) {
+        return trimmed_body.to_string();
+    }
+
+    let sig_lines: Vec<&str> = trimmed_sig
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if let Some(last_sig_line) = sig_lines.last() {
+        let body_tail: String = trimmed_body
+            .lines()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_lowercase();
+        if body_tail.contains(&last_sig_line.to_lowercase()) {
+            return trimmed_body.to_string();
         }
     }
-    None
+
+    let mut body_lines: Vec<&str> = trimmed_body.lines().collect();
+    while let Some(last) = body_lines.last() {
+        let l = last.trim().to_lowercase();
+        if l.is_empty()
+            || l == "üdvözlettel,"
+            || l == "üdvözlettel"
+            || l == "üdv,"
+            || l == "üdv!"
+            || l == "tisztelettel,"
+            || l == "köszönettel,"
+        {
+            body_lines.pop();
+        } else {
+            break;
+        }
+    }
+
+    let clean_main = body_lines.join("\n").trim().to_string();
+    format!("{}\n\n{}", clean_main, trimmed_sig)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1747,62 +1765,52 @@ pub async fn generate_cold_email(
     custom_instructions: &str,
 ) -> GeneratedEmail {
     let signature = resolve_email_signature(Some(project), settings);
-    let sender_person_name = extract_sender_name_from_signature(signature)
-        .unwrap_or_else(|| "Dezső Benedek".to_string());
     let offer_block = format_campaign_offer_block(offer_summary, offer_timing, offer_delivery, offer, true);
     let allow_offer_in_cold = offer_timing == "first_email" || (offer_timing == "custom" && !offer_summary.trim().is_empty());
     let (expected_greeting, is_single_person) = compute_hungarian_salutation(lead, tone);
 
     let number_rule = if is_single_person {
         format!(
-            "CÍMZETT ÉS RAGOZÁS: A címzett egy konkrét személy ({} — {}). Ha tegeződsz, végig egyes számban írj (weboldaladon/nálad/gyűjthetnéd). Ha magázódsz, a cégükről/weboldalukról írhatsz többes számban ('A weboldalukon olvastam, hogy ... kínálnak', 'gyűjthetnék be') vagy egyes számban, de a levél elejétől a végéig maradj teljesen következetes!",
+            "EGYES SZÁM SZABÁLY (KRITIKUS!): A címzett egy konkrét személy ({} — {}). Ha tegeződsz, végig egyes számban írj (te/neked/oldaladon/nálad). Ha magázódsz, írhatsz egyes számban (Ön/Önnek) vagy a cégükről többes számban (Önök/weboldalukon), de a levél elejétől a végéig maradj teljesen következetes!",
             expected_greeting, lead.primary_email
         )
     } else {
         format!(
-            "TÖBBES SZÁM SZABÁLY (KRITIKUS!): A címzett egy cég csapata ({} — {}). A levél ELEJÉTŐL A VÉGÉIG következetesen TÖBBES SZÁMBAN írj (magázódva: 'A weboldalukon olvastam, hogy ... kínálnak', 'gyűjthetnék be'; tegeződve: 'A weboldalatokon olvastam, hogy ... kínáltok', 'gyűjthetnétek be'). SOHA ne válts át egyes számra a levél végén!",
+            "TÖBBES SZÁM SZABÁLY (KRITIKUS!): A címzett egy cég csapata ({} — {}). A levél ELEJÉTŐL A VÉGÉIG következetesen TÖBBES SZÁMBAN írj (ti/nektek/oldalatokon/nálatok, vagy magázó hangnemnél Önök/Önöknek/weboldalukon). SOHA ne válts át egyes számra ('hogy lásd', 'ha van kedved', 'szólj') a levél végén!",
             expected_greeting, lead.primary_email
         )
     };
 
     let tone_desc = match tone {
-        "friendly_direct" => "közvetlen, természetes tegeződő, de szigorúan 4 rövid mondatos, sallangmentes (pl. 'A weboldalatokon olvastam...', 'egyszerűbben gyűjthetnétek be')",
-        "concise_executive" => "ultra-tömör, tárgyilagos, pontosan 4 egyszerű mondat (max 45-55 szó)",
-        _ => "udvarias, letisztult, magázódó B2B stílus, pontosan 4 rövid mondatban (pl. 'A weboldalukon olvastam, hogy... kínálnak', 'egyszerűbben gyűjthetnék be')",
+        "friendly_direct" => "közvetlen, barátságos, természetes tegeződő, de tömör és lényegre törő",
+        "concise_executive" => "letisztult, vezetői szintű, ultra-tömör és sallangmentes (4 rövid mondat)",
+        _ => "udvarias, természetes, tiszteletteljes B2B stílus (tömör, nem hivataloskodó, nem ömlengő)",
     };
 
     if has_live_ai(settings) {
-        let system = "Te egy lényegre törő, természetes hangvételű magyar B2B kapcsolatépítő vagy. A feladatod egy ULTRA-RÖVID, pontosan 4 mondatos hideg e-mail megírása a célcégnek.\n\
-KRITIKUS HOSSZÚSÁGI ÉS SZERKEZETI SZABÁLYOK (KÖTELEZŐ!):\n\
-1. A levél törzse (a megszólítás után) PONTOSAN 4 RÖVID BEKEZDÉSBŐL álljon, és MINDEN BEKEZDÉS KIZÁRÓLAG EGYETLEN RÖVID, EGYSZERŰ MONDAT LEGYEN (összesen 4 mondat, maximum 45–60 szó a teljes levél)!\n\
-2. SZIGORÚAN TILOS 1 mondatnál hosszabb bekezdéseket, gondolatjeles (—) mellékmondat-füzéreket, esti böngészős történetmesélést ('amikor ma este valaki hirtelen úgy dönt...', 'Amit ti csináltok, azt nem lehet sablonba szorítani...'), évszámokat/statisztikákat vagy túlzó hízelgést írni!\n\
-3. A 4 EGYSZERŰ MONDAT KÖTELEZŐ FELÉPÍTÉSE:\n\
-   - 1. bekezdés (1 rövid mondat — mit olvastál a weboldalukon): Tényszerűen, egyszerűen említsd meg, milyen konkrét szolgáltatást (pl. workshopokat, tréningeket, coachingot, képzéseket) kínálnak a weboldaluk alapján.\n\
-   - 2. bekezdés (1 rövid mondat — rövid bemutatkozás + mi a megoldásunk): Mondd el, ki vagy a projektnél és mit tud a megoldásunk egyetlen egyszerű mondatban.\n\
-   - 3. bekezdés (1 rövid mondat — konkrét előny az ő szolgáltatásukra): Egyetlen mondatban írd le, hogyan egyszerűsítené ez az ő konkrét szolgáltatásaikra érkező jelentkezéseket / foglalásokat és díjak begyűjtését.\n\
-   - 4. bekezdés (1 rövid kérdés — alacsony elköteleződésű CTA): Egyetlen rövid kérdés arról, hogy megküldheted-e pár rövid ötletedet arról, hogyan lehetne a jelentkezéseket és a fizetéseket (vagy időpontfoglalást) egy folyamatba tenni.\n\
-MINTA LEVÉL (PONTOSAN ILYEN HOSSZÚSÁGÚ, TÖMÖRSÉGŰ ÉS FELÉPÍTÉSŰ LEGYEN!):\n\
-\"\"\"\n\
-Kedves Klára!\n\n\
-A weboldalukon olvastam, hogy vállalati meditációs workshopokat és coachingot kínálnak, a meditációt pszichológiai technikákkal ötvözve.\n\n\
-Dezső Benedek vagyok az OKOSűrlapnál, magyar űrlapkészítő, amivel jelentkezéseket és kártyás fizetéseket lehet egy helyen kezelni.\n\n\
-A workshopjaikra érkező jelentkezéseket és a részvételi díjakat egyszerűbben gyűjthetnék be egy űrlapon keresztül.\n\n\
-Megküldhetem pár rövid ötletemet arról, hogyan lehetne a workshop-jelentkezéseket és a fizetéseket egy folyamatba tenni?\n\
-\"\"\"\n\
-SZIGORÚ KÖSZÖNÉSI ÉS NYELVTANI SZABÁLYOK:\n\
-4. KÖTELEZŐ KÖSZÖNÉS: A levelet MINDIG a megadott KÖTELEZŐ MEGSZÓLÍTÁS sorral kezdd (pl. 'Kedves Klára!' vagy 'Kedves Gordio Csapat!'), magyar helyesírás szerint FELKIÁLTÓJELLEL (!) a végén, SOHA nem angol vesszővel (,).\n\
-5. TILOS a 'Szia', 'Sziasztok', 'Helló' köszönés, és TILOS kitalált keresztnevet írni egy központi 'info@' vagy 'office@' e-mail címre! Mindig a megadott KÖTELEZŐ MEGSZÓLÍTÁST használd!\n\
-6. TILOS felsorolásjeleket (•, -, 1., 2.) vagy technikai audit-kifejezéseket ('konverziómérés', 'statikus HTML űrlap', 'SEO meta') használni!\n\
-7. SZIGORÚAN tartsd be a kampány-ajánlat időzítési szabályát (ha tiltva van az első levélben, NE írd bele a kedvezményt!). Ha van megadva Aláírás és nem redundáns, a levél végén használd.\n\
+        let system = "Te egy lényegre törő, kiváló stílusérzékű magyar B2B kapcsolatépítő és szövegíró vagy. A feladatod egy RÖVID, TÖMÖR, mégis teljesen egyedi és természetes hideg e-mail megírása a célcégnek.\n\
+KRITIKUS HOSSZÚSÁGI ÉS STÍLUS SZABÁLYOK (KÖTELEZŐ!):\n\
+1. RÖVIDSÉG (MAX 50–70 SZÓ): A levél törzse (a megszólítás és az aláírás között) 3 vagy 4 RÖVID, LEVEGŐS BEKEZDÉSBŐL álljon, és MINDEN BEKEZDÉS KIZÁRÓLAG 1 RÖVID, GÖRDÜLÉKENY MONDAT LEGYEN (összesen 4 rövid mondat a teljes levéltörzs)!\n\
+2. TILOS A RIZSA ÉS A TÖRTÉNETMESÉLÉS: Szigorúan tilos hosszú, többszörösen összetett, gondolatjeles (—) mondatfüzéreket írni! Tilos évszámokat és statisztikákat sorolni ('1998 óta, több mint 27 éve...', '72 000 emberig eljutva'), tilos a túlzó hízelgés ('Amit ti csináltok, azt nem lehet sablonba szorítani'), és tilos az esti böngészős drámai történetmesélés ('Amikor viszont egy érdeklődő ma este hirtelen úgy dönt...').\n\
+3. TILOS A MECHANIKUS SABLONMÁSOLÁS: Minden levél legyen természetesen a célcég saját tevékenységére fogalmazva — ne használj minden levélben szó szerint ugyanolyan nyitó vagy záró klisét!\n\
+4. A 4 RÖVID BEKEZDÉS (BEKEZDÉSENKÉNT 1 MONDAT) LOGIKÁJA:\n\
+   - 1. bekezdés (1 rövid mondat — Konkrét kapcsolódás): Utalj természetesen és tényszerűen arra, amivel a cég a weboldala alapján foglalkozik (pl. milyen tréningeket, workshopokat, coachingot vagy szolgáltatást kínálnak).\n\
+   - 2. bekezdés (1 rövid mondat — Megoldásunk & relevancia): Mutasd meg tömören, hogyan tudná a megoldásunk (pl. az OKOSűrlap) egyszerűsíteni náluk a jelentkezések, az igényfelmérés/időpontfoglalás és akár a kártyás díjfizetés folyamatát az e-mailes vagy kézi egyeztetés helyett.\n\
+   - 3. bekezdés (1 rövid mondat — Konkrét előny nekik): Egyetlen tiszta mondat arról, mit nyernek vele a gyakorlatban (pl. az érdeklődők egyetlen, a saját arculatukba illő űrlapon keresztül jelentkezhetnek és fizethetnek, ti pedig kész, egységes igényléseket kaptok).\n\
+   - 4. bekezdés (1 rövid kérdés — Könnyű CTA): Egyetlen rövid, alacsony elköteleződésű kérdés (pl. összeállíthatsz-e / átküldhetsz-e nekik pár rövid ötletet vagy egy rájuk szabott mintát, hogyan működne ez egy folyamatban).\n\
+SZIGORÚ KÖSZÖNÉSI, NYELVTANI ÉS ALÁÍRÁSI SZABÁLYOK:\n\
+5. KÖTELEZŐ KÖSZÖNÉS: A levelet MINDIG a megadott KÖTELEZŐ MEGSZÓLÍTÁS sorral kezdd (pl. 'Kedves Klára!' vagy 'Kedves Gordio Csapat!'), magyar helyesírás szerint FELKIÁLTÓJELLEL (!) a végén, SOHA nem angol vesszővel (,). TILOS a 'Szia', 'Sziasztok', 'Helló' köszönés, és TILOS kitalált keresztnevet írni egy központi 'info@' vagy 'office@' címre!\n\
+6. TILOS felsorolásjeleket (•, -, 1., 2.) vagy technikai audit-zsargont ('konverziómérés', 'statikus HTML űrlap', 'SEO meta') használni!\n\
+7. KÖTELEZŐ ALÁÍRÁS A LEVÉL VÉGÉN: A levelet MINDIG zárd a megadott Aláírással (üres sorral elválasztva a 4. bekezdés után)! SOHA ne hagyd le az aláírást a levél végéről!\n\
+8. SZIGORÚAN tartsd be a kampány-ajánlat időzítési szabályát (ha tiltva van az első levélben, NE írd bele a kedvezményt!).\n\
 Kizárólag JSON-t adj vissza: {\"subject\":\"...\",\"body\":\"...\"}";
 
         let user = format!(
-            "KÖTELEZŐ MEGSZÓLÍTÁS (pontosan ezzel a sorral kezdd a levelet!): {}\n{}\nNyelv: {}\nHangnem: {}\nKüldő személy neve (a 2. mondatos bemutatkozáshoz): {}\nSaját megoldásunk: {} ({})\nMit tud a megoldásunk (1 mondatba sűrítsd a 2. bekezdésben): {}\nLanding oldal: {}\nIdőpontfoglaló link: {}\nIdőpontfoglaló link beillesztése már az első levélbe: {}\nKAMPÁNY AJÁNLAT ÉS TÁLALÁSI SZABÁLY:\n{}\nExtra felhasználói instrukció: {}\nAláírás:\n{}\n\nCÉLCÉG ADATAI (CSAK A LEGFONTOSABB TEVÉKENYSÉGÜKET EMELD KI AZ 1. MONDATBAN, NE SOROLJ FEL MINDENT!):\nCégnév / Szakember: {}\nCímzett e-mail cím: {}\nWeboldal: {}\nTevékenység / Iparág: {}\nMit tudunk róluk (összefoglaló): {}\nHáttér-információ (ebből csak 1 rövid mondatot formálj a 3. bekezdéshez, NE másold be a pontokat!):\n{}",
+            "KÖTELEZŐ MEGSZÓLÍTÁS (pontosan ezzel a sorral kezdd a levelet!): {}\n{}\nNyelv: {}\nHangnem: {}\nSaját megoldásunk: {} ({})\nMit adunk ügyfeleinknek: {}\nLanding oldal: {}\nIdőpontfoglaló link: {}\nIdőpontfoglaló link beillesztése már az első levélbe: {}\nKAMPÁNY AJÁNLAT ÉS TÁLALÁSI SZABÁLY:\n{}\nExtra felhasználói instrukció: {}\nKÖTELEZŐ ALÁÍRÁS A LEVÉL VÉGÉRE (ezt mindig tedd a levél legvégére!):\n{}\n\nCÉLCÉG ADATAI (CSAK A LÉNYEGET HASZNÁLD, TARTSD A LEVELET 4 RÖVID MONDATBAN / 50-70 SZÓBAN!):\nCégnév / Szakember: {}\nCímzett e-mail cím: {}\nWeboldal: {}\nTevékenység / Iparág: {}\nMit tudunk róluk (összefoglaló): {}\nJelenlegi helyzetük: {:?}\nHogyan tudnánk segíteni (HÁTTÉRINFORMÁCIÓ — csak 1-2 tömör mondatba sűrítsd a lényegét, NE sorold fel mindet!):\n{}",
             expected_greeting,
             number_rule,
             language,
             tone_desc,
-            sender_person_name,
             project.name,
             project.website_url,
             project.value_proposition,
@@ -1817,18 +1825,20 @@ Kizárólag JSON-t adj vissza: {\"subject\":\"...\",\"body\":\"...\"}";
             lead.website_url,
             lead.industry,
             lead.company_summary,
+            lead.pain_points,
             lead.how_we_can_help,
         );
         if let Ok(json_str) = call_llm_json(settings, system, &user).await {
-            if let Ok(parsed) = serde_json::from_str::<GeneratedEmail>(&json_str) {
+            if let Ok(mut parsed) = serde_json::from_str::<GeneratedEmail>(&json_str) {
                 if !parsed.subject.trim().is_empty() && !parsed.body.trim().is_empty() {
+                    parsed.body = ensure_signature_present(&parsed.body, signature);
                     return enforce_hungarian_email_quality(parsed, &expected_greeting, is_single_person);
                 }
             }
         }
     }
 
-    // Ultra-short, 4-sentence human fallback matching the exact target length & structure
+    // Short, varied, natural 4-sentence fallback with guaranteed closing signature
     let is_informal = tone == "friendly_direct";
     let clean_name = lead.company_name.trim();
     let ind_lower = format!("{} {}", lead.industry, lead.company_summary).to_lowercase();
@@ -1841,61 +1851,66 @@ Kizárólag JSON-t adj vissza: {\"subject\":\"...\",\"body\":\"...\"}";
         || ind_lower.contains("akadémia");
 
     let variant = clean_name.bytes().fold(0usize, |acc, b| acc.wrapping_add(b as usize)) % 3;
+    let proj_name = if project.name.trim().is_empty() { "OKOSűrlap" } else { project.name.trim() };
 
     let subject = if is_coaching_or_training {
         match variant {
             0 => format!("Jelentkezések és fizetés egy folyamatban — {}", clean_name),
             1 => format!("Rövid ötlet a jelentkezésekhez ({})", clean_name),
-            _ => format!("Workshop- és képzés-jelentkezések egyszerűbben — {}", clean_name),
+            _ => format!("Képzés- és workshop-jelentkezések egyszerűbben — {}", clean_name),
         }
     } else {
-        format!("Rövid ötlet az online jelentkezésekhez — {}", clean_name)
+        format!("Rövid ötlet az online megkeresésekhez — {}", clean_name)
     };
 
-    let p1 = if is_coaching_or_training {
+    let (p1, p2, mut p3, p4) = if is_coaching_or_training {
         if is_informal {
             if is_single_person {
-                "A weboldaladon olvastam, hogy személyre szabott coachinggal és szakmai fejlesztéssel foglalkozol.".to_string()
+                (
+                    "Láttam a weboldaladon, hogy személyre szabott coachinggal és szakmai fejlesztő programokkal foglalkozol.".to_string(),
+                    format!("A(z) {} segítségével a jelentkezéseket, az előszűrő kérdéseket és akár a kártyás fizetést is egyetlen felületen tudod kezelni a külön e-mailezés helyett.", proj_name),
+                    "Így az érdeklődők egyetlen saját arculatú űrlapon keresztül jelentkezhetnek hozzád, te pedig azonnal kész, rendezett adatokat kapsz.".to_string(),
+                    "Átküldhetek pár rövid ötletet arról, hogyan lehetne nálad a jelentkezéseket és a fizetést egy folyamatba tenni?".to_string(),
+                )
             } else {
-                "A weboldalatokon olvastam, hogy vállalati tréningeket, workshopokat és coaching programokat kínáltok.".to_string()
+                (
+                    "Láttam a weboldalatokon, hogy vállalati tréningeket, workshopokat és coaching programokat tartotok.".to_string(),
+                    format!("A(z) {} segítségével a képzési jelentkezéseket, az igényfelmérő kérdéseket és akár a kártyás díjfizetést is egyetlen helyen tudjátok kezelni.", proj_name),
+                    "Így a résztvevők külön e-mailezés és kézi díjbekérőzés helyett egyetlen, az arculatotokba illő űrlapon keresztül jelentkezhetnek.".to_string(),
+                    "Összeállíthatok nektek egy rövid, rátok szabott mintát arról, hogyan nézne ki ez egy folyamatban?".to_string(),
+                )
             }
         } else {
-            "A weboldalukon olvastam, hogy vállalati tréningeket, workshopokat és coaching programokat kínálnak.".to_string()
+            (
+                "A weboldalukon olvastam, hogy vállalati tréningeket, workshopokat és coaching programokat kínálnak.".to_string(),
+                format!("A(z) {} egy magyar űrlapkészítő megoldás, amivel az igényfelmérést, a jelentkezéseket és a kártyás fizetéseket egy helyen lehet kezelni.", proj_name),
+                "A programjaikra érkező jelentkezéseket és a részvételi díjakat így külön e-mailezés helyett sokkal egyszerűbben gyűjthetnék be egyetlen űrlapon keresztül.".to_string(),
+                "Megküldhetem pár rövid ötletemet arról, hogyan lehetne a jelentkezéseket és a fizetéseket egy folyamatba tenni?".to_string(),
+            )
         }
     } else if is_informal {
         if is_single_person {
-            format!("A weboldaladon olvastam a szolgáltatásaidról {} területén.", if lead.industry.is_empty() { "a szakmádban" } else { &lead.industry })
+            (
+                format!("Megnéztem a szolgáltatásaidat a weboldaladon {} területén.", if lead.industry.is_empty() { "a szakmádban" } else { &lead.industry }),
+                format!("A(z) {} segítségével az érdeklődők előszűrését, az időpontfoglalást és akár a díjfizetést is egyetlen felületen tudod kezelni.", proj_name),
+                "Így kevesebb oda-vissza levelezéssel, egyetlen űrlapon keresztül érkezhetnek be hozzád a megkeresések.".to_string(),
+                "Átküldhetek pár rövid ötletet arról, hogyan lehetne ezt nálad egy folyamatba tenni?".to_string(),
+            )
         } else {
-            format!("A weboldalatokon olvastam a szolgáltatásaitokról {} területén.", if lead.industry.is_empty() { "a szakmátokban" } else { &lead.industry })
+            (
+                format!("Megnéztem a szolgáltatásaitokat a weboldalatokon {} területén.", if lead.industry.is_empty() { "a szakmátokban" } else { &lead.industry }),
+                format!("A(z) {} segítségével az ügyfelek igényfelmérését, a jelentkezéseket és akár a díjfizetést is egyetlen helyen tudjátok kezelni.", proj_name),
+                "Így a kézi e-mailezés helyett egyetlen, a saját arculatotokba illő űrlapon keresztül gyűjthetitek be a megkereséseket.".to_string(),
+                "Összeállíthatok nektek egy rövid mintát arról, hogyan működne ez a ti folyamataitokban?".to_string(),
+            )
         }
     } else {
-        format!("A weboldalukon olvastam a szolgáltatásaikról {} területén.", if lead.industry.is_empty() { "az Önök szektorában" } else { &lead.industry })
-    };
-
-    let p2 = format!(
-        "{} vagyok a(z) {}-nál, magyar űrlapkészítő, amivel jelentkezéseket és kártyás fizetéseket lehet egy helyen kezelni.",
-        sender_person_name,
-        if project.name.trim().is_empty() { "OKOSűrlap" } else { project.name.trim() }
-    );
-
-    let mut p3 = if is_coaching_or_training {
-        if is_informal {
-            if is_single_person {
-                "A programjaidra érkező jelentkezéseket és a részvételi díjakat egyszerűbben gyűjthetnéd be egy űrlapon keresztül.".to_string()
-            } else {
-                "A képzéseitekre és workshopjaitokra érkező jelentkezéseket és a részvételi díjakat egyszerűbben gyűjthetnétek be egy űrlapon keresztül.".to_string()
-            }
-        } else {
-            "A képzéseikre és workshopjaikra érkező jelentkezéseket és a részvételi díjakat egyszerűbben gyűjthetnék be egy űrlapon keresztül.".to_string()
-        }
-    } else if is_informal {
-        if is_single_person {
-            "Az ügyfelektől érkező jelentkezéseket és díjakat egyszerűbben gyűjthetnéd be egy űrlapon keresztül.".to_string()
-        } else {
-            "Az ügyfelektől érkező jelentkezéseket és díjakat egyszerűbben gyűjthetnétek be egy űrlapon keresztül.".to_string()
-        }
-    } else {
-        "Az ügyfelektől érkező jelentkezéseket és díjakat egyszerűbben gyűjthetnék be egy űrlapon keresztül.".to_string()
+        (
+            format!("A weboldalukon olvastam a szolgáltatásaikról {} területén.", if lead.industry.is_empty() { "az Önök szektorában" } else { &lead.industry }),
+            format!("A(z) {} segítségével az igényfelmérést, a jelentkezéseket és a kártyás fizetéseket egyetlen helyen lehet kezelni.", proj_name),
+            "Az ügyfelektől érkező megkereséseket és díjakat így egyszerűbben, kevesebb adminisztrációval gyűjthetnék be egy űrlapon keresztül.".to_string(),
+            "Megküldhetem pár rövid ötletemet arról, hogyan lehetne a jelentkezéseket és a fizetéseket egy folyamatba tenni?".to_string(),
+        )
     };
 
     if allow_offer_in_cold {
@@ -1906,22 +1921,14 @@ Kizárólag JSON-t adj vissza: {\"subject\":\"...\",\"body\":\"...\"}";
         }
     }
 
-    let p4 = if include_booking_link && !project.booking_url.trim().is_empty() {
-        format!(
-            "Megküldhetem pár rövid ötletemet arról, hogyan lehetne a jelentkezéseket és a fizetéseket egy folyamatba tenni (vagy egyeztessünk itt: {})?",
-            project.booking_url.trim()
-        )
-    } else if is_coaching_or_training {
-        "Megküldhetem pár rövid ötletemet arról, hogyan lehetne a képzés-jelentkezéseket és a fizetéseket egy folyamatba tenni?".to_string()
+    let p4_final = if include_booking_link && !project.booking_url.trim().is_empty() {
+        format!("{} (Időpontfoglalás: {})", p4, project.booking_url.trim())
     } else {
-        "Megküldhetem pár rövid ötletemet arról, hogyan lehetne a jelentkezéseket és a fizetéseket egy folyamatba tenni?".to_string()
+        p4
     };
 
-    let body = if signature.is_empty() {
-        format!("{}\n\n{}\n\n{}\n\n{}\n\n{}", expected_greeting, p1, p2, p3, p4)
-    } else {
-        format!("{}\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}", expected_greeting, p1, p2, p3, p4, signature)
-    };
+    let raw_body = format!("{}\n\n{}\n\n{}\n\n{}\n\n{}", expected_greeting, p1, p2, p3, p4_final);
+    let body = ensure_signature_present(&raw_body, signature);
 
     enforce_hungarian_email_quality(
         GeneratedEmail { subject, body },
@@ -2643,24 +2650,22 @@ pub async fn rewrite_email_with_instruction(
     let (expected_greeting, is_single_person) = compute_hungarian_salutation(lead, "professional_formal");
 
     if has_live_ai(settings) {
-        let sender_person_name = extract_sender_name_from_signature(signature)
-            .unwrap_or_else(|| "Dezső Benedek".to_string());
-        let system = "Te egy lényegre törő, természetes hangvételű magyar B2B kommunikációs szövegíró vagy. A felhasználó megjegyzése / instrukciója alapján írd át a meglévő e-mail tervezetet MAGYAR nyelven.\n\
+        let system = "Te egy lényegre törő, kiváló stílusérzékű magyar B2B kommunikációs szövegíró vagy. A felhasználó megjegyzése / instrukciója alapján írd át a meglévő e-mail tervezetet MAGYAR nyelven.\n\
 SZIGORÚ HOSSZÚSÁGI ÉS SZERKEZETI SZABÁLYOK:\n\
 1. A levelet MINDIG a megadott KÖTELEZŐ MEGSZÓLÍTÁSSAL kezdd (pl. 'Kedves Klára!' vagy 'Kedves Gordio Csapat!'), felkiáltójellel (!) a végén. TILOS a 'Szia', 'Sziasztok', 'Helló' köszönés!\n\
-2. A levél legyen ULTRA-RÖVID és sallangmentes: a törzse PONTOSAN 4 RÖVID BEKEZDÉSBŐL álljon, és MINDEN BEKEZDÉS KIZÁRÓLAG EGYETLEN RÖVID MONDAT LEGYEN (összesen 4 mondat, maximum 45–60 szó, kivéve ha a felhasználó kifejezetten hosszabb levelet kér):\n\
-   - 1. mondat: Mit olvastál a weboldalukon a fő szolgáltatásukról (tényszerűen, hízelgés és évszámok nélkül).\n\
-   - 2. mondat: Rövid bemutatkozás + mi a megoldásunk 1 mondatban (pl. '[Küldő neve] vagyok az OKOSűrlapnál, magyar űrlapkészítő, amivel jelentkezéseket és kártyás fizetéseket lehet egy helyen kezelni.').\n\
-   - 3. mondat: 1 mondat arról, hogyan egyszerűsítené ez az ő szolgáltatásukra érkező jelentkezéseket és díjfizetést.\n\
-   - 4. mondat: 1 rövid kérdés ('Megküldhetem pár rövid ötletemet arról, hogyan lehetne a [jelentkezéseket és a fizetéseket] egy folyamatba tenni?').\n\
-3. TILOS gondolatjeles (—) mellékmondat-füzéreket, esti böngészős történetmesélést vagy felsorolásjeleket írni!\n\
-4. Tartsd meg a következetes ragozást a levél elejétől a végéig.\n\
+2. A levél legyen RÖVID, TÖMÖR és sallangmentes (50–70 szó): a törzse (a megszólítás és az aláírás között) 3 vagy 4 RÖVID BEKEZDÉSBŐL álljon, és MINDEN BEKEZDÉS KIZÁRÓLAG 1 RÖVID, GÖRDÜLÉKENY MONDAT LEGYEN (kivéve ha a felhasználó kifejezetten hosszabb levelet kér):\n\
+   - 1. bekezdés (1 mondat): Természetes, tényszerű kapcsolódás a cég fő szolgáltatásához (túlzó hízelgés és évszámok nélkül).\n\
+   - 2. bekezdés (1 mondat): Hogyan tudná a megoldásunk (pl. az OKOSűrlap) egyszerűsíteni náluk a jelentkezések, igényfelmérés/időpontfoglalás és akár a kártyás fizetés kezelését.\n\
+   - 3. bekezdés (1 mondat): Konkrét gyakorlati előny az ő szolgáltatásukra szabva.\n\
+   - 4. bekezdés (1 rövid kérdés): Alacsony elköteleződésű kérdés (pl. átküldhetsz-e pár rövid ötletet vagy egy rájuk szabott mintát).\n\
+3. TILOS gondolatjeles (—) mellékmondat-füzéreket, esti böngészős történetmesélést vagy felsorolásjeleket írni, és TILOS sablonszöveget mechanikusan másolni!\n\
+4. KÖTELEZŐ ALÁÍRÁS A LEVÉL VÉGÉN: A levelet MINDIG zárd a megadott Aláírással (üres sorral elválasztva a 4. bekezdés után)! SOHA ne hagyd le az aláírást a levél végéről!\n\
+5. Tartsd meg a következetes ragozást a levél elejétől a végéig.\n\
 Kizárólag JSON-t adj vissza: {\"subject\":\"...\",\"body\":\"...\"}";
         let user = format!(
-            "KÖTELEZŐ MEGSZÓLÍTÁS: {}\nRAGOZÁS: {}\nKÜLDŐ SZEMÉLY NEVE: {}\nFELHASZNÁLÓ MEGJEGYZÉSE / ÁTÍRÁSI UTASÍTÁS:\n{}\n\nJELENLEGI TÁRGY: {}\nJELENLEGI LEVÉLSZÖVEG:\n{}\n\nCÉG: {} ({}, email: {})\nMiben segíthetünk (csak 1 mondatos háttérként használd):\n{}\nSAJÁT PROJEKT: {}\nAJÁNLAT: {}\nFOGLALÁSI LINK: {}\nLANDING LINK: {}\nALÁÍRÁS:\n{}\n\nELŐZMÉNYEK:\n{}",
+            "KÖTELEZŐ MEGSZÓLÍTÁS: {}\nEGYES/TÖBBES SZÁM: {}\nFELHASZNÁLÓ MEGJEGYZÉSE / ÁTÍRÁSI UTASÍTÁS:\n{}\n\nJELENLEGI TÁRGY: {}\nJELENLEGI LEVÉLSZÖVEG:\n{}\n\nCÉG: {} ({}, email: {})\nMiben segíthetünk (csak tömör háttérként használd):\n{}\nSAJÁT PROJEKT: {}\nAJÁNLAT: {}\nFOGLALÁSI LINK: {}\nLANDING LINK: {}\nKÖTELEZŐ ALÁÍRÁS A LEVÉL VÉGÉRE (ezt mindig tedd a levél legvégére!):\n{}\n\nELŐZMÉNYEK:\n{}",
             expected_greeting,
-            if is_single_person { "Személyes megszólítás (következetes ragozás)" } else { "Végig TÖBBES SZÁM (Csapat)" },
-            sender_person_name,
+            if is_single_person { "Végig EGYES SZÁM (vagy következetes magázódás)" } else { "Végig TÖBBES SZÁM (Csapat)" },
             instruction,
             current_subject,
             current_body,
@@ -2679,6 +2684,7 @@ Kizárólag JSON-t adj vissza: {\"subject\":\"...\",\"body\":\"...\"}";
         let parsed = serde_json::from_str::<GeneratedEmail>(&json_str)
             .map_err(|_| "Az AI nem érvényes JSON formátumban adta vissza az átírt levelet.".to_string())?;
         if !parsed.body.trim().is_empty() {
+            let body_with_sig = ensure_signature_present(&parsed.body, signature);
             return Ok(enforce_hungarian_email_quality(
                 GeneratedEmail {
                     subject: if parsed.subject.trim().is_empty() {
@@ -2686,7 +2692,7 @@ Kizárólag JSON-t adj vissza: {\"subject\":\"...\",\"body\":\"...\"}";
                     } else {
                         parsed.subject
                     },
-                    body: parsed.body,
+                    body: body_with_sig,
                 },
                 &expected_greeting,
                 is_single_person,
@@ -3085,9 +3091,11 @@ mod tests {
         assert!(!fixed.body.contains("Sziasztok"));
         assert!(fixed.body.contains("Ha nyitottak vagytok rá,"));
         assert!(fixed.body.contains("hogy lássátok,"));
-        assert_eq!(
-            extract_sender_name_from_signature("Üdvözlettel,\nDezső Benedek, az OKOSűrlap csapatából"),
-            Some("Dezső Benedek".to_string())
-        );
+
+        let sig = "Üdvözlettel,\nDezső Benedek, az OKOSűrlap csapatából";
+        let with_sig = ensure_signature_present("Kedves Klára!\n\nRövid törzsszöveg.", sig);
+        assert!(with_sig.ends_with(sig));
+        // Calling it again when signature is already present does not duplicate it
+        assert_eq!(ensure_signature_present(&with_sig, sig), with_sig);
     }
 }

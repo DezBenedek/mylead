@@ -454,6 +454,7 @@ export default function App() {
             threads={threads}
             leads={leads}
             projects={projects}
+            campaigns={campaigns}
             senderAccounts={senderAccounts}
             settings={settings}
             onSelectLead={setSelectedLead}

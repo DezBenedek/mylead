@@ -149,6 +149,10 @@ export const api = {
 
   // Inbox & AI Auto-Reply
   listInboxThreads: () => invoke<InboxThread[]>("list_inbox_threads"),
+  listLeadMessageHistory: (leadId: string) =>
+    invoke<EmailMessage[]>("list_lead_message_history", { leadId }),
+  deleteInboxConversation: (messageIds: string[]) =>
+    invoke<number>("delete_inbox_conversation", { messageIds }),
   syncImapInbox: (senderAccountId?: string | null) =>
     invoke<number>("sync_imap_inbox", { senderAccountId: senderAccountId || null }),
   reclassifyInboxThreads: () => invoke<number>("reclassify_inbox_threads"),
@@ -212,10 +216,15 @@ export const api = {
       currentBody,
       instruction,
     }),
-  generateInboxReplyWithAi: (leadId: string, campaignId?: string | null) =>
+  generateInboxReplyWithAi: (
+    leadId: string,
+    campaignId?: string | null,
+    subject?: string | null
+  ) =>
     invoke<InboxThread>("generate_inbox_reply_with_ai", {
       leadId,
       campaignId: campaignId || null,
+      subject: subject || null,
     }),
 
   // Sender Accounts & Settings

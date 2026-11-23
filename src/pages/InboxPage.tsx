@@ -31,6 +31,7 @@ import {
   IconChevronDown,
   IconClock,
   IconFlame,
+  IconHistory,
   IconMailPlus,
   IconPlayerPause,
   IconPlayerPlay,
@@ -54,6 +55,8 @@ import {
 } from "../lib/api";
 import type {
   AppSettings,
+  Campaign,
+  EmailMessage,
   InboxThread,
   Lead,
   Project,
@@ -64,6 +67,7 @@ interface Props {
   threads: InboxThread[];
   leads: Lead[];
   projects: Project[];
+  campaigns: Campaign[];
   senderAccounts: SenderAccount[];
   settings: AppSettings;
   onSelectLead: (lead: Lead) => void;
@@ -98,13 +102,14 @@ export function InboxPage({
   threads,
   leads,
   projects,
+  campaigns,
   senderAccounts,
   settings,
   onSelectLead,
   onRefresh,
 }: Props) {
-  const [selectedLeadId, setSelectedLeadId] = useState<string | null>(
-    threads[0]?.leadId ?? null
+  const [selectedThreadKey, setSelectedThreadKey] = useState<string | null>(
+    threads[0]?.threadKey ?? null
   );
   const [threadFilter, setThreadFilter] = useState<string>("all");
   const [sortMode, setSortMode] = useState<"priority" | "recent">(
@@ -133,6 +138,11 @@ export function InboxPage({
   const [rulesModalOpen, setRulesModalOpen] = useState(false);
   const [rulesForm, setRulesForm] = useState<AppSettings>(settings);
   const [savingRules, setSavingRules] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyMessages, setHistoryMessages] = useState<EmailMessage[]>([]);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const lastServerSettingsJsonRef = useRef<string>(JSON.stringify(settings));
   const activeComposerKeyRef = useRef<string>("");
 
@@ -155,7 +165,7 @@ export function InboxPage({
     [senderAccounts]
   );
 
-  // Quiet automatic IMAP sync (runs automatically on mount & every 45s without button press)
+  // Quiet automatic IMAP sync (runs automatically on mount & by the configured poll interval)
   const runQuietImapSync = useCallback(async () => {
     if (!hasImapAccount) return;
     try {
@@ -178,9 +188,12 @@ export function InboxPage({
 
   useEffect(() => {
     runQuietImapSync();
-    const timer = setInterval(runQuietImapSync, 45000);
+    // The backend already polls IMAP on its own; mirror the same interval here
+    // instead of hammering the mailbox every 45 seconds.
+    const pollMinutes = Math.max(1, settings.imapPollMinutes || 1);
+    const timer = setInterval(runQuietImapSync, pollMinutes * 60_000);
     return () => clearInterval(timer);
-  }, [runQuietImapSync]);
+  }, [runQuietImapSync, settings.imapPollMinutes]);
 
   const filteredThreads = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -222,10 +235,25 @@ export function InboxPage({
   }, [threads, threadFilter, searchQuery, sortMode]);
 
   const selected =
-    filteredThreads.find((t) => t.leadId === selectedLeadId) ??
-    threads.find((t) => t.leadId === selectedLeadId) ??
+    threads.find((t) => t.threadKey === selectedThreadKey) ??
     filteredThreads[0] ??
+    threads[0] ??
     null;
+
+  useEffect(() => {
+    if (!selectedThreadKey || !threads.some((t) => t.threadKey === selectedThreadKey)) {
+      setSelectedThreadKey(filteredThreads[0]?.threadKey ?? threads[0]?.threadKey ?? null);
+    }
+  }, [threads, filteredThreads, selectedThreadKey]);
+
+  const selectedProject = useMemo(() => {
+    if (selected?.campaignId) {
+      const campaign = campaigns.find((c) => c.id === selected.campaignId);
+      const project = campaign && projects.find((p) => p.id === campaign.projectId);
+      if (project) return project;
+    }
+    return projects[0] ?? null;
+  }, [selected?.campaignId, campaigns, projects]);
 
   const pendingMsg = useMemo(() => {
     if (!selected) return null;
@@ -251,9 +279,18 @@ export function InboxPage({
     );
   }, [selected, pendingMsg]);
 
+  const lastTimelineMsg = timelineMessages[timelineMessages.length - 1] ?? null;
+
   useEffect(() => {
     if (!selected) return;
-    const composerKey = `${selected.leadId}:${pendingMsg?.id || "none"}`;
+    const composerKey = [
+      selected.threadKey,
+      pendingMsg?.id || "none",
+      pendingMsg?.autoSendStatus || "",
+      pendingMsg?.subject || "",
+      pendingMsg?.body?.length ?? 0,
+      lastTimelineMsg?.id || "none",
+    ].join("|");
     if (composerKey === activeComposerKeyRef.current) {
       return;
     }
@@ -270,23 +307,31 @@ export function InboxPage({
           );
         }
       }
+    } else if (lastTimelineMsg?.direction === "outbound") {
+      // We already answered this conversation — wait for the next incoming
+      // message instead of prefilling the same answer again.
+      const subj = lastTimelineMsg.subject || `Re: ${selected.leadCompany}`;
+      setReplySubject(subj.toLowerCase().startsWith("re:") ? subj : `Re: ${subj}`);
+      setReplyBody("");
     } else {
       const lastInbound = [...selected.messages]
         .reverse()
         .find((m) => m.direction === "inbound");
-      const lastAny = selected.messages[selected.messages.length - 1];
-      const subj = lastAny?.subject || `Re: ${selected.leadCompany}`;
-      setReplySubject(subj.startsWith("Re:") ? subj : `Re: ${subj}`);
+      const subj = lastInbound?.subject || `Re: ${selected.leadCompany}`;
+      setReplySubject(subj.toLowerCase().startsWith("re:") ? subj : `Re: ${subj}`);
       setReplyBody(lastInbound?.aiSuggestedReply || "");
     }
     setAiComment("");
     setShowCustomSchedule(false);
   }, [
-    selected?.leadId,
+    selected?.threadKey,
     pendingMsg?.id,
+    pendingMsg?.autoSendStatus,
     pendingMsg?.body,
     pendingMsg?.subject,
     pendingMsg?.scheduledSendAt,
+    lastTimelineMsg?.id,
+    lastTimelineMsg?.direction,
   ]);
 
   const scheduledCount = threads.filter((t) => t.autoSendStatus === "scheduled").length;
@@ -435,7 +480,11 @@ export function InboxPage({
     if (!selected) return;
     setGenerating(true);
     try {
-      await api.generateInboxReplyWithAi(selected.leadId, selected.campaignId);
+      await api.generateInboxReplyWithAi(
+        selected.leadId,
+        selected.campaignId,
+        selected.subject
+      );
       await onRefresh();
       notifications.show({ title: "AI válasz legenerálva", message: "", color: "forest" });
     } catch (e) {
@@ -486,9 +535,9 @@ export function InboxPage({
   };
 
   const insertBookingLink = () => {
-    const url = projects[0]?.bookingUrl;
+    const url = selectedProject?.bookingUrl;
     if (!url) {
-      notifications.show({ title: "Nincs foglaló link beállítva a projektben", message: "", color: "orange" });
+      notifications.show({ title: "Nincs foglaló link beállítva a projekthez", message: "", color: "orange" });
       return;
     }
     setReplyBody((prev) =>
@@ -497,11 +546,53 @@ export function InboxPage({
   };
 
   const insertLandingLink = () => {
-    const url = projects[0]?.landingUrl || projects[0]?.websiteUrl;
-    if (!url) return;
+    const url = selectedProject?.landingUrl || selectedProject?.websiteUrl;
+    if (!url) {
+      notifications.show({ title: "Nincs weboldal link beállítva a projekthez", message: "", color: "orange" });
+      return;
+    }
     setReplyBody((prev) =>
       prev ? `${prev}\n\nRészletek: ${url}` : `Részletek: ${url}`
     );
+  };
+
+  const openHistory = async () => {
+    if (!selected) return;
+    setHistoryOpen(true);
+    setHistoryLoading(true);
+    setHistoryMessages([]);
+    try {
+      const messages = await api.listLeadMessageHistory(selected.leadId);
+      setHistoryMessages(messages);
+    } catch (e) {
+      notifications.show({ title: "Előzmények betöltése sikertelen", message: String(e), color: "red" });
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  const handleDeleteConversation = async () => {
+    if (!selected) return;
+    setDeleting(true);
+    try {
+      const ids = selected.messages.map((m) => m.id);
+      await api.deleteInboxConversation(ids);
+      setDeleteOpen(false);
+      setHistoryOpen(false);
+      setSelectedThreadKey(
+        threads.find((t) => t.threadKey !== selected.threadKey)?.threadKey ?? null
+      );
+      notifications.show({
+        title: "Beszélgetés törölve",
+        message: `${selected.leadCompany} — ${selected.subject}`,
+        color: "forest",
+      });
+      await onRefresh();
+    } catch (e) {
+      notifications.show({ title: "Törlési hiba", message: String(e), color: "red" });
+    } finally {
+      setDeleting(false);
+    }
   };
 
   const isScheduled = pendingMsg?.autoSendStatus === "scheduled";
@@ -708,7 +799,7 @@ export function InboxPage({
                   </Text>
                 ) : (
                   filteredThreads.map((t) => {
-                    const active = selected?.leadId === t.leadId;
+                    const active = selected?.threadKey === t.threadKey;
                     const intentMeta = t.latestIntent ? INTENT_META[t.latestIntent] : null;
                     const prio = t.priorityScore ?? 50;
                     const prioColor =
@@ -722,9 +813,9 @@ export function InboxPage({
                     const tags = t.aiTags || [];
                     return (
                       <Box
-                        key={t.leadId}
+                        key={t.threadKey}
                         p="xs"
-                        onClick={() => setSelectedLeadId(t.leadId)}
+                        onClick={() => setSelectedThreadKey(t.threadKey)}
                         style={{
                           cursor: "pointer",
                           borderRadius: 6,
@@ -766,6 +857,14 @@ export function InboxPage({
                         <Text size="11px" c="dimmed" className="ml-mono" truncate mt={1}>
                           {t.leadEmail}
                         </Text>
+                        <Text size="11px" fw={600} truncate mt={2} title={t.subject}>
+                          {t.subject || "(nincs tárgy)"}
+                        </Text>
+                        {t.campaignName && (
+                          <Text size="10px" c="dimmed" truncate>
+                            {t.campaignName}
+                          </Text>
+                        )}
                         {t.decisionSummary && (
                           <Text size="11px" c="dimmed" lineClamp={1} mt={2} fw={500}>
                             {t.decisionSummary}
@@ -795,7 +894,7 @@ export function InboxPage({
                           )}
                           {t.hasPendingDraft && t.autoSendStatus !== "scheduled" && (
                             <Badge size="xs" variant="outline" color="gray">
-                              ⏸ Tervezet
+                              {t.pendingReplyId ? "⏸ Tervezet" : "Válaszra vár"}
                             </Badge>
                           )}
                         </Group>
@@ -851,6 +950,14 @@ export function InboxPage({
                   <Text size="xs" c="dimmed" className="ml-mono" truncate>
                     {selected.leadEmail}
                   </Text>
+                  <Text size="xs" fw={500} truncate maw={260} title={selected.subject}>
+                    {selected.subject}
+                  </Text>
+                  {selected.campaignName && (
+                    <Badge size="xs" variant="light" color="gray">
+                      {selected.campaignName}
+                    </Badge>
+                  )}
                   {selected.latestIntent && INTENT_META[selected.latestIntent] && (
                     <Badge size="xs" color={INTENT_META[selected.latestIntent].color}>
                       {INTENT_META[selected.latestIntent].label}
@@ -859,6 +966,21 @@ export function InboxPage({
                 </Group>
 
                 <Group gap={6} wrap="nowrap">
+                  <Tooltip label="Előzmények — minden beszélgetés ezzel a személlyel">
+                    <ActionIcon variant="default" size="md" onClick={openHistory}>
+                      <IconHistory size={14} />
+                    </ActionIcon>
+                  </Tooltip>
+                  <Tooltip label="Beszélgetés törlése">
+                    <ActionIcon
+                      variant="light"
+                      color="red"
+                      size="md"
+                      onClick={() => setDeleteOpen(true)}
+                    >
+                      <IconTrash size={14} />
+                    </ActionIcon>
+                  </Tooltip>
                   <Select
                     size="xs"
                     w={145}
@@ -1267,6 +1389,164 @@ export function InboxPage({
           )}
         </Box>
       )}
+
+      {/* Conversation delete confirmation */}
+      <Modal
+        opened={deleteOpen}
+        onClose={() => setDeleteOpen(false)}
+        title="Beszélgetés törlése"
+        size="sm"
+      >
+        <Stack gap="sm">
+          <Text size="sm">
+            Biztosan törlöd ezt a beszélgetést? A művelet nem visszavonható.
+          </Text>
+          {selected && (
+            <Paper p="xs" withBorder>
+              <Text size="xs" fw={600}>
+                {selected.subject || "(nincs tárgy)"}
+              </Text>
+              <Text size="xs" c="dimmed">
+                {selected.leadCompany} · {selected.leadEmail}
+              </Text>
+              <Text size="xs" c="dimmed">
+                {selected.messageCount} üzenet törlődik
+              </Text>
+            </Paper>
+          )}
+          <Text size="xs" c="dimmed">
+            Csak ez az egy beszélgetés törlődik. A személy többi beszélgetése és a lead
+            adatlapja megmarad.
+          </Text>
+          {selected?.autoSendStatus === "scheduled" && (
+            <Text size="xs" c="orange.9" fw={500}>
+              A beszélgetéshez tartozó időzített válasz is törlődik, így az nem kerül
+              kiküldésre.
+            </Text>
+          )}
+          <Group justify="flex-end">
+            <Button variant="default" onClick={() => setDeleteOpen(false)}>
+              Mégse
+            </Button>
+            <Button
+              color="red"
+              loading={deleting}
+              leftSection={<IconTrash size={14} />}
+              onClick={handleDeleteConversation}
+            >
+              Törlés
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
+
+      {/* Full history with this person across all conversations */}
+      <Modal
+        opened={historyOpen}
+        onClose={() => setHistoryOpen(false)}
+        title={
+          selected
+            ? `Előzmények — ${selected.leadCompany}`
+            : "Előzmények"
+        }
+        size="xl"
+      >
+        {historyLoading ? (
+          <Text size="sm" c="dimmed">
+            Betöltés…
+          </Text>
+        ) : historyMessages.length === 0 ? (
+          <Text size="sm" c="dimmed">
+            Nincs korábbi üzenet ezzel a személlyel.
+          </Text>
+        ) : (
+          <Stack gap="xs">
+            <Text size="xs" c="dimmed">
+              {selected?.leadEmail} — összesen {historyMessages.length} üzenet, minden
+              beszélgetéssel együtt.
+            </Text>
+            <ScrollArea h={520} type="auto">
+              <Stack gap="xs" pr="xs">
+                {historyMessages.map((m) => {
+                  const inbound = m.direction === "inbound";
+                  const containingThread = threads.find((t) =>
+                    t.messages.some((tm) => tm.id === m.id)
+                  );
+                  const statusLabel =
+                    m.status === "sent"
+                      ? "Elküldve"
+                      : m.status === "received"
+                      ? "Beérkezett"
+                      : m.status === "queued"
+                      ? "Időzítve"
+                      : m.status === "draft"
+                      ? "Tervezet"
+                      : m.status === "failed"
+                      ? "Hiba"
+                      : m.status;
+                  return (
+                    <Paper key={m.id} p="sm" withBorder>
+                      <Group justify="space-between" wrap="wrap" gap={4} mb={4}>
+                        <Group gap={6} wrap="wrap">
+                          <Badge
+                            size="xs"
+                            color={inbound ? "forest" : "gray"}
+                            variant={inbound ? "filled" : "light"}
+                          >
+                            {inbound ? "Beérkező" : "Kimenő"}
+                          </Badge>
+                          <Text size="xs" fw={600}>
+                            {m.subject || "(nincs tárgy)"}
+                          </Text>
+                          {m.campaignName && (
+                            <Badge
+                              size="xs"
+                              variant="outline"
+                              color="gray"
+                              style={{ textTransform: "none" }}
+                            >
+                              {m.campaignName}
+                            </Badge>
+                          )}
+                          {m.status !== "sent" && m.status !== "received" && (
+                            <Badge
+                              size="xs"
+                              color={m.status === "failed" ? "red" : "yellow"}
+                              variant="light"
+                            >
+                              {statusLabel}
+                            </Badge>
+                          )}
+                        </Group>
+                        <Group gap={6} wrap="nowrap">
+                          <Text size="11px" c="dimmed" className="ml-tabular">
+                            {formatShortDate(m.sentAt || m.createdAt)}
+                          </Text>
+                          {containingThread && (
+                            <Button
+                              size="compact-xs"
+                              variant="subtle"
+                              onClick={() => {
+                                setSelectedThreadKey(containingThread.threadKey);
+                                setHistoryOpen(false);
+                              }}
+                            >
+                              Beszélgetés megnyitása
+                            </Button>
+                          )}
+                        </Group>
+                      </Group>
+                      <Text size="sm" style={{ whiteSpace: "pre-wrap", lineHeight: 1.5 }}>
+                        {m.body}
+                      </Text>
+                    </Paper>
+                  );
+                })}
+              </Stack>
+            </ScrollArea>
+          </Stack>
+        )}
+      </Modal>
 
       {/* Direct New Message Modal */}
       <DirectEmailModal

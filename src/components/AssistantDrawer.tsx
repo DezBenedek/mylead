@@ -80,7 +80,15 @@ export function AssistantDrawer({
   const [elapsedSec, setElapsedSec] = useState(0);
   const activeRequestIdRef = useRef<number>(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+
+  // Amint megnyílik az asszisztens, a kurzor egyből a prompt mezőben legyen.
+  useEffect(() => {
+    if (!opened) return;
+    const t = window.setTimeout(() => textareaRef.current?.focus(), 60);
+    return () => window.clearTimeout(t);
+  }, [opened]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -531,26 +539,34 @@ export function AssistantDrawer({
           </Paper>
         )}
 
-        <Group align="flex-end" gap="xs" wrap="nowrap">
+        {/* Egyetlen lekerekített prompt mező: bal oldalt a csatolás, jobb oldalt a küldés. */}
+        <Box className="ml-assistant-composer">
           <ActionIcon
-            size="lg"
-            variant="default"
+            size="md"
+            radius="xl"
+            variant="subtle"
+            color="gray"
             title="CSV feltöltése (leadek betöltése és azonnali átnézése)"
             disabled={busy}
             onClick={() => fileInputRef.current?.click()}
+            style={{ flexShrink: 0, marginBottom: 2 }}
           >
-            <IconPaperclip size={16} />
+            <IconPaperclip size={18} />
           </ActionIcon>
           <Textarea
+            ref={textareaRef}
+            variant="unstyled"
+            autoFocus
             placeholder={
               attachedCsv
                 ? "Opcionális szempont a CSV kiértékeléshez (pl. nézd meg, van-e online foglalójuk)..."
                 : "Írj parancsot vagy tölts fel CSV-t..."
             }
-            minRows={2}
+            minRows={1}
             maxRows={5}
             autosize
-            style={{ flex: 1 }}
+            style={{ flex: 1, minWidth: 0 }}
+            styles={{ input: { padding: "8px 4px", fontSize: 13, lineHeight: 1.5 } }}
             value={input}
             onChange={(e) => setInput(e.currentTarget.value)}
             onKeyDown={(e) => {
@@ -560,15 +576,21 @@ export function AssistantDrawer({
               }
             }}
           />
-          <Button
-            leftSection={<IconSend size={14} />}
+          <ActionIcon
+            size="md"
+            radius="xl"
+            variant="filled"
+            color="forest"
+            title={attachedCsv ? "Kiértékelés" : "Küldés"}
+            aria-label={attachedCsv ? "Kiértékelés" : "Küldés"}
             loading={busy}
             disabled={!input.trim() && !attachedCsv}
             onClick={() => sendMessage()}
+            style={{ flexShrink: 0, marginBottom: 2 }}
           >
-            {attachedCsv ? "Kiértékelés" : "Küldés"}
-          </Button>
-        </Group>
+            <IconSend size={16} />
+          </ActionIcon>
+        </Box>
       </Box>
     </Drawer>
   );

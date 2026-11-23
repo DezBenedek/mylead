@@ -11,6 +11,102 @@ pub struct Database {
     pub conn: Mutex<Connection>,
 }
 
+/// Strips mail client reply/forward prefixes so that "Re: Foo" and "Foo"
+/// belong to the same subject-based conversation.
+pub(crate) fn normalize_subject_root(subject: &str) -> String {
+    let mut current = subject.trim().to_lowercase();
+    loop {
+        let trimmed = current.trim_start();
+        let mut stripped = false;
+        for prefix in ["re:", "fw:", "fwd:", "aw:", "sv:", "válasz:"] {
+            if let Some(rest) = trimmed.strip_prefix(prefix) {
+                current = rest.trim_start().to_string();
+                stripped = true;
+                break;
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+    let cleaned = current.split_whitespace().collect::<Vec<_>>().join(" ");
+    if cleaned.is_empty() {
+        "nincs tárgy".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn normalize_message_id(id: &str) -> String {
+    id.trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim()
+        .to_lowercase()
+}
+
+/// A conversation is either scoped to a campaign (outreach thread) or, for
+/// direct e-mails without a campaign, to the normalized subject.
+fn conversation_base_key(msg: &EmailMessage) -> String {
+    match msg.campaign_id.as_deref().filter(|c| !c.trim().is_empty()) {
+        Some(campaign_id) => format!("{}|campaign:{}", msg.lead_id, campaign_id),
+        None => format!(
+            "{}|direct:{}",
+            msg.lead_id,
+            normalize_subject_root(&msg.subject)
+        ),
+    }
+}
+
+fn find_conversation_root(parents: &mut HashMap<String, String>, key: &str) -> String {
+    let mut root = key.to_string();
+    loop {
+        let next = parents
+            .get(&root)
+            .cloned()
+            .unwrap_or_else(|| root.clone());
+        if next == root {
+            break;
+        }
+        root = next;
+    }
+    // Path compression so repeated lookups stay cheap.
+    let mut cursor = key.to_string();
+    while cursor != root {
+        let next = parents
+            .get(&cursor)
+            .cloned()
+            .unwrap_or_else(|| root.clone());
+        parents.insert(cursor.clone(), root.clone());
+        cursor = next;
+    }
+    root
+}
+
+fn union_conversations(parents: &mut HashMap<String, String>, a: &str, b: &str) {
+    let root_a = find_conversation_root(parents, a);
+    let root_b = find_conversation_root(parents, b);
+    if root_a == root_b {
+        return;
+    }
+    // Keep the lexicographically smaller key as root so the result is stable.
+    if root_a <= root_b {
+        parents.insert(root_b, root_a);
+    } else {
+        parents.insert(root_a, root_b);
+    }
+}
+
+/// Messages that belong on the Beérkező (inbox) screen. Plain step-1 campaign
+/// drafts are managed on the Campaigns page and should not define a thread's
+/// visible subject or date.
+fn is_inbox_visible_message(msg: &EmailMessage) -> bool {
+    msg.status == "sent"
+        || msg.status == "received"
+        || msg.status == "queued"
+        || (msg.status == "draft" && (msg.step_number >= 2 || msg.auto_send_status.is_some()))
+}
+
 impl Database {
     pub fn open(path: &Path) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
@@ -1566,6 +1662,65 @@ impl Database {
         Ok(())
     }
 
+    pub fn delete_email_messages(&self, ids: &[String]) -> Result<usize, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let mut deleted = 0usize;
+        {
+            let mut stmt = tx
+                .prepare("DELETE FROM email_messages WHERE id = ?1")
+                .map_err(|e| e.to_string())?;
+            for id in ids {
+                deleted += stmt.execute(params![id]).map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(deleted)
+    }
+
+    pub fn find_email_message_by_header(
+        &self,
+        message_id_header: &str,
+    ) -> Result<Option<EmailMessage>, String> {
+        let normalized = normalize_message_id(message_id_header);
+        if normalized.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT em.id, em.campaign_id, c.name, em.lead_id, l.company_name, l.primary_email,
+                       em.direction, em.status, em.step_number, em.subject, em.body,
+                       em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
+                       em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
+                       em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note,
+                       em.ai_priority_score, em.ai_tags
+                FROM email_messages em
+                JOIN leads l ON l.id = em.lead_id
+                LEFT JOIN campaigns c ON c.id = em.campaign_id
+                WHERE em.message_id_header IS NOT NULL
+                ORDER BY em.created_at ASC
+                "#,
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], Self::map_email_row)
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            let msg = row.map_err(|e| e.to_string())?;
+            if msg
+                .message_id_header
+                .as_deref()
+                .map(normalize_message_id)
+                .is_some_and(|header| header == normalized)
+            {
+                return Ok(Some(msg));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn list_lead_messages(&self, lead_id: &str) -> Result<Vec<EmailMessage>, String> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
@@ -1811,23 +1966,92 @@ impl Database {
             })
             .map_err(|e| e.to_string())?;
 
-        let mut map: HashMap<String, InboxThread> = HashMap::new();
+        struct LoadedMessage {
+            message: EmailMessage,
+            offer_title: Option<String>,
+            lead_status: String,
+            fit_score: i64,
+        }
+
+        let mut loaded: Vec<LoadedMessage> = Vec::new();
         for row in rows {
-            let (msg, offer_title, lead_status, fit_score) = row.map_err(|e| e.to_string())?;
-            let ts = msg.sent_at.clone().unwrap_or_else(|| msg.created_at.clone());
-            let entry = map.entry(msg.lead_id.clone()).or_insert_with(|| InboxThread {
-                lead_id: msg.lead_id.clone(),
-                lead_company: msg.lead_company.clone(),
-                lead_email: msg.lead_email.clone(),
+            let (message, offer_title, lead_status, fit_score) = row.map_err(|e| e.to_string())?;
+            loaded.push(LoadedMessage {
+                message,
+                offer_title,
                 lead_status,
                 fit_score,
-                campaign_id: msg.campaign_id.clone(),
-                campaign_name: msg.campaign_name.clone(),
-                offer_title: offer_title.clone(),
-                last_message_at: ts.clone(),
-                last_direction: msg.direction.clone(),
-                latest_intent: msg.ai_intent.clone(),
-                priority_score: (fit_score / 2).clamp(20, 48),
+            });
+        }
+
+        // Resolve which messages belong to the same conversation. Replies inherit
+        // the conversation of the message they answer when the In-Reply-To header
+        // points to a message we know about, so a changed subject does not split
+        // a real thread. Independent conversations of the same lead stay separate.
+        let mut parents: HashMap<String, String> = HashMap::new();
+        let mut header_to_base: HashMap<String, String> = HashMap::new();
+        for item in &loaded {
+            let base = conversation_base_key(&item.message);
+            parents.entry(base.clone()).or_insert(base.clone());
+            if let Some(header) = item.message.message_id_header.as_deref() {
+                let normalized = normalize_message_id(header);
+                if !normalized.is_empty() {
+                    header_to_base.entry(normalized).or_insert(base);
+                }
+            }
+        }
+        for item in &loaded {
+            if let Some(parent_header) = item.message.in_reply_to.as_deref() {
+                let normalized = normalize_message_id(parent_header);
+                if let Some(parent_base) = header_to_base.get(&normalized) {
+                    let base = conversation_base_key(&item.message);
+                    union_conversations(&mut parents, &base, parent_base);
+                }
+            }
+        }
+
+        let mut grouped: HashMap<String, Vec<LoadedMessage>> = HashMap::new();
+        for item in loaded {
+            let base = conversation_base_key(&item.message);
+            let root = find_conversation_root(&mut parents, &base);
+            grouped.entry(root).or_default().push(item);
+        }
+
+        let mut threads: Vec<InboxThread> = Vec::new();
+        for mut items in grouped.into_values() {
+            items.sort_by(|a, b| {
+                let a_ts = a.message.sent_at.as_deref().unwrap_or(&a.message.created_at);
+                let b_ts = b.message.sent_at.as_deref().unwrap_or(&b.message.created_at);
+                a_ts.cmp(b_ts)
+            });
+
+            let visible = items
+                .iter()
+                .any(|item| is_inbox_visible_message(&item.message));
+            if !visible || items.is_empty() {
+                continue;
+            }
+
+            let first = &items[0];
+            let first_message = &first.message;
+            let mut entry = InboxThread {
+                thread_key: conversation_base_key(first_message),
+                lead_id: first_message.lead_id.clone(),
+                lead_company: first_message.lead_company.clone(),
+                lead_email: first_message.lead_email.clone(),
+                lead_status: first.lead_status.clone(),
+                fit_score: first.fit_score,
+                campaign_id: first_message.campaign_id.clone(),
+                campaign_name: first_message.campaign_name.clone(),
+                offer_title: first.offer_title.clone(),
+                subject: first_message.subject.clone(),
+                last_message_at: first_message
+                    .sent_at
+                    .clone()
+                    .unwrap_or_else(|| first_message.created_at.clone()),
+                last_direction: first_message.direction.clone(),
+                latest_intent: first_message.ai_intent.clone(),
+                priority_score: (first.fit_score / 2).clamp(20, 48),
                 ai_tags: vec![],
                 decision_summary: None,
                 has_pending_draft: false,
@@ -1837,86 +2061,88 @@ impl Database {
                 booking_link_sent: false,
                 message_count: 0,
                 messages: vec![],
-            });
-            entry.last_message_at = ts;
-            entry.last_direction = msg.direction.clone();
-            if msg.ai_intent.is_some() {
-                entry.latest_intent = msg.ai_intent.clone();
-            }
-            if msg.direction == "inbound" {
-                if msg.ai_priority_score > 0 {
-                    entry.priority_score = msg.ai_priority_score;
-                } else if let Some(ref intent) = msg.ai_intent {
-                    entry.priority_score = match intent.as_str() {
-                        "booking_request" => 94,
-                        "interested" => 85,
-                        "question" => 74,
-                        "objection" => 58,
-                        "not_interested" => 22,
-                        "unsubscribe" => 10,
-                        "out_of_office" => 15,
-                        _ => 52,
-                    };
+            };
+
+            for item in items {
+                let msg = item.message;
+                let ts = msg.sent_at.clone().unwrap_or_else(|| msg.created_at.clone());
+                if is_inbox_visible_message(&msg) {
+                    entry.last_message_at = ts;
+                    entry.last_direction = msg.direction.clone();
+                    entry.subject = msg.subject.clone();
                 }
-                if !msg.ai_tags.is_empty() {
-                    entry.ai_tags = msg.ai_tags.clone();
-                } else if entry.ai_tags.is_empty() {
-                    if let Some(ref intent) = msg.ai_intent {
-                        entry.ai_tags = match intent.as_str() {
-                            "booking_request" => vec!["Időpontkérés".to_string(), "Forró lead".to_string()],
-                            "interested" => vec!["Érdeklődik".to_string(), "Potenciális ügyfél".to_string()],
-                            "question" => vec!["Kérdés".to_string(), "Válaszra vár".to_string()],
-                            "objection" => vec!["Kifogás".to_string(), "Utánkövetendő".to_string()],
-                            "not_interested" => vec!["Elutasítás".to_string()],
-                            "unsubscribe" => vec!["Leiratkozás".to_string()],
-                            _ => vec!["Beérkező".to_string()],
+                if msg.ai_intent.is_some() {
+                    entry.latest_intent = msg.ai_intent.clone();
+                }
+                if msg.direction == "inbound" {
+                    if msg.ai_priority_score > 0 {
+                        entry.priority_score = msg.ai_priority_score;
+                    } else if let Some(ref intent) = msg.ai_intent {
+                        entry.priority_score = match intent.as_str() {
+                            "booking_request" => 94,
+                            "interested" => 85,
+                            "question" => 74,
+                            "objection" => 58,
+                            "not_interested" => 22,
+                            "unsubscribe" => 10,
+                            "out_of_office" => 15,
+                            _ => 52,
                         };
                     }
+                    if !msg.ai_tags.is_empty() {
+                        entry.ai_tags = msg.ai_tags.clone();
+                    } else if entry.ai_tags.is_empty() {
+                        if let Some(ref intent) = msg.ai_intent {
+                            entry.ai_tags = match intent.as_str() {
+                                "booking_request" => vec!["Időpontkérés".to_string(), "Forró lead".to_string()],
+                                "interested" => vec!["Érdeklődik".to_string(), "Potenciális ügyfél".to_string()],
+                                "question" => vec!["Kérdés".to_string(), "Válaszra vár".to_string()],
+                                "objection" => vec!["Kifogás".to_string(), "Utánkövetendő".to_string()],
+                                "not_interested" => vec!["Elutasítás".to_string()],
+                                "unsubscribe" => vec!["Leiratkozás".to_string()],
+                                _ => vec!["Beérkező".to_string()],
+                            };
+                        }
+                    }
+                    if msg.ai_summary.as_ref().is_some_and(|s| !s.trim().is_empty()) {
+                        entry.decision_summary = msg.ai_summary.clone();
+                    }
                 }
-                if msg.ai_summary.as_ref().is_some_and(|s| !s.trim().is_empty()) {
-                    entry.decision_summary = msg.ai_summary.clone();
+                if item.offer_title.is_some() {
+                    entry.offer_title = item.offer_title;
                 }
+                if msg.direction == "outbound" && (msg.status == "queued" || (msg.status == "draft" && (msg.step_number >= 2 || msg.auto_send_status.is_some()))) {
+                    entry.has_pending_draft = true;
+                    entry.pending_reply_id = Some(msg.id.clone());
+                    entry.scheduled_send_at = msg.scheduled_send_at.clone();
+                    entry.auto_send_status = msg.auto_send_status.clone();
+                } else if msg.direction == "inbound" && msg.ai_suggested_reply.as_ref().is_some_and(|s| !s.is_empty()) {
+                    entry.has_pending_draft = true;
+                }
+                if msg.direction == "outbound" && msg.status == "sent" {
+                    entry.has_pending_draft = false;
+                    entry.pending_reply_id = None;
+                    entry.scheduled_send_at = None;
+                    entry.auto_send_status = None;
+                }
+                if msg.booking_link_sent {
+                    entry.booking_link_sent = true;
+                }
+                if msg.campaign_id.is_some() {
+                    entry.campaign_id = msg.campaign_id.clone();
+                    entry.campaign_name = msg.campaign_name.clone();
+                }
+                entry.message_count += 1;
+                entry.messages.push(msg);
             }
-            if offer_title.is_some() {
-                entry.offer_title = offer_title;
-            }
-            if msg.direction == "outbound" && (msg.status == "queued" || (msg.status == "draft" && (msg.step_number >= 2 || msg.auto_send_status.is_some()))) {
-                entry.has_pending_draft = true;
-                entry.pending_reply_id = Some(msg.id.clone());
-                entry.scheduled_send_at = msg.scheduled_send_at.clone();
-                entry.auto_send_status = msg.auto_send_status.clone();
-            } else if msg.direction == "inbound" && msg.ai_suggested_reply.as_ref().is_some_and(|s| !s.is_empty()) {
-                entry.has_pending_draft = true;
-            }
-            if msg.direction == "outbound" && msg.status == "sent" {
-                entry.has_pending_draft = false;
-                entry.pending_reply_id = None;
-                entry.scheduled_send_at = None;
-                entry.auto_send_status = None;
-            }
-            if msg.booking_link_sent {
-                entry.booking_link_sent = true;
-            }
-            if msg.campaign_id.is_some() {
-                entry.campaign_id = msg.campaign_id.clone();
-                entry.campaign_name = msg.campaign_name.clone();
-            }
-            entry.message_count += 1;
-            entry.messages.push(msg);
+            threads.push(entry);
         }
 
-        let mut threads: Vec<InboxThread> = map
-            .into_values()
-            .filter(|t| {
-                t.messages.iter().any(|m| {
-                    m.status == "sent"
-                        || m.status == "received"
-                        || m.status == "queued"
-                        || (m.status == "draft" && (m.step_number >= 2 || m.auto_send_status.is_some()))
-                })
-            })
-            .collect();
-        threads.sort_by(|a, b| b.last_message_at.cmp(&a.last_message_at));
+        threads.sort_by(|a, b| {
+            b.last_message_at
+                .cmp(&a.last_message_at)
+                .then_with(|| a.thread_key.cmp(&b.thread_key))
+        });
         Ok(threads)
     }
 
@@ -2152,5 +2378,90 @@ impl Database {
         )
         .map_err(|e| e.to_string())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_lead_can_have_separate_conversations() {
+        let db_path = std::env::temp_dir().join(format!("mylead-test-{}.sqlite", Uuid::new_v4()));
+        let db = Database::open(&db_path).unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO projects (id, name, created_at, updated_at) VALUES ('p1','P','2026-01-01','2026-01-01')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO leads (id, company_name, primary_email, created_at, updated_at) VALUES ('l1','Acme','a@acme.hu','2026-01-01','2026-01-01')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO campaigns (id, name, project_id, created_at, updated_at) VALUES ('c1','C','p1','2026-01-01','2026-01-01')",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Campaign conversation: outbound, inbound reply with a changed scope,
+        // then a pending AI answer.
+        db.insert_email_message_full(
+            Some("c1"), "l1", "outbound", "sent", 1, "Outreach A", "Hello",
+            Some("<out-1@acme.hu>"), None, None, None, false,
+            Some("2026-01-01T10:00:00Z"), None, None, None, None,
+        )
+        .unwrap();
+        db.insert_email_message_full(
+            None, "l1", "inbound", "received", 1, "Re: Outreach A", "Hi",
+            Some("<in-1@acme.hu>"), Some("<out-1@acme.hu>"), Some("interested"),
+            Some("Reply"), false, Some("2026-01-01T11:00:00Z"), None, None, None, None,
+        )
+        .unwrap();
+        db.insert_email_message_full(
+            None, "l1", "outbound", "draft", 2, "Re: Outreach A", "Draft",
+            None, Some("<in-1@acme.hu>"), None, None, false, None, None,
+            Some("paused"), None, None,
+        )
+        .unwrap();
+
+        // Independent direct conversation with the same person.
+        db.insert_email_message_full(
+            None, "l1", "outbound", "sent", 1, "Direct B", "Yo",
+            Some("<out-2@acme.hu>"), None, None, None, false,
+            Some("2026-01-02T10:00:00Z"), None, None, None, None,
+        )
+        .unwrap();
+        db.insert_email_message_full(
+            None, "l1", "inbound", "received", 1, "Re: Direct B", "Hey",
+            Some("<in-2@acme.hu>"), Some("<out-2@acme.hu>"), None, None, false,
+            Some("2026-01-02T11:00:00Z"), None, None, None, None,
+        )
+        .unwrap();
+
+        let threads = db.list_inbox_threads().unwrap();
+        assert_eq!(threads.len(), 2, "the two conversations must be separate");
+
+        let campaign_thread = threads
+            .iter()
+            .find(|t| t.campaign_id.as_deref() == Some("c1"))
+            .expect("campaign conversation");
+        assert_eq!(campaign_thread.messages.len(), 3);
+        assert!(campaign_thread.has_pending_draft);
+        assert!(campaign_thread.pending_reply_id.is_some());
+
+        let direct_thread = threads
+            .iter()
+            .find(|t| t.campaign_id.is_none())
+            .expect("direct conversation");
+        assert_eq!(direct_thread.messages.len(), 2);
+        assert!(!direct_thread.has_pending_draft);
+        assert_ne!(campaign_thread.thread_key, direct_thread.thread_key);
+
+        std::fs::remove_file(&db_path).ok();
     }
 }
