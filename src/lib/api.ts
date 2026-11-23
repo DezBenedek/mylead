@@ -164,7 +164,8 @@ export const api = {
     subject: string,
     body: string,
     dryRun: boolean,
-    pendingMessageId?: string | null
+    pendingMessageId?: string | null,
+    threadKey?: string | null
   ) =>
     invoke<InboxThread>("send_inbox_reply", {
       leadId,
@@ -173,6 +174,7 @@ export const api = {
       body,
       dryRun,
       pendingMessageId: pendingMessageId || null,
+      threadKey: threadKey || null,
     }),
   saveInboxReplyDraft: (
     messageId: string | null,
@@ -180,7 +182,8 @@ export const api = {
     campaignId: string | null,
     subject: string,
     body: string,
-    keepScheduled: boolean
+    keepScheduled: boolean,
+    threadKey?: string | null
   ) =>
     invoke<InboxThread>("save_inbox_reply_draft", {
       messageId: messageId || null,
@@ -189,6 +192,7 @@ export const api = {
       subject,
       body,
       keepScheduled,
+      threadKey: threadKey || null,
     }),
   controlScheduledReply: (
     messageId: string,
@@ -207,7 +211,8 @@ export const api = {
     messageId: string | null,
     currentSubject: string,
     currentBody: string,
-    instruction: string
+    instruction: string,
+    threadKey?: string | null
   ) =>
     invoke<GeneratedEmail>("rewrite_inbox_reply_with_ai", {
       leadId,
@@ -215,16 +220,19 @@ export const api = {
       currentSubject,
       currentBody,
       instruction,
+      threadKey: threadKey || null,
     }),
   generateInboxReplyWithAi: (
     leadId: string,
     campaignId?: string | null,
-    subject?: string | null
+    subject?: string | null,
+    threadKey?: string | null
   ) =>
     invoke<InboxThread>("generate_inbox_reply_with_ai", {
       leadId,
       campaignId: campaignId || null,
       subject: subject || null,
+      threadKey: threadKey || null,
     }),
 
   // Sender Accounts & Settings

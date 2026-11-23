@@ -25,6 +25,7 @@ import {
 import { notifications } from "@mantine/notifications";
 import {
   IconDownload,
+  IconExternalLink,
   IconMail,
   IconPlus,
   IconRefresh,
@@ -35,6 +36,7 @@ import {
 import { AddToCampaignModal } from "../components/AddToCampaignModal";
 import { DirectEmailModal } from "../components/DirectEmailModal";
 import { api, LEAD_STATUS_META } from "../lib/api";
+import { openExternalUrl } from "../lib/openExternal";
 import type {
   AppSettings,
   Campaign,
@@ -591,6 +593,33 @@ export function LeadsPage({
                         </Table.Td>
                         <Table.Td ta="right" onClick={(e) => e.stopPropagation()}>
                           <Group gap={4} justify="flex-end" wrap="nowrap">
+                            <Tooltip
+                              label={
+                                l.websiteUrl || l.domain
+                                  ? `Weboldal megnyitása (${l.websiteUrl || l.domain})`
+                                  : "Nincs weboldal megadva"
+                              }
+                            >
+                              <ActionIcon
+                                size="sm"
+                                variant="subtle"
+                                color="gray"
+                                disabled={!l.websiteUrl && !l.domain}
+                                onClick={async () => {
+                                  const res = await openExternalUrl(l.websiteUrl || l.domain);
+                                  if (!res.ok) {
+                                    notifications.show({
+                                      title: "Megnyitás sikertelen",
+                                      message: `${l.websiteUrl || l.domain || ""}${res.error ? ` — ${res.error}` : ""}`,
+                                      color: "red",
+                                      autoClose: 8000,
+                                    });
+                                  }
+                                }}
+                              >
+                                <IconExternalLink size={14} />
+                              </ActionIcon>
+                            </Tooltip>
                             <Tooltip label="Mély kutatás / Okosűrlap elemzés (párhuzamosan is indítható)">
                               <ActionIcon
                                 size="sm"

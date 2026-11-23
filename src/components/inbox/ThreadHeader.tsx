@@ -55,6 +55,13 @@ export function ThreadHeader({
         {thread.subject}
       </Text>
       <Group gap={4} wrap="nowrap">
+        {thread.hasSubjectChange && (
+          <Tooltip label="A beszélgetésben több eltérő tárgy szerepel — ellenőrizd, hogy nem keveredett-e össze két beszélgetés.">
+            <Badge size="xs" variant="light" color="orange">
+              Több tárgy
+            </Badge>
+          </Tooltip>
+        )}
         {thread.hasPendingDraft && (
           <Badge size="xs" variant="dot" color={thread.autoSendStatus === "scheduled" ? "yellow" : "gray"}>
             {thread.autoSendStatus === "scheduled" ? "Időzítve" : "Tervezet"}

@@ -407,7 +407,8 @@ export function InboxPage({
         selected.campaignId,
         replySubject.trim() || `Re: ${selected.leadCompany}`,
         replyBody.trim(),
-        keepScheduled
+        keepScheduled,
+        selected.threadKey
       );
       await onRefresh();
       notifications.show({
@@ -432,7 +433,8 @@ export function InboxPage({
         pendingMsg?.id || null,
         replySubject,
         replyBody,
-        instr
+        instr,
+        selected.threadKey
       );
       setReplySubject(rewritten.subject);
       setReplyBody(rewritten.body);
@@ -453,7 +455,8 @@ export function InboxPage({
       await api.generateInboxReplyWithAi(
         selected.leadId,
         selected.campaignId,
-        selected.subject
+        selected.subject,
+        selected.threadKey
       );
       await onRefresh();
       notifications.show({ title: "AI válasz legenerálva", message: "", color: "forest" });
@@ -474,7 +477,8 @@ export function InboxPage({
         replySubject,
         replyBody,
         false,
-        pendingMsg?.id || null
+        pendingMsg?.id || null,
+        selected.threadKey
       );
       await onRefresh();
       setReplyBody("");

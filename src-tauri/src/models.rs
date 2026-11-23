@@ -391,6 +391,10 @@ pub struct EmailMessage {
     pub body: String,
     pub message_id_header: Option<String>,
     pub in_reply_to: Option<String>,
+    /// Stabil, perzisztált beszélgetés-azonosító. Egy leadhez több párhuzamos
+    /// beszélgetés is tartozhat; a válaszok ezt öröklik az In-Reply-To alapján.
+    #[serde(default)]
+    pub thread_key: Option<String>,
     pub ai_intent: Option<String>, // interested | booking_request | question | objection | not_interested | out_of_office | unsubscribe
     pub ai_suggested_reply: Option<String>,
     pub booking_link_sent: bool,
@@ -414,8 +418,9 @@ pub struct EmailMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InboxThread {
-    /// Stable identifier of one conversation (lead + campaign / subject thread).
-    /// A single lead can have several separate conversations.
+    /// Stabil, perzisztált beszélgetés-azonosító (email_messages.thread_key).
+    /// A válaszok az In-Reply-To láncon keresztül öröklik; egy leadhez több
+    /// párhuzamos beszélgetés is tartozhat.
     #[serde(default)]
     pub thread_key: String,
     pub lead_id: String,
@@ -447,6 +452,10 @@ pub struct InboxThread {
     #[serde(default)]
     pub auto_send_status: Option<String>,
     pub booking_link_sent: bool,
+    /// Igaz, ha a beszélgetésben egynél több eltérő tárgy szerepel. Ilyenkor
+    /// érdemes ellenőrizni, hogy nem keveredett-e össze két beszélgetés.
+    #[serde(default)]
+    pub has_subject_change: bool,
     pub message_count: i64,
     pub messages: Vec<EmailMessage>,
 }

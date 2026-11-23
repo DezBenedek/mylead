@@ -37,7 +37,7 @@ pub(crate) fn normalize_subject_root(subject: &str) -> String {
     }
 }
 
-fn normalize_message_id(id: &str) -> String {
+pub(crate) fn normalize_message_id(id: &str) -> String {
     id.trim()
         .trim_start_matches('<')
         .trim_end_matches('>')
@@ -45,55 +45,168 @@ fn normalize_message_id(id: &str) -> String {
         .to_lowercase()
 }
 
-/// A conversation is either scoped to a campaign (outreach thread) or, for
-/// direct e-mails without a campaign, to the normalized subject.
-fn conversation_base_key(msg: &EmailMessage) -> String {
-    match msg.campaign_id.as_deref().filter(|c| !c.trim().is_empty()) {
-        Some(campaign_id) => format!("{}|campaign:{}", msg.lead_id, campaign_id),
-        None => format!(
-            "{}|direct:{}",
-            msg.lead_id,
-            normalize_subject_root(&msg.subject)
-        ),
-    }
+/// Egy kampányon belüli outreach-beszélgetés stabil azonosítója.
+/// A leadet is tartalmazza, mert ugyanaz a kampány minden leadnél külön
+/// beszélgetést jelent.
+fn campaign_thread_key(lead_id: &str, campaign_id: &str) -> String {
+    format!("campaign:{}:{}", lead_id, campaign_id)
 }
 
-fn find_conversation_root(parents: &mut HashMap<String, String>, key: &str) -> String {
-    let mut root = key.to_string();
-    loop {
-        let next = parents
-            .get(&root)
-            .cloned()
-            .unwrap_or_else(|| root.clone());
-        if next == root {
-            break;
+fn new_direct_thread_key(lead_id: &str) -> String {
+    format!("direct:{}:{}", lead_id, Uuid::new_v4())
+}
+
+/// Régi (thread_key nélküli) adatbázis egyszeri migrálása.
+///
+/// A beszélgetéseket a lehető legpontosabban állítja helyre:
+/// 1. In-Reply-To / Message-ID lánc → a válasz a szülő beszélgetésébe kerül.
+/// 2. Kampánylevelek → lead + kampány szerinti outreach-beszélgetés.
+/// 3. Kampány nélküli, szülő nélküli levél → új önálló beszélgetés. Kivétel a
+///    bejövő levél, amelynek a tárgya egy korábbi közvetlen beszélgetéshez
+///    illeszkedik (régi kliens, ami nem küld In-Reply-To fejlécet).
+fn backfill_thread_keys(conn: &rusqlite::Connection) -> Result<(), String> {
+    struct LegacyMessage {
+        id: String,
+        lead_id: String,
+        campaign_id: Option<String>,
+        direction: String,
+        subject: String,
+        message_id_header: Option<String>,
+        in_reply_to: Option<String>,
+        thread_key: Option<String>,
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, lead_id, campaign_id, direction, subject, message_id_header, in_reply_to, thread_key
+             FROM email_messages
+             ORDER BY COALESCE(sent_at, created_at) ASC, created_at ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(LegacyMessage {
+                id: r.get(0)?,
+                lead_id: r.get(1)?,
+                campaign_id: r.get(2)?,
+                direction: r.get(3)?,
+                subject: r.get(4)?,
+                message_id_header: r.get(5)?,
+                in_reply_to: r.get(6)?,
+                thread_key: r.get(7)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut messages: Vec<LegacyMessage> = Vec::new();
+    for row in rows {
+        messages.push(row.map_err(|e| e.to_string())?);
+    }
+    drop(stmt);
+
+    let mut header_to_thread: HashMap<String, String> = HashMap::new();
+    // (lead_id, normalizált tárgy) → közvetlen beszélgetés kulcsa
+    let mut direct_subject_thread: HashMap<(String, String), String> = HashMap::new();
+    let mut updates: Vec<(String, String)> = Vec::new();
+
+    for msg in &messages {
+        let mut key = msg
+            .thread_key
+            .clone()
+            .filter(|k| !k.trim().is_empty());
+        if key.is_none() {
+            let inherited = msg
+                .in_reply_to
+                .as_deref()
+                .map(normalize_message_id)
+                .and_then(|normalized| header_to_thread.get(&normalized).cloned());
+            key = inherited.or_else(|| {
+                if let Some(cid) = msg
+                    .campaign_id
+                    .as_deref()
+                    .filter(|c| !c.trim().is_empty())
+                {
+                    Some(campaign_thread_key(&msg.lead_id, cid))
+                } else if msg.direction == "inbound" {
+                    direct_subject_thread
+                        .get(&(msg.lead_id.clone(), normalize_subject_root(&msg.subject)))
+                        .cloned()
+                        .or_else(|| Some(new_direct_thread_key(&msg.lead_id)))
+                } else {
+                    Some(new_direct_thread_key(&msg.lead_id))
+                }
+            });
+            if let Some(ref thread_key) = key {
+                updates.push((msg.id.clone(), thread_key.clone()));
+            }
         }
-        root = next;
+        let Some(key) = key else { continue };
+
+        if let Some(header) = msg.message_id_header.as_deref() {
+            let normalized = normalize_message_id(header);
+            if !normalized.is_empty() {
+                header_to_thread.entry(normalized).or_insert_with(|| key.clone());
+            }
+        }
+        if msg
+            .campaign_id
+            .as_deref()
+            .filter(|c| !c.trim().is_empty())
+            .is_none()
+        {
+            direct_subject_thread
+                .entry((msg.lead_id.clone(), normalize_subject_root(&msg.subject)))
+                .or_insert(key);
+        }
     }
-    // Path compression so repeated lookups stay cheap.
-    let mut cursor = key.to_string();
-    while cursor != root {
-        let next = parents
-            .get(&cursor)
-            .cloned()
-            .unwrap_or_else(|| root.clone());
-        parents.insert(cursor.clone(), root.clone());
-        cursor = next;
+
+    for (id, thread_key) in updates {
+        conn.execute(
+            "UPDATE email_messages SET thread_key = ?1 WHERE id = ?2",
+            params![thread_key, id],
+        )
+        .map_err(|e| e.to_string())?;
     }
-    root
+    Ok(())
 }
 
-fn union_conversations(parents: &mut HashMap<String, String>, a: &str, b: &str) {
-    let root_a = find_conversation_root(parents, a);
-    let root_b = find_conversation_root(parents, b);
-    if root_a == root_b {
-        return;
+/// Kiszámolja egy beszúrandó üzenet beszélgetés-kulcsát.
+///
+/// Először a válaszláncot követi (In-Reply-To → szülő thread_key), így a
+/// tárgyváltás vagy egy másik kampány nem töri szét a beszélgetést. Ha nincs
+/// ismert szülő, a kampánylevelek a kampány beszélgetésébe kerülnek, minden
+/// más levél pedig új, önálló beszélgetést indít.
+fn resolve_thread_key_for_new_message(
+    conn: &rusqlite::Connection,
+    campaign_id: Option<&str>,
+    lead_id: &str,
+    in_reply_to: Option<&str>,
+) -> String {
+    if let Some(parent_header) = in_reply_to {
+        let normalized = normalize_message_id(parent_header);
+        if !normalized.is_empty() {
+            let parent_thread: Option<Option<String>> = conn
+                .query_row(
+                    "SELECT thread_key FROM email_messages
+                     WHERE message_id_header IS NOT NULL
+                       AND REPLACE(REPLACE(LOWER(TRIM(message_id_header)), '<', ''), '>', '') = ?1
+                     ORDER BY created_at DESC
+                     LIMIT 1",
+                    params![&normalized],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap_or(None);
+            if let Some(Some(thread_key)) = parent_thread {
+                if !thread_key.trim().is_empty() {
+                    return thread_key;
+                }
+            }
+        }
     }
-    // Keep the lexicographically smaller key as root so the result is stable.
-    if root_a <= root_b {
-        parents.insert(root_b, root_a);
-    } else {
-        parents.insert(root_a, root_b);
+    match campaign_id.filter(|c| !c.trim().is_empty()) {
+        Some(cid) => campaign_thread_key(lead_id, cid),
+        None => new_direct_thread_key(lead_id),
     }
 }
 
@@ -280,6 +393,7 @@ impl Database {
                 body TEXT NOT NULL DEFAULT '',
                 message_id_header TEXT,
                 in_reply_to TEXT,
+                thread_key TEXT,
                 ai_intent TEXT,
                 ai_suggested_reply TEXT,
                 booking_link_sent INTEGER NOT NULL DEFAULT 0,
@@ -291,6 +405,18 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_messages_lead ON email_messages(lead_id);
             CREATE INDEX IF NOT EXISTS idx_messages_campaign ON email_messages(campaign_id);
             CREATE INDEX IF NOT EXISTS idx_messages_msgid ON email_messages(message_id_header);
+
+            -- Már feldolgozott bejövő levelek nyilvántartása (exactly-once).
+            -- A törölt beszélgetések üzenetazonosítói is itt maradnak, így az
+            -- IMAP-szinkron nem szúrja be újra ugyanazt a levelet.
+            CREATE TABLE IF NOT EXISTS inbound_processed (
+                message_id_norm TEXT PRIMARY KEY,
+                message_id_raw TEXT NOT NULL DEFAULT '',
+                from_email TEXT NOT NULL DEFAULT '',
+                subject TEXT NOT NULL DEFAULT '',
+                action TEXT NOT NULL DEFAULT 'inserted',
+                processed_at TEXT NOT NULL
+            );
 
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
@@ -327,6 +453,7 @@ impl Database {
             "ALTER TABLE email_messages ADD COLUMN ai_rewrite_note TEXT",
             "ALTER TABLE email_messages ADD COLUMN ai_priority_score INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE email_messages ADD COLUMN ai_tags TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE email_messages ADD COLUMN thread_key TEXT",
         ];
         for sql in migrations {
             let _ = conn.execute(sql, []);
@@ -335,7 +462,84 @@ impl Database {
             "CREATE INDEX IF NOT EXISTS idx_messages_scheduled ON email_messages(status, auto_send_status, scheduled_send_at)",
             [],
         );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_thread ON email_messages(thread_key)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS inbound_processed (
+                message_id_norm TEXT PRIMARY KEY,
+                message_id_raw TEXT NOT NULL DEFAULT '',
+                from_email TEXT NOT NULL DEFAULT '',
+                subject TEXT NOT NULL DEFAULT '',
+                action TEXT NOT NULL DEFAULT 'inserted',
+                processed_at TEXT NOT NULL
+            )",
+            [],
+        );
+        backfill_thread_keys(&conn)?;
+        Self::backfill_inbound_processed(&conn)?;
 
+        Ok(())
+    }
+
+    /// Minden már adatbázisban lévő üzenetazonosítót bejegyez a feldolgozottak
+    /// közé. Idempotens (INSERT OR IGNORE), így minden induláskor futhat —
+    /// a korábbi összeomlás miatt kimaradt azonosítókat is pótolja.
+    pub(crate) fn backfill_inbound_processed(conn: &rusqlite::Connection) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT OR IGNORE INTO inbound_processed (message_id_norm, message_id_raw, subject, action, processed_at)
+             SELECT LOWER(TRIM(message_id_header, '<> ')), message_id_header, subject, 'backfilled', ?1
+             FROM email_messages
+             WHERE message_id_header IS NOT NULL AND TRIM(message_id_header) <> ''",
+            params![now],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Már feldolgoztuk ezt a bejövő levelet? (Törlés után is igaz marad.)
+    pub fn is_inbound_processed(&self, message_id_header: &str) -> bool {
+        let normalized = normalize_message_id(message_id_header);
+        if normalized.is_empty() {
+            return false;
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM inbound_processed WHERE message_id_norm = ?1",
+            params![normalized],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+            > 0
+    }
+
+    /// Bejegyzi a levelet feldolgozottként. Többször is hívható (idempotens).
+    pub fn mark_inbound_processed(
+        &self,
+        message_id_header: &str,
+        from_email: &str,
+        subject: &str,
+        action: &str,
+    ) -> Result<(), String> {
+        let normalized = normalize_message_id(message_id_header);
+        if normalized.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO inbound_processed (message_id_norm, message_id_raw, from_email, subject, action, processed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                normalized,
+                message_id_header,
+                from_email,
+                subject,
+                if action.trim().is_empty() { "inserted" } else { action },
+                Utc::now().to_rfc3339()
+            ],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -1157,13 +1361,28 @@ impl Database {
         }
         let id_opt: Option<String> = {
             let conn = self.conn.lock().unwrap();
-            conn.query_row(
-                "SELECT id FROM leads WHERE LOWER(primary_email) = ?1 OR LOWER(contacts) LIKE ?2 LIMIT 1",
-                params![&clean, format!("%\"{}\"% ", clean).trim()],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(|e| e.to_string())?
+            // Először a pontos elsődleges címre illesztünk, és csak utána a
+            // kapcsolattartók között keresünk. Így nem nyeli el egy másik lead
+            // a levelet pusztán azért, mert az cím szerepel a contact listájában.
+            let by_primary: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM leads WHERE LOWER(primary_email) = ?1 ORDER BY updated_at DESC LIMIT 1",
+                    params![&clean],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            match by_primary {
+                Some(id) => Some(id),
+                None => conn
+                    .query_row(
+                        "SELECT id FROM leads WHERE LOWER(contacts) LIKE ?1 ORDER BY updated_at DESC LIMIT 1",
+                        params![format!("%\"{}\"%", clean)],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string())?,
+            }
         };
         match id_opt {
             Some(id) => Ok(Some(self.get_lead(&id)?)),
@@ -1526,8 +1745,10 @@ impl Database {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().unwrap();
+        let thread_key =
+            resolve_thread_key_for_new_message(&conn, campaign_id, lead_id, in_reply_to);
         conn.execute(
-            "INSERT INTO email_messages (id, campaign_id, lead_id, direction, status, step_number, subject, body, message_id_header, in_reply_to, ai_intent, ai_suggested_reply, booking_link_sent, sent_at, created_at, scheduled_send_at, auto_send_status, ai_summary, ai_rewrite_note) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+            "INSERT INTO email_messages (id, campaign_id, lead_id, direction, status, step_number, subject, body, message_id_header, in_reply_to, thread_key, ai_intent, ai_suggested_reply, booking_link_sent, sent_at, created_at, scheduled_send_at, auto_send_status, ai_summary, ai_rewrite_note) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             params![
                 &id,
                 campaign_id,
@@ -1539,6 +1760,7 @@ impl Database {
                 body,
                 message_id_header,
                 in_reply_to,
+                thread_key,
                 ai_intent,
                 ai_suggested_reply,
                 if booking_link_sent { 1 } else { 0 },
@@ -1552,6 +1774,51 @@ impl Database {
         )
         .map_err(|e| e.to_string())?;
         Ok(id)
+    }
+
+    /// Egy meglévő üzenet beszélgetés-kulcsának felülírása. Kézi válasz /
+    /// tervezet esetén a kiválasztott beszélgetéshez rögzítjük a levelet,
+    /// akkor is, ha nincs In-Reply-To fejléc (pl. még nem érkezett válasz).
+    pub fn set_email_thread_key(&self, id: &str, thread_key: &str) -> Result<(), String> {
+        if thread_key.trim().is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE email_messages SET thread_key = ?1 WHERE id = ?2",
+            params![thread_key, id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn list_thread_messages(&self, thread_key: &str) -> Result<Vec<EmailMessage>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT em.id, em.campaign_id, c.name, em.lead_id, l.company_name, l.primary_email,
+                       em.direction, em.status, em.step_number, em.subject, em.body,
+                       em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
+                       em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
+                       em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note,
+                       em.ai_priority_score, em.ai_tags, em.thread_key
+                FROM email_messages em
+                JOIN leads l ON l.id = em.lead_id
+                LEFT JOIN campaigns c ON c.id = em.campaign_id
+                WHERE em.thread_key = ?1
+                ORDER BY COALESCE(em.sent_at, em.created_at) ASC
+                "#,
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![thread_key], Self::map_email_row)
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| e.to_string())?);
+        }
+        Ok(out)
     }
 
     fn map_email_row(r: &rusqlite::Row) -> rusqlite::Result<EmailMessage> {
@@ -1570,6 +1837,7 @@ impl Database {
             body: r.get(10)?,
             message_id_header: r.get(11)?,
             in_reply_to: r.get(12)?,
+            thread_key: r.get::<_, Option<String>>(25).ok().flatten(),
             ai_intent: r.get(13)?,
             ai_suggested_reply: r.get(14)?,
             booking_link_sent: r.get::<_, i64>(15)? != 0,
@@ -1596,7 +1864,7 @@ impl Database {
                    em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
                    em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
                    em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note,
-                   em.ai_priority_score, em.ai_tags
+                   em.ai_priority_score, em.ai_tags, em.thread_key
             FROM email_messages em
             JOIN leads l ON l.id = em.lead_id
             LEFT JOIN campaigns c ON c.id = em.campaign_id
@@ -1662,32 +1930,38 @@ impl Database {
         Ok(())
     }
 
-    /// Kézi küldés után a lead többi el nem küldött választervezetét törli,
-    /// hogy az auto-küldés biztosan megszűnjön. A kampány-leveleket (step 1)
-    /// nem érinti — csak a választervezeteket (step >= 2).
+    /// Kézi küldés után a beszélgetés többi el nem küldött választervezetét
+    /// törli, hogy az auto-küldés biztosan megszűnjön. Csak ugyanabban a
+    /// beszélgetésben (thread_key), más beszélgetések tervezeteit nem érinti.
+    /// A kampány-leveleket (step 1) sem törli — csak a választervezeteket.
     pub fn delete_other_pending_reply_drafts(
         &self,
-        lead_id: &str,
+        thread_key: &str,
         exclude_id: &str,
     ) -> Result<usize, String> {
+        if thread_key.trim().is_empty() {
+            return Ok(0);
+        }
         let conn = self.conn.lock().unwrap();
         let n = conn
             .execute(
-                "DELETE FROM email_messages WHERE lead_id = ?1 AND id <> ?2 AND direction = 'outbound' AND status IN ('queued', 'draft') AND step_number >= 2",
-                params![lead_id, exclude_id],
+                "DELETE FROM email_messages WHERE thread_key = ?1 AND id <> ?2 AND direction = 'outbound' AND status IN ('queued', 'draft') AND step_number >= 2",
+                params![thread_key, exclude_id],
             )
             .map_err(|e| e.to_string())?;
         Ok(n)
     }
 
-    /// Már beragadt duplikált bejövő üzenetek takarítása (azonos lead + tárgy +
-    /// törzs): a legkorábbit tartja meg. Előretekintő védelem az IMAP-szinkron
-    /// versenyhelyzetei ellen.
+    /// Már beragadt duplikált bejövő üzenetek takarítása: azonos
+    /// Message-ID-ből csak a legkorábbi marad meg. A normalizált azonosító
+    /// szerint dolgozik, így a <> / kis-nagybetű eltérés sem okoz duplikátumot.
+    /// (Korábban tárgy+törzs alapján törölt — az tévesen törölhette két külön,
+    /// de egyforma tartalmú levél egyikét.)
     pub fn delete_duplicate_inbound_messages(&self) -> Result<usize, String> {
         let conn = self.conn.lock().unwrap();
         let n = conn
             .execute(
-                "DELETE FROM email_messages WHERE direction = 'inbound' AND rowid NOT IN (SELECT MIN(rowid) FROM email_messages WHERE direction = 'inbound' GROUP BY lead_id, subject, body)",
+                "DELETE FROM email_messages WHERE direction = 'inbound' AND message_id_header IS NOT NULL AND rowid NOT IN (SELECT MIN(rowid) FROM email_messages WHERE direction = 'inbound' AND message_id_header IS NOT NULL GROUP BY LOWER(TRIM(message_id_header, '<> ')))",
                 [],
             )
             .map_err(|e| e.to_string())?;
@@ -1695,8 +1969,34 @@ impl Database {
     }
 
     pub fn delete_email_messages(&self, ids: &[String]) -> Result<usize, String> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let now = Utc::now().to_rfc3339();
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
+        // A törölt üzenetek azonosítóit megjegyezzük a feldolgozottak között,
+        // hogy az IMAP-szinkron később se szúrja be újra ugyanazt a levelet.
+        {
+            let mut sel = tx
+                .prepare("SELECT message_id_header, subject FROM email_messages WHERE id = ?1")
+                .map_err(|e| e.to_string())?;
+            let mut ins = tx
+                .prepare("INSERT OR IGNORE INTO inbound_processed (message_id_norm, message_id_raw, subject, action, processed_at) VALUES (LOWER(TRIM(?1, '<> ')), ?1, ?2, 'deleted', ?3)")
+                .map_err(|e| e.to_string())?;
+            for id in ids {
+                let row: Option<(Option<String>, String)> = sel
+                    .query_row(params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .optional()
+                    .map_err(|e| e.to_string())?;
+                if let Some((Some(raw), subject)) = row {
+                    if !normalize_message_id(&raw).is_empty() {
+                        ins.execute(params![raw, subject, now])
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+        }
         let mut deleted = 0usize;
         {
             let mut stmt = tx
@@ -1727,7 +2027,7 @@ impl Database {
                        em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
                        em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
                        em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note,
-                       em.ai_priority_score, em.ai_tags
+                       em.ai_priority_score, em.ai_tags, em.thread_key
                 FROM email_messages em
                 JOIN leads l ON l.id = em.lead_id
                 LEFT JOIN campaigns c ON c.id = em.campaign_id
@@ -1763,7 +2063,7 @@ impl Database {
                        em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
                        em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
                        em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note,
-                       em.ai_priority_score, em.ai_tags
+                       em.ai_priority_score, em.ai_tags, em.thread_key
                 FROM email_messages em
                 JOIN leads l ON l.id = em.lead_id
                 LEFT JOIN campaigns c ON c.id = em.campaign_id
@@ -1793,7 +2093,7 @@ impl Database {
                        em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
                        em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
                        em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note,
-                       em.ai_priority_score, em.ai_tags
+                       em.ai_priority_score, em.ai_tags, em.thread_key
                 FROM email_messages em
                 JOIN leads l ON l.id = em.lead_id
                 LEFT JOIN campaigns c ON c.id = em.campaign_id
@@ -1838,10 +2138,16 @@ impl Database {
     }
 
     pub fn message_id_exists(&self, message_id_header: &str) -> bool {
+        // Normalizált összehasonlítás: a <> jelek és a kis/nagybetű eltérés
+        // nem eredményezhet duplikált beszúrást.
+        let normalized = normalize_message_id(message_id_header);
+        if normalized.is_empty() {
+            return false;
+        }
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT COUNT(*) FROM email_messages WHERE message_id_header = ?1",
-            params![message_id_header],
+            "SELECT COUNT(*) FROM email_messages WHERE LOWER(TRIM(message_id_header, '<> ')) = ?1",
+            params![normalized],
             |r| r.get::<_, i64>(0),
         )
         .unwrap_or(0)
@@ -1858,7 +2164,7 @@ impl Database {
                        em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
                        em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
                        em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note,
-                       em.ai_priority_score, em.ai_tags
+                       em.ai_priority_score, em.ai_tags, em.thread_key
                 FROM email_messages em
                 JOIN leads l ON l.id = em.lead_id
                 LEFT JOIN campaigns c ON c.id = em.campaign_id
@@ -1918,7 +2224,7 @@ impl Database {
                        em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
                        em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
                        em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note,
-                       em.ai_priority_score, em.ai_tags
+                       em.ai_priority_score, em.ai_tags, em.thread_key
                 FROM email_messages em
                 JOIN leads l ON l.id = em.lead_id
                 LEFT JOIN campaigns c ON c.id = em.campaign_id
@@ -1947,7 +2253,7 @@ impl Database {
                        em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
                        em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
                        em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note,
-                       l.status, l.fit_score, em.ai_priority_score, em.ai_tags
+                       l.status, l.fit_score, em.ai_priority_score, em.ai_tags, em.thread_key
                 FROM email_messages em
                 JOIN leads l ON l.id = em.lead_id
                 LEFT JOIN campaigns c ON c.id = em.campaign_id
@@ -1976,6 +2282,7 @@ impl Database {
                     body: r.get(11)?,
                     message_id_header: r.get(12)?,
                     in_reply_to: r.get(13)?,
+                    thread_key: r.get(28)?,
                     ai_intent: r.get(14)?,
                     ai_suggested_reply: r.get(15)?,
                     booking_link_sent: r.get::<_, i64>(16)? != 0,
@@ -2016,41 +2323,38 @@ impl Database {
             });
         }
 
-        // Resolve which messages belong to the same conversation. Replies inherit
-        // the conversation of the message they answer when the In-Reply-To header
-        // points to a message we know about, so a changed subject does not split
-        // a real thread. Independent conversations of the same lead stay separate.
-        let mut parents: HashMap<String, String> = HashMap::new();
-        let mut header_to_base: HashMap<String, String> = HashMap::new();
-        for item in &loaded {
-            let base = conversation_base_key(&item.message);
-            parents.entry(base.clone()).or_insert(base.clone());
-            if let Some(header) = item.message.message_id_header.as_deref() {
-                let normalized = normalize_message_id(header);
-                if !normalized.is_empty() {
-                    header_to_base.entry(normalized).or_insert(base);
-                }
-            }
-        }
-        for item in &loaded {
-            if let Some(parent_header) = item.message.in_reply_to.as_deref() {
-                let normalized = normalize_message_id(parent_header);
-                if let Some(parent_base) = header_to_base.get(&normalized) {
-                    let base = conversation_base_key(&item.message);
-                    union_conversations(&mut parents, &base, parent_base);
-                }
-            }
-        }
-
+        // A beszélgetés-azonosító perzisztált (thread_key), ezért a csoportosítás
+        // stabil: a válaszok az In-Reply-To láncon keresztül öröklik a szülő
+        // beszélgetését, a független beszélgetések pedig külön kulcsot kapnak.
+        // Így nem keveredik össze két, ugyanahhoz a leadhez tartozó beszélgetés.
         let mut grouped: HashMap<String, Vec<LoadedMessage>> = HashMap::new();
         for item in loaded {
-            let base = conversation_base_key(&item.message);
-            let root = find_conversation_root(&mut parents, &base);
-            grouped.entry(root).or_default().push(item);
+            let key = item
+                .message
+                .thread_key
+                .clone()
+                .filter(|k| !k.trim().is_empty())
+                .unwrap_or_else(|| {
+                    if let Some(cid) = item
+                        .message
+                        .campaign_id
+                        .as_deref()
+                        .filter(|c| !c.trim().is_empty())
+                    {
+                        campaign_thread_key(&item.message.lead_id, cid)
+                    } else {
+                        format!(
+                            "legacy:{}:{}",
+                            item.message.lead_id,
+                            normalize_subject_root(&item.message.subject)
+                        )
+                    }
+                });
+            grouped.entry(key).or_default().push(item);
         }
 
         let mut threads: Vec<InboxThread> = Vec::new();
-        for mut items in grouped.into_values() {
+        for (thread_key, mut items) in grouped {
             items.sort_by(|a, b| {
                 let a_ts = a.message.sent_at.as_deref().unwrap_or(&a.message.created_at);
                 let b_ts = b.message.sent_at.as_deref().unwrap_or(&b.message.created_at);
@@ -2067,7 +2371,7 @@ impl Database {
             let first = &items[0];
             let first_message = &first.message;
             let mut entry = InboxThread {
-                thread_key: conversation_base_key(first_message),
+                thread_key: thread_key.clone(),
                 lead_id: first_message.lead_id.clone(),
                 lead_company: first_message.lead_company.clone(),
                 lead_email: first_message.lead_email.clone(),
@@ -2091,10 +2395,12 @@ impl Database {
                 scheduled_send_at: None,
                 auto_send_status: None,
                 booking_link_sent: false,
+                has_subject_change: false,
                 message_count: 0,
                 messages: vec![],
             };
 
+            let mut subject_roots: Vec<String> = Vec::new();
             for item in items {
                 let msg = item.message;
                 let ts = msg.sent_at.clone().unwrap_or_else(|| msg.created_at.clone());
@@ -2102,6 +2408,10 @@ impl Database {
                     entry.last_message_at = ts;
                     entry.last_direction = msg.direction.clone();
                     entry.subject = msg.subject.clone();
+                    let root = normalize_subject_root(&msg.subject);
+                    if !subject_roots.iter().any(|existing| existing == &root) {
+                        subject_roots.push(root);
+                    }
                 }
                 if msg.ai_intent.is_some() {
                     entry.latest_intent = msg.ai_intent.clone();
@@ -2144,18 +2454,18 @@ impl Database {
                     entry.offer_title = item.offer_title;
                 }
                 if msg.direction == "outbound" && (msg.status == "queued" || (msg.status == "draft" && (msg.step_number >= 2 || msg.auto_send_status.is_some()))) {
-                    entry.has_pending_draft = true;
-                    entry.pending_reply_id = Some(msg.id.clone());
-                    entry.scheduled_send_at = msg.scheduled_send_at.clone();
-                    entry.auto_send_status = msg.auto_send_status.clone();
+                    let is_scheduled = msg.auto_send_status.as_deref() == Some("scheduled");
+                    let current_is_scheduled = entry.auto_send_status.as_deref() == Some("scheduled");
+                    // Ha egy beszélgetésben több függő válasz van, az időzített
+                    // (ténylegesen kiküldésre kerülő) legyen a megjelenített.
+                    if entry.pending_reply_id.is_none() || is_scheduled || !current_is_scheduled {
+                        entry.has_pending_draft = true;
+                        entry.pending_reply_id = Some(msg.id.clone());
+                        entry.scheduled_send_at = msg.scheduled_send_at.clone();
+                        entry.auto_send_status = msg.auto_send_status.clone();
+                    }
                 } else if msg.direction == "inbound" && msg.ai_suggested_reply.as_ref().is_some_and(|s| !s.is_empty()) {
                     entry.has_pending_draft = true;
-                }
-                if msg.direction == "outbound" && msg.status == "sent" {
-                    entry.has_pending_draft = false;
-                    entry.pending_reply_id = None;
-                    entry.scheduled_send_at = None;
-                    entry.auto_send_status = None;
                 }
                 if msg.booking_link_sent {
                     entry.booking_link_sent = true;
@@ -2167,6 +2477,7 @@ impl Database {
                 entry.message_count += 1;
                 entry.messages.push(msg);
             }
+            entry.has_subject_change = subject_roots.len() > 1;
             threads.push(entry);
         }
 
@@ -2406,7 +2717,7 @@ impl Database {
     pub fn clear_all_data(&self) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(
-            "DELETE FROM email_messages; DELETE FROM campaigns; DELETE FROM search_leads; DELETE FROM searches; DELETE FROM leads; DELETE FROM offers; DELETE FROM projects; DELETE FROM activity_log; DELETE FROM suppression_list;",
+            "DELETE FROM email_messages; DELETE FROM campaigns; DELETE FROM search_leads; DELETE FROM searches; DELETE FROM leads; DELETE FROM offers; DELETE FROM projects; DELETE FROM activity_log; DELETE FROM suppression_list; DELETE FROM inbound_processed;",
         )
         .map_err(|e| e.to_string())?;
         Ok(())
@@ -2416,6 +2727,166 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn independent_inbound_mail_does_not_merge_into_another_conversation() {
+        let db_path = std::env::temp_dir().join(format!("mylead-test-{}.sqlite", Uuid::new_v4()));
+        let db = Database::open(&db_path).unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO projects (id, name, created_at, updated_at) VALUES ('p1','P','2026-01-01','2026-01-01')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO leads (id, company_name, primary_email, created_at, updated_at) VALUES ('l1','Acme','a@acme.hu','2026-01-01','2026-01-01')",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Direct conversation A.
+        db.insert_email_message_full(
+            None, "l1", "outbound", "sent", 1, "Project X", "Hello",
+            Some("<a-out-1@acme.hu>"), None, None, None, false,
+            Some("2026-01-01T10:00:00Z"), None, None, None, None,
+        )
+        .unwrap();
+        db.insert_email_message_full(
+            None, "l1", "inbound", "received", 1, "Re: Project X", "Hi",
+            Some("<a-in-1@acme.hu>"), Some("<a-out-1@acme.hu>"), Some("interested"),
+            Some("Reply"), false, Some("2026-01-01T11:00:00Z"), None, None, None, None,
+        )
+        .unwrap();
+
+        // Direct conversation B: new subject, no In-Reply-To. It must NOT be
+        // merged into conversation A just because the sender is the same.
+        db.insert_email_message_full(
+            None, "l1", "outbound", "sent", 1, "Más téma", "Yo",
+            Some("<b-out-1@acme.hu>"), None, None, None, false,
+            Some("2026-01-02T10:00:00Z"), None, None, None, None,
+        )
+        .unwrap();
+        db.insert_email_message_full(
+            None, "l1", "inbound", "received", 1, "Re: Más téma", "Hey",
+            Some("<b-in-1@acme.hu>"), Some("<b-out-1@acme.hu>"), None, None, false,
+            Some("2026-01-02T11:00:00Z"), None, None, None, None,
+        )
+        .unwrap();
+
+        // An entirely new, headerless incoming mail from the same address.
+        db.insert_email_message_full(
+            None, "l1", "inbound", "received", 1, "Teljesen új megkeresés", "Szia",
+            Some("<c-in-1@acme.hu>"), None, None, None, false,
+            Some("2026-01-03T09:00:00Z"), None, None, None, None,
+        )
+        .unwrap();
+
+        let threads = db.list_inbox_threads().unwrap();
+        assert_eq!(threads.len(), 3, "three independent conversations expected");
+        assert_eq!(
+            threads.iter().map(|t| t.messages.len()).sum::<usize>(),
+            5,
+            "no message may be duplicated or dropped"
+        );
+        let new_thread = threads
+            .iter()
+            .find(|t| t.subject == "Teljesen új megkeresés")
+            .expect("new conversation");
+        assert_eq!(new_thread.messages.len(), 1);
+        // Existing threads stay stable and distinct.
+        let a = threads.iter().find(|t| t.subject == "Re: Project X").unwrap();
+        let b = threads.iter().find(|t| t.subject == "Re: Más téma").unwrap();
+        assert_ne!(a.thread_key, b.thread_key);
+        assert_ne!(a.thread_key, new_thread.thread_key);
+
+        // A saved reply inherits the thread it answers, even if the subject changes.
+        let reply_id = db
+            .insert_email_message_full(
+                None, "l1", "outbound", "draft", 2, "Re: új tárgy", "Draft",
+                None, Some("<a-in-1@acme.hu>"), None, None, false, None, None,
+                Some("paused"), None, None,
+            )
+            .unwrap();
+        let reply = db.get_email_message(&reply_id).unwrap();
+        assert_eq!(reply.thread_key.as_deref(), Some(a.thread_key.as_str()));
+        assert_eq!(db.list_inbox_threads().unwrap().len(), 3);
+
+        std::fs::remove_file(&db_path).ok();
+    }
+
+    #[test]
+    fn legacy_database_is_migrated_to_stable_thread_keys() {
+        let db_path = std::env::temp_dir().join(format!("mylead-test-{}.sqlite", Uuid::new_v4()));
+        let db = Database::open(&db_path).unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            // Szimuláljuk a régi, thread_key nélküli adatbázist.
+            conn.execute("DROP INDEX IF EXISTS idx_messages_thread", []).unwrap();
+            conn.execute("ALTER TABLE email_messages DROP COLUMN thread_key", []).unwrap();
+            conn.execute(
+                "INSERT INTO projects (id, name, created_at, updated_at) VALUES ('p1','P','2026-01-01','2026-01-01')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO leads (id, company_name, primary_email, created_at, updated_at) VALUES ('l1','Acme','a@acme.hu','2026-01-01','2026-01-01')",
+                [],
+            )
+            .unwrap();
+            let insert = "INSERT INTO email_messages (id, lead_id, direction, status, step_number, subject, body, message_id_header, in_reply_to, sent_at, created_at) VALUES (?1,'l1',?2,?3,1,?4,?5,?6,?7,?8,?8)";
+            conn.execute(
+                insert,
+                params!["m1", "outbound", "sent", "Project X", "Hello", "<out-1@acme.hu>", Option::<String>::None, "2026-01-01T10:00:00Z"],
+            )
+            .unwrap();
+            conn.execute(
+                insert,
+                params!["m2", "inbound", "received", "Re: Project X", "Hi", "<in-1@acme.hu>", "<out-1@acme.hu>", "2026-01-01T11:00:00Z"],
+            )
+            .unwrap();
+            conn.execute(
+                insert,
+                params!["m3", "inbound", "received", "Más téma", "Szia", "<in-2@acme.hu>", Option::<String>::None, "2026-01-02T11:00:00Z"],
+            )
+            .unwrap();
+            conn.execute(
+                insert,
+                params!["m4", "outbound", "sent", "Harmadik ügy", "Yo", "<out-3@acme.hu>", Option::<String>::None, "2026-01-03T10:00:00Z"],
+            )
+            .unwrap();
+        }
+        drop(db);
+
+        // Újranyitáskor végbemegy az ALTER + backfill.
+        let db = Database::open(&db_path).unwrap();
+        let threads = db.list_inbox_threads().unwrap();
+        assert_eq!(threads.len(), 3, "három független beszélgetés");
+        assert!(threads.iter().all(|t| !t.thread_key.trim().is_empty()));
+        let keys: std::collections::HashSet<&str> =
+            threads.iter().map(|t| t.thread_key.as_str()).collect();
+        assert_eq!(keys.len(), 3);
+
+        let project_thread = threads
+            .iter()
+            .find(|t| t.subject == "Re: Project X")
+            .unwrap();
+        let reply_id = db
+            .insert_email_message_full(
+                None, "l1", "outbound", "draft", 2, "Re: Project X", "Draft",
+                None, Some("<in-1@acme.hu>"), None, None, false, None, None,
+                Some("paused"), None, None,
+            )
+            .unwrap();
+        let reply = db.get_email_message(&reply_id).unwrap();
+        assert_eq!(
+            reply.thread_key.as_deref(),
+            Some(project_thread.thread_key.as_str())
+        );
+
+        std::fs::remove_file(&db_path).ok();
+    }
 
     #[test]
     fn one_lead_can_have_separate_conversations() {
@@ -2493,6 +2964,130 @@ mod tests {
         assert_eq!(direct_thread.messages.len(), 2);
         assert!(!direct_thread.has_pending_draft);
         assert_ne!(campaign_thread.thread_key, direct_thread.thread_key);
+
+        std::fs::remove_file(&db_path).ok();
+    }
+
+    fn open_test_db_with_lead() -> (std::path::PathBuf, Database) {
+        let db_path = std::env::temp_dir().join(format!("mylead-test-{}.sqlite", Uuid::new_v4()));
+        let db = Database::open(&db_path).unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO projects (id, name, created_at, updated_at) VALUES ('p1','P','2026-01-01','2026-01-01')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO leads (id, company_name, primary_email, created_at, updated_at) VALUES ('l1','Acme','a@acme.hu','2026-01-01','2026-01-01')",
+                [],
+            )
+            .unwrap();
+        }
+        (db_path, db)
+    }
+
+    #[test]
+    fn deleted_inbound_is_never_reprocessed() {
+        let (db_path, db) = open_test_db_with_lead();
+
+        // Bejövő levél + feldolgozásjelölés (ezt teszi az IMAP-szinkron).
+        let inbound_id = db
+            .insert_email_message_full(
+                None, "l1", "inbound", "received", 1, "Re: Hello", "Szia",
+                Some("<gone-1@acme.hu>"), None, None, None, false,
+                Some("2026-01-01T10:00:00Z"), None, None, None, None,
+            )
+            .unwrap();
+        db.mark_inbound_processed("<gone-1@acme.hu>", "a@acme.hu", "Re: Hello", "inserted")
+            .unwrap();
+
+        // A felhasználó törli a beszélgetést.
+        assert_eq!(db.delete_email_messages(&[inbound_id]).unwrap(), 1);
+        assert!(db.find_email_message_by_header("<gone-1@acme.hu>").unwrap().is_none());
+
+        // A következő szinkron pontosan ezt nézi: feldolgozott → kihagy.
+        assert!(
+            db.is_inbound_processed("<gone-1@acme.hu>"),
+            "deleted message must stay marked as processed"
+        );
+        assert!(
+            db.is_inbound_processed("<GONE-1@ACME.HU>"),
+            "lookup must be case-insensitive"
+        );
+
+        std::fs::remove_file(&db_path).ok();
+    }
+
+    #[test]
+    fn backfill_remembers_preexisting_message_ids() {
+        let (db_path, db) = open_test_db_with_lead();
+        db.insert_email_message_full(
+            None, "l1", "inbound", "received", 1, "Régi levél", "Helló",
+            Some("<legacy-1@acme.hu>"), None, None, None, false,
+            Some("2026-01-01T10:00:00Z"), None, None, None, None,
+        )
+        .unwrap();
+
+        // A backfill minden meglévő azonosítót bejegyez (régi adatbázisok).
+        {
+            let conn = db.conn.lock().unwrap();
+            Database::backfill_inbound_processed(&conn).unwrap();
+        }
+        assert!(db.is_inbound_processed("<legacy-1@acme.hu>"));
+
+        // Újra futtatva sem duplikál, nem hibázik.
+        {
+            let conn = db.conn.lock().unwrap();
+            Database::backfill_inbound_processed(&conn).unwrap();
+        }
+        // Idempotens jelölés.
+        db.mark_inbound_processed("<legacy-1@acme.hu>", "a@acme.hu", "Régi", "inserted")
+            .unwrap();
+        assert!(db.is_inbound_processed("<legacy-1@acme.hu>"));
+
+        std::fs::remove_file(&db_path).ok();
+    }
+
+    #[test]
+    fn message_id_lookup_ignores_brackets_and_case() {
+        let (db_path, db) = open_test_db_with_lead();
+        db.insert_email_message_full(
+            None, "l1", "inbound", "received", 1, "Tárgy", "Törzs",
+            Some("<AbC-123@acme.hu>"), None, None, None, false,
+            Some("2026-01-01T10:00:00Z"), None, None, None, None,
+        )
+        .unwrap();
+
+        assert!(db.message_id_exists("<abc-123@ACME.HU>"));
+        assert!(db.message_id_exists("abc-123@acme.hu"));
+        assert!(!db.message_id_exists("<mas-456@acme.hu>"));
+
+        std::fs::remove_file(&db_path).ok();
+    }
+
+    #[test]
+    fn duplicate_inbound_message_ids_are_collapsed() {
+        let (db_path, db) = open_test_db_with_lead();
+        for _ in 0..2 {
+            db.insert_email_message_full(
+                None, "l1", "inbound", "received", 1, "Ugyanaz", "Ugyanaz a törzs",
+                Some("<dupe-1@acme.hu>"), None, None, None, false,
+                Some("2026-01-01T10:00:00Z"), None, None, None, None,
+            )
+            .unwrap();
+        }
+        // Két különböző, egyforma tartalmú levél viszont megmarad.
+        db.insert_email_message_full(
+            None, "l1", "inbound", "received", 1, "Ugyanaz", "Ugyanaz a törzs",
+            Some("<egyedi-2@acme.hu>"), None, None, None, false,
+            Some("2026-01-01T11:00:00Z"), None, None, None, None,
+        )
+        .unwrap();
+
+        assert_eq!(db.delete_duplicate_inbound_messages().unwrap(), 1);
+        let remaining = db.list_lead_messages("l1").unwrap();
+        assert_eq!(remaining.len(), 2, "same content, different Message-ID stays");
 
         std::fs::remove_file(&db_path).ok();
     }

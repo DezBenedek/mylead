@@ -1,4 +1,5 @@
-import { Badge, Box, Center, Group, Stack, Text } from "@mantine/core";
+import { useState } from "react";
+import { Badge, Box, Center, Group, Modal, Stack, Text } from "@mantine/core";
 import { IconCalendarCheck, IconInbox } from "@tabler/icons-react";
 import { formatShortDate } from "../../lib/api";
 import type { EmailMessage } from "../../types";
@@ -10,6 +11,10 @@ export interface MessageTimelineProps {
 }
 
 export function MessageTimeline({ messages, leadCompany }: MessageTimelineProps) {
+  const [openedId, setOpenedId] = useState<string | null>(null);
+  const opened = openedId ? messages.find((m) => m.id === openedId) ?? null : null;
+  const openedInbound = opened?.direction === "inbound";
+
   if (messages.length === 0) {
     return (
       <Center py="xl">
@@ -27,33 +32,69 @@ export function MessageTimeline({ messages, leadCompany }: MessageTimelineProps)
   }
 
   return (
-    <Stack gap={10} className="ml-timeline">
-      {messages.map((m) => {
-        const isInbound = m.direction === "inbound";
-        return (
-          <Box key={m.id} className={isInbound ? "ml-msg in" : "ml-msg out"}>
-            <Group justify="space-between" gap={8} wrap="nowrap" mb={4}>
-              <Text size="12px" fw={700}>
-                {isInbound ? leadCompany : "Te"}
-                {m.bookingLinkSent && (
-                  <Badge
-                    size="xs"
-                    color="green"
-                    ml={6}
-                    leftSection={<IconCalendarCheck size={10} />}
-                  >
-                    Foglaló link
-                  </Badge>
-                )}
+    <>
+      <Stack gap={10} className="ml-timeline">
+        {messages.map((m) => {
+          const isInbound = m.direction === "inbound";
+          return (
+            <Box
+              key={m.id}
+              className={isInbound ? "ml-msg in" : "ml-msg out"}
+              onClick={() => setOpenedId(m.id)}
+              title="Kattints a teljes levélhez"
+              style={{ cursor: "pointer" }}
+            >
+              <Group justify="space-between" gap={8} wrap="nowrap" mb={4}>
+                <Text size="12px" fw={700}>
+                  {isInbound ? leadCompany : "Te"}
+                  {m.bookingLinkSent && (
+                    <Badge
+                      size="xs"
+                      color="green"
+                      ml={6}
+                      leftSection={<IconCalendarCheck size={10} />}
+                    >
+                      Foglaló link
+                    </Badge>
+                  )}
+                </Text>
+                <Text size="11px" c="dimmed" className="ml-tabular" style={{ whiteSpace: "nowrap" }}>
+                  {formatShortDate(m.sentAt || m.createdAt)}
+                </Text>
+              </Group>
+              <Text size="12.5px" fw={600} lineClamp={1} mb={2}>
+                {m.subject || "(nincs tárgy)"}
               </Text>
-              <Text size="11px" c="dimmed" className="ml-tabular" style={{ whiteSpace: "nowrap" }}>
-                {formatShortDate(m.sentAt || m.createdAt)}
+              <EmailBody body={m.body} hideQuoted />
+            </Box>
+          );
+        })}
+      </Stack>
+
+      <Modal
+        opened={opened !== null}
+        onClose={() => setOpenedId(null)}
+        title={opened?.subject || "(nincs tárgy)"}
+        size="lg"
+      >
+        {opened && (
+          <Stack gap="sm">
+            <Group gap="xs" wrap="wrap">
+              <Badge size="xs" color={openedInbound ? "forest" : "gray"}>
+                {openedInbound ? "Beérkező" : "Kimenő"}
+              </Badge>
+              <Text size="12px" c="dimmed" className="ml-tabular">
+                {formatShortDate(opened.sentAt || opened.createdAt)}
+              </Text>
+              <Text size="12px" c="dimmed" className="ml-mono">
+                {openedInbound ? leadCompany : "Te"}
+                {opened.leadEmail ? ` · ${opened.leadEmail}` : ""}
               </Text>
             </Group>
-            <EmailBody body={m.body} />
-          </Box>
-        );
-      })}
-    </Stack>
+            <EmailBody body={opened.body} />
+          </Stack>
+        )}
+      </Modal>
+    </>
   );
 }

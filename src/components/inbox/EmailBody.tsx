@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { Box, Text } from "@mantine/core";
 import { IconChevronDown, IconChevronUp } from "@tabler/icons-react";
+import { openExternalUrl } from "../../lib/openExternal";
 
 type Block =
   | { kind: "text"; text: string }
@@ -173,12 +174,29 @@ function QuoteBlock({ header, lines }: { header: string | null; lines: string[] 
   );
 }
 
-export function EmailBody({ body }: { body: string }) {
+export function EmailBody({ body, hideQuoted }: { body: string; hideQuoted?: boolean }) {
   const blocks = useMemo(() => parseEmailBody(body || ""), [body]);
-  if (blocks.length === 0) return null;
+  const visible = hideQuoted ? blocks.filter((b) => b.kind !== "quote") : blocks;
+  if (visible.length === 0) {
+    if (!hideQuoted) return null;
+    return (
+      <Text size="12px" c="dimmed" fs="italic">
+        Csak idézett előzmény — kattints a teljes levélhez.
+      </Text>
+    );
+  }
+  // Tauri-ban a sima <a target="_blank"> nem nyit külső böngészőt,
+  // ezért a linkkattintásokat itt kapjuk el és az opener pluginnal nyitjuk.
+  const handleClick = (e: React.MouseEvent) => {
+    const anchor = (e.target as HTMLElement | null)?.closest?.("a[href]");
+    if (anchor) {
+      e.preventDefault();
+      void openExternalUrl(anchor.getAttribute("href"));
+    }
+  };
   return (
-    <Box className="ml-email-body">
-      {blocks.map((b, idx) => {
+    <Box className="ml-email-body" onClick={handleClick}>
+      {visible.map((b, idx) => {
         if (b.kind === "quote") {
           return <QuoteBlock key={idx} header={b.header} lines={b.lines} />;
         }

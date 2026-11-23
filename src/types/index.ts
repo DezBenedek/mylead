@@ -320,6 +320,7 @@ export interface EmailMessage {
   body: string;
   messageIdHeader: string | null;
   inReplyTo: string | null;
+  threadKey?: string | null;
   aiIntent: string | null;
   aiSuggestedReply: string | null;
   bookingLinkSent: boolean;
@@ -358,6 +359,8 @@ export interface InboxThread {
   scheduledSendAt?: string | null;
   autoSendStatus?: "scheduled" | "paused" | "cancelled" | "sent" | "failed" | string | null;
   bookingLinkSent: boolean;
+  /** Igaz, ha a beszélgetésben több eltérő tárgy van (érdemes ellenőrizni). */
+  hasSubjectChange?: boolean;
   messageCount: number;
   messages: EmailMessage[];
 }

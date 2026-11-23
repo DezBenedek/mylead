@@ -1114,6 +1114,8 @@ pub async fn send_direct_email(
         .as_ref()
         .is_some_and(|p| !p.booking_url.is_empty() && input.body.contains(&p.booking_url));
 
+    let new_thread_key: Option<String>;
+
     if input.schedule_mode == "auto_random" || input.schedule_mode == "custom" {
         let scheduled_at = if input.schedule_mode == "custom" {
             input
@@ -1123,7 +1125,7 @@ pub async fn send_direct_email(
         } else {
             ai::compute_random_business_send_time(&settings)
         };
-        db.insert_email_message_full(
+        let inserted_id = db.insert_email_message_full(
             None,
             &lead.id,
             "outbound",
@@ -1142,6 +1144,10 @@ pub async fn send_direct_email(
             None,
             None,
         )?;
+        new_thread_key = db
+            .get_email_message(&inserted_id)
+            .ok()
+            .and_then(|m| m.thread_key);
         db.log_activity(
             "campaign",
             "Közvetlen üzenet időzítve",
@@ -1172,7 +1178,7 @@ pub async fn send_direct_email(
             db.increment_sender_sent_today(&account.id);
             id
         };
-        db.insert_email_message_full(
+        let inserted_id = db.insert_email_message_full(
             None,
             &lead.id,
             "outbound",
@@ -1191,6 +1197,10 @@ pub async fn send_direct_email(
             None,
             None,
         )?;
+        new_thread_key = db
+            .get_email_message(&inserted_id)
+            .ok()
+            .and_then(|m| m.thread_key);
         if matches!(lead.status.as_str(), "new" | "promising" | "enriched") {
             let _ = db.update_lead_fields(LeadUpdateInput {
                 id: lead.id.clone(),
@@ -1207,10 +1217,7 @@ pub async fn send_direct_email(
     }
 
     let _ = app.emit("inbox-updated", ());
-    db.list_inbox_threads()?
-        .into_iter()
-        .find(|t| t.lead_id == lead.id)
-        .ok_or_else(|| "Beszélgetés nem található".to_string())
+    find_inbox_thread(&db, &lead.id, new_thread_key.as_deref())
 }
 
 #[tauri::command]
@@ -1404,7 +1411,21 @@ pub(crate) async fn sync_imap_inbox_inner(
         match fetched_res {
             Ok(fetched) => {
                 for mail in fetched {
+                    // Exactly-once: a törölt beszélgetések azonosítói is itt
+                    // vannak, így ugyanaz a levél nem kerül be újra — akkor sem,
+                    // ha az email_messages sorát már törölték.
+                    if db.is_inbound_processed(&mail.message_id) {
+                        continue;
+                    }
                     if db.message_id_exists(&mail.message_id) {
+                        // Régi sor, ami még nem került be a nyilvántartásba:
+                        // most pótoljuk, hogy a későbbi törlés után se jöjjön vissza.
+                        let _ = db.mark_inbound_processed(
+                            &mail.message_id,
+                            &mail.from_email,
+                            &mail.subject,
+                            "duplicate",
+                        );
                         continue;
                     }
                     if let Some(lead) = db.find_lead_by_email(&mail.from_email)? {
@@ -1419,6 +1440,12 @@ pub(crate) async fn sync_imap_inbox_inner(
                             mail.in_reply_to.as_deref(),
                         )
                         .await?;
+                        let _ = db.mark_inbound_processed(
+                            &mail.message_id,
+                            &mail.from_email,
+                            &mail.subject,
+                            "inserted",
+                        );
                         new_replies += 1;
                     }
                 }
@@ -1528,11 +1555,18 @@ pub async fn simulate_inbound_reply(
 ) -> Result<InboxThread, String> {
     let lead = db.get_lead(&lead_id)?;
     let subject = format!("Re: {} — megkeresés", lead.company_name);
-    process_inbound_reply(&app, &db, &lead, campaign_id.as_deref(), &subject, &body, None, None).await?;
-    db.list_inbox_threads()?
-        .into_iter()
-        .find(|t| t.lead_id == lead_id)
-        .ok_or_else(|| "Beszélgetés nem található".to_string())
+    let thread_key = process_inbound_reply(
+        &app,
+        &db,
+        &lead,
+        campaign_id.as_deref(),
+        &subject,
+        &body,
+        None,
+        None,
+    )
+    .await?;
+    find_inbox_thread(&db, &lead_id, Some(&thread_key))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1545,36 +1579,50 @@ pub(crate) async fn process_inbound_reply(
     body: &str,
     msg_id: Option<&str>,
     in_reply_to: Option<&str>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let settings = db.get_settings()?;
-    // Do not blindly attach a reply to "the first campaign" — resolve the
-    // conversation from the message being answered, then from the latest
-    // outbound message sent to this lead. Direct (campaign-less) threads stay
-    // direct so they do not get merged into an unrelated campaign.
+    // A válasz beszélgetését elsődlegesen az In-Reply-To fejléc dönti el.
+    // Csak akkor keresünk tárgy alapján, ha a kliens nem küld válaszfejlécet.
+    // Bármilyen más, találomra kiválasztott "legutolsó" levélhez csatolás
+    // összekeverné a különböző beszélgetéseket.
+    let parent = in_reply_to
+        .and_then(|header| db.find_email_message_by_header(header).ok().flatten())
+        .filter(|parent| parent.lead_id == lead.id);
+    let wanted_subject = crate::db::normalize_subject_root(subject);
+    let subject_match = if parent.is_none() {
+        db.list_lead_messages(&lead.id)
+            .unwrap_or_default()
+            .into_iter()
+            .rev()
+            .find(|m| {
+                m.direction == "outbound"
+                    && m.status == "sent"
+                    && crate::db::normalize_subject_root(&m.subject) == wanted_subject
+            })
+    } else {
+        None
+    };
+
     let campaign = match campaign_id_opt {
         Some(cid) => db.get_campaign(cid).ok(),
-        None => {
-            let from_parent = in_reply_to
-                .and_then(|header| db.find_email_message_by_header(header).ok().flatten())
-                .filter(|parent| parent.lead_id == lead.id)
-                .and_then(|parent| parent.campaign_id)
-                .and_then(|cid| db.get_campaign(&cid).ok());
-            from_parent.or_else(|| {
-                let history = db.list_lead_messages(&lead.id).unwrap_or_default();
-                let wanted_subject = crate::db::normalize_subject_root(subject);
-                history
-                    .iter()
-                    .rev()
-                    .find(|m| {
-                        m.direction == "outbound"
-                            && crate::db::normalize_subject_root(&m.subject) == wanted_subject
-                    })
-                    .or_else(|| history.iter().rev().find(|m| m.direction == "outbound"))
-                    .and_then(|m| m.campaign_id.clone())
-                    .and_then(|cid| db.get_campaign(&cid).ok())
-            })
-        }
+        None => parent
+            .as_ref()
+            .and_then(|p| p.campaign_id.as_deref())
+            .or_else(|| subject_match.as_ref().and_then(|m| m.campaign_id.as_deref()))
+            .and_then(|cid| db.get_campaign(cid).ok()),
     };
+
+    // A beszélgetés kulcsa: válasz esetén a szülőé, tárgy alapú találatnál a
+    // talált levélé. Ha egyik sem ismert, ez egy új, önálló beszélgetés.
+    let conversation_thread_key = if campaign_id_opt.is_some() {
+        None
+    } else {
+        parent
+            .as_ref()
+            .and_then(|p| p.thread_key.clone())
+            .or_else(|| subject_match.as_ref().and_then(|m| m.thread_key.clone()))
+    };
+
     let project = match &campaign {
         Some(c) => db.get_project(&c.project_id)?,
         None => db
@@ -1587,7 +1635,12 @@ pub(crate) async fn process_inbound_reply(
         Some(oid) => db.get_offer(oid)?,
         None => project.offers.first().cloned(),
     };
-    let thread_history = db.list_lead_messages(&lead.id).unwrap_or_default();
+    // Az AI csak ennek a beszélgetésnek az előzményeit lássa, ne a lead összes
+    // párhuzamos beszélgetését — így nem keveredik a válasz tartalma sem.
+    let thread_history = match conversation_thread_key.as_deref() {
+        Some(key) => db.list_thread_messages(key).unwrap_or_default(),
+        None => Vec::new(),
+    };
 
     let classification = ai::classify_and_draft_reply(
         &settings,
@@ -1626,6 +1679,14 @@ pub(crate) async fn process_inbound_reply(
         Some(&classification.summary),
         None,
     )?;
+    if let Some(key) = conversation_thread_key.as_deref() {
+        let _ = db.set_email_thread_key(&inbound_msg_id, key);
+    }
+    let conversation_key = db
+        .get_email_message(&inbound_msg_id)
+        .ok()
+        .and_then(|m| m.thread_key)
+        .unwrap_or_default();
 
     let _ = db.update_email_decision_metadata(
         &inbound_msg_id,
@@ -1701,14 +1762,27 @@ pub(crate) async fn process_inbound_reply(
 
         // Ha ugyanebben a beszélgetésben már van el nem küldött választervezet,
         // nem halmozunk mellé újat, hanem azt frissítjük az új levél alapján.
-        // Automatikus tervezet új időzítést kap, megállított megállítva marad.
-        // Így nem torlódnak tervezetek, és új levélig nem generálódik újabb.
-        let existing_pending = thread_history.iter().rev().find(|m| {
-            m.direction == "outbound"
-                && (m.status == "queued" || m.status == "draft")
-                && m.step_number >= 2
-                && m.campaign_id == campaign.as_ref().map(|c| c.id.clone())
-        });
+        // Más beszélgetés tervezetét viszont nem írjuk felül.
+        let conversation_messages = if conversation_key.is_empty() {
+            thread_history.clone()
+        } else {
+            db.list_thread_messages(&conversation_key).unwrap_or_default()
+        };
+        let existing_pending = conversation_messages
+            .iter()
+            .rev()
+            .find(|m| {
+                m.direction == "outbound"
+                    && m.status == "queued"
+                    && m.step_number >= 2
+            })
+            .or_else(|| {
+                conversation_messages.iter().rev().find(|m| {
+                    m.direction == "outbound"
+                        && (m.status == "queued" || m.status == "draft")
+                        && m.step_number >= 2
+                })
+            });
         if let Some(pend) = existing_pending {
             let _ = db.update_email_message_content(
                 &pend.id,
@@ -1716,6 +1790,11 @@ pub(crate) async fn process_inbound_reply(
                 &classification.suggested_reply,
                 None,
             );
+            // Egy beszélgetésben csak egy függő válasz maradjon; a korábbi
+            // duplikált tervezetek ne mehessenek ki elavult tartalommal.
+            if !conversation_key.is_empty() {
+                let _ = db.delete_other_pending_reply_drafts(&conversation_key, &pend.id);
+            }
             if pend.status == "queued" && auto_schedule {
                 let refreshed_at = ai::compute_random_business_send_time(&settings);
                 let _ = db.update_email_schedule(
@@ -1733,7 +1812,7 @@ pub(crate) async fn process_inbound_reply(
                 Some(&lead.id),
             );
         } else {
-            db.insert_email_message_full(
+            let reply_msg_id = db.insert_email_message_full(
                 campaign.as_ref().map(|c| c.id.as_str()),
                 &lead.id,
                 "outbound",
@@ -1752,6 +1831,9 @@ pub(crate) async fn process_inbound_reply(
                 Some(&classification.summary),
                 None,
             )?;
+            if !conversation_key.is_empty() {
+                let _ = db.set_email_thread_key(&reply_msg_id, &conversation_key);
+            }
 
             db.log_activity(
                 "reply",
@@ -1767,7 +1849,7 @@ pub(crate) async fn process_inbound_reply(
     }
 
     let _ = app.emit("inbox-updated", ());
-    Ok(())
+    Ok(conversation_key)
 }
 
 /// Dispatches a single scheduled outbound message (live SMTP/SES or dry-run)
@@ -1873,6 +1955,23 @@ pub(crate) async fn dispatch_due_scheduled_messages(app: &AppHandle) {
     }
 }
 
+fn find_inbox_thread(
+    db: &Database,
+    lead_id: &str,
+    preferred_thread_key: Option<&str>,
+) -> Result<InboxThread, String> {
+    let threads = db.list_inbox_threads()?;
+    if let Some(key) = preferred_thread_key.filter(|k| !k.trim().is_empty()) {
+        if let Some(found) = threads.iter().find(|t| t.thread_key == key) {
+            return Ok(found.clone());
+        }
+    }
+    threads
+        .into_iter()
+        .find(|t| t.lead_id == lead_id)
+        .ok_or_else(|| "Beszélgetés nem található".to_string())
+}
+
 #[tauri::command]
 pub fn save_inbox_reply_draft(
     app: AppHandle,
@@ -1883,12 +1982,20 @@ pub fn save_inbox_reply_draft(
     subject: String,
     body: String,
     keep_scheduled: bool,
+    thread_key: Option<String>,
 ) -> Result<InboxThread, String> {
     let settings = db.get_settings()?;
+    let mut effective_thread_key = thread_key.filter(|k| !k.trim().is_empty());
     if let Some(mid) = message_id.filter(|s| !s.trim().is_empty()) {
         db.update_email_message_content(&mid, &subject, &body, None)?;
         if !keep_scheduled {
             db.update_email_schedule(&mid, "draft", Some("paused"), None, None)?;
+        }
+        if effective_thread_key.is_none() {
+            effective_thread_key = db
+                .get_email_message(&mid)
+                .ok()
+                .and_then(|m| m.thread_key);
         }
     } else {
         let scheduled_at = if keep_scheduled {
@@ -1897,22 +2004,30 @@ pub fn save_inbox_reply_draft(
             None
         };
         let wanted_subject = crate::db::normalize_subject_root(&subject);
-        let reply_target = db
-            .list_lead_messages(&lead_id)
-            .unwrap_or_default()
-            .into_iter()
-            .rev()
-            .find(|m| {
-                m.direction == "inbound"
-                    && m.message_id_header.is_some()
-                    && if campaign_id.is_some() {
-                        m.campaign_id.as_deref() == campaign_id.as_deref()
-                    } else {
-                        crate::db::normalize_subject_root(&m.subject) == wanted_subject
-                    }
-            })
-            .and_then(|m| m.message_id_header);
-        db.insert_email_message_full(
+        let reply_target = match effective_thread_key.as_deref() {
+            Some(key) => db
+                .list_thread_messages(key)
+                .unwrap_or_default()
+                .into_iter()
+                .rev()
+                .find(|m| m.direction == "inbound" && m.message_id_header.is_some()),
+            None => db
+                .list_lead_messages(&lead_id)
+                .unwrap_or_default()
+                .into_iter()
+                .rev()
+                .find(|m| {
+                    m.direction == "inbound"
+                        && m.message_id_header.is_some()
+                        && if campaign_id.is_some() {
+                            m.campaign_id.as_deref() == campaign_id.as_deref()
+                        } else {
+                            crate::db::normalize_subject_root(&m.subject) == wanted_subject
+                        }
+                }),
+        }
+        .and_then(|m| m.message_id_header);
+        let inserted_id = db.insert_email_message_full(
             campaign_id.as_deref(),
             &lead_id,
             "outbound",
@@ -1931,13 +2046,18 @@ pub fn save_inbox_reply_draft(
             None,
             None,
         )?;
+        if let Some(key) = effective_thread_key.as_deref() {
+            let _ = db.set_email_thread_key(&inserted_id, key);
+        } else {
+            effective_thread_key = db
+                .get_email_message(&inserted_id)
+                .ok()
+                .and_then(|m| m.thread_key);
+        }
     }
 
     let _ = app.emit("inbox-updated", ());
-    db.list_inbox_threads()?
-        .into_iter()
-        .find(|t| t.lead_id == lead_id)
-        .ok_or_else(|| "Beszélgetés nem található".to_string())
+    find_inbox_thread(&db, &lead_id, effective_thread_key.as_deref())
 }
 
 #[tauri::command]
@@ -1981,10 +2101,7 @@ pub async fn control_scheduled_reply(
     }
 
     let _ = app.emit("inbox-updated", ());
-    db.list_inbox_threads()?
-        .into_iter()
-        .find(|t| t.lead_id == lead_id)
-        .ok_or_else(|| "Beszélgetés nem található".to_string())
+    find_inbox_thread(&db, &lead_id, msg.thread_key.as_deref())
 }
 
 #[tauri::command]
@@ -1996,13 +2113,26 @@ pub async fn rewrite_inbox_reply_with_ai(
     current_subject: String,
     current_body: String,
     instruction: String,
+    thread_key: Option<String>,
 ) -> Result<ai::GeneratedEmail, String> {
     if instruction.trim().is_empty() {
         return Err("Írj megjegyzést vagy instrukciót az AI-nak az átíráshoz!".to_string());
     }
     let lead = db.get_lead(&lead_id)?;
     let settings = db.get_settings()?;
-    let history = db.list_lead_messages(&lead_id).unwrap_or_default();
+    let effective_thread_key = thread_key
+        .filter(|k| !k.trim().is_empty())
+        .or_else(|| {
+            message_id
+                .as_deref()
+                .and_then(|mid| db.get_email_message(mid).ok())
+                .and_then(|m| m.thread_key)
+        });
+    // Csak a kiválasztott beszélgetés előzményeit adjuk az AI-nak.
+    let history = match effective_thread_key.as_deref() {
+        Some(key) => db.list_thread_messages(key).unwrap_or_default(),
+        None => db.list_lead_messages(&lead_id).unwrap_or_default(),
+    };
     let camp_id = message_id
         .as_deref()
         .and_then(|mid| db.get_email_message(mid).ok())
@@ -2052,33 +2182,36 @@ pub async fn generate_inbox_reply_with_ai(
     lead_id: String,
     campaign_id: Option<String>,
     subject: Option<String>,
+    thread_key: Option<String>,
 ) -> Result<InboxThread, String> {
     let lead = db.get_lead(&lead_id)?;
     let settings = db.get_settings()?;
     let all_history = db.list_lead_messages(&lead_id).unwrap_or_default();
+    let mut effective_thread_key = thread_key.filter(|k| !k.trim().is_empty());
 
-    // Keep the AI reply inside the selected conversation only.
+    // Keep the AI reply inside the selected conversation only. Ha ismert a
+    // beszélgetés-kulcs, kizárólag annak üzeneteit használjuk; a lead többi
+    // párhuzamos beszélgetése nem szivároghat be a válaszba.
     let wanted_subject = subject
         .as_deref()
         .map(crate::db::normalize_subject_root)
         .filter(|s| !s.is_empty());
-    let conversation_history: Vec<EmailMessage> = all_history
-        .iter()
-        .filter(|m| {
-            if campaign_id.is_some() {
-                m.campaign_id.as_deref() == campaign_id.as_deref()
-            } else if let Some(ref wanted) = wanted_subject {
-                m.campaign_id.is_none() && crate::db::normalize_subject_root(&m.subject) == *wanted
-            } else {
-                m.campaign_id.is_none()
-            }
-        })
-        .cloned()
-        .collect();
-    let history = if conversation_history.is_empty() {
-        all_history
+    let history: Vec<EmailMessage> = if let Some(key) = effective_thread_key.as_deref() {
+        db.list_thread_messages(key).unwrap_or_default()
     } else {
-        conversation_history
+        all_history
+            .iter()
+            .filter(|m| {
+                if campaign_id.is_some() {
+                    m.campaign_id.as_deref() == campaign_id.as_deref()
+                } else if let Some(ref wanted) = wanted_subject {
+                    m.campaign_id.is_none() && crate::db::normalize_subject_root(&m.subject) == *wanted
+                } else {
+                    m.campaign_id.is_none()
+                }
+            })
+            .cloned()
+            .collect()
     };
     let last_inbound = history.iter().rev().find(|m| m.direction == "inbound");
 
@@ -2125,9 +2258,11 @@ pub async fn generate_inbox_reply_with_ai(
     )
     .await;
     let sig = ai::resolve_email_signature(Some(&project), &settings);
+    let (expected_greeting, _) = ai::compute_hungarian_salutation(&lead, "professional_formal");
     let body = if classification.suggested_reply.trim().is_empty() {
         format!(
-            "Köszönöm a megkeresést!\n\nSzívesen egyeztetünk a(z) {} kapcsán. {}\n\n{}",
+            "{}\n\nKöszönöm a megkeresést!\n\nSzívesen egyeztetünk a(z) {} kapcsán. {}\n\n{}",
+            expected_greeting,
             lead.company_name,
             if !project.booking_url.is_empty() {
                 format!("Itt tud közvetlenül időpontot választani: {}", project.booking_url)
@@ -2141,9 +2276,18 @@ pub async fn generate_inbox_reply_with_ai(
     };
 
     // If an existing pending/paused outbound reply exists, update it; otherwise insert new scheduled reply
-    let existing_pending = history.iter().rev().find(|m| {
-        m.direction == "outbound" && (m.status == "queued" || (m.status == "draft" && (m.step_number >= 2 || m.auto_send_status.is_some())))
-    });
+    let existing_pending = history
+        .iter()
+        .rev()
+        .find(|m| m.direction == "outbound" && m.status == "queued" && m.step_number >= 2)
+        .or_else(|| {
+            history.iter().rev().find(|m| {
+                m.direction == "outbound"
+                    && (m.status == "queued"
+                        || (m.status == "draft"
+                            && (m.step_number >= 2 || m.auto_send_status.is_some())))
+            })
+        });
     let scheduled_at = ai::compute_random_business_send_time(&settings);
     if let Some(pend) = existing_pending {
         db.update_email_message_content(&pend.id, &reply_subject, &body, None)?;
@@ -2152,8 +2296,11 @@ pub async fn generate_inbox_reply_with_ai(
         } else {
             db.update_email_schedule(&pend.id, "draft", Some("paused"), None, None)?;
         }
+        if let Some(key) = effective_thread_key.as_deref() {
+            let _ = db.delete_other_pending_reply_drafts(key, &pend.id);
+        }
     } else {
-        db.insert_email_message_full(
+        let inserted_id = db.insert_email_message_full(
             camp.as_ref().map(|c| c.id.as_str()),
             &lead_id,
             "outbound",
@@ -2172,13 +2319,18 @@ pub async fn generate_inbox_reply_with_ai(
             Some(&classification.summary),
             None,
         )?;
+        if let Some(key) = effective_thread_key.as_deref() {
+            let _ = db.set_email_thread_key(&inserted_id, key);
+        } else {
+            effective_thread_key = db
+                .get_email_message(&inserted_id)
+                .ok()
+                .and_then(|m| m.thread_key);
+        }
     }
 
     let _ = app.emit("inbox-updated", ());
-    db.list_inbox_threads()?
-        .into_iter()
-        .find(|t| t.lead_id == lead_id)
-        .ok_or_else(|| "Beszélgetés nem található".to_string())
+    find_inbox_thread(&db, &lead_id, effective_thread_key.as_deref())
 }
 
 #[tauri::command]
@@ -2191,20 +2343,23 @@ pub async fn send_inbox_reply(
     body: String,
     dry_run: bool,
     pending_message_id: Option<String>,
+    thread_key: Option<String>,
 ) -> Result<InboxThread, String> {
+    let mut effective_thread_key = thread_key.filter(|k| !k.trim().is_empty());
     if let Some(pid) = pending_message_id.filter(|s| !s.trim().is_empty()) {
         db.update_email_message_content(&pid, &subject, &body, None)?;
         let msg = db.get_email_message(&pid)?;
+        if effective_thread_key.is_none() {
+            effective_thread_key = msg.thread_key.clone();
+        }
         execute_send_for_message(&db, &msg, dry_run).await?;
-        // Kézi küldés = auto-küldés vége: a lead többi mentett választervezetét töröljük,
-        // hogy semmi ne mehessen ki magától később, és új tervezet se maradjon vissza.
-        let _ = db.delete_other_pending_reply_drafts(&lead_id, &pid);
+        // Kézi küldés = auto-küldés vége ebben a beszélgetésben: csak az ide
+        // tartozó mentett választervezeteket töröljük, más beszélgetéseket nem.
+        if let Some(key) = effective_thread_key.as_deref() {
+            let _ = db.delete_other_pending_reply_drafts(key, &pid);
+        }
         let _ = app.emit("inbox-updated", ());
-        return db
-            .list_inbox_threads()?
-            .into_iter()
-            .find(|t| t.lead_id == lead_id)
-            .ok_or_else(|| "Beszélgetés nem található".to_string());
+        return find_inbox_thread(&db, &lead_id, effective_thread_key.as_deref());
     }
 
     let lead = db.get_lead(&lead_id)?;
@@ -2219,21 +2374,29 @@ pub async fn send_inbox_reply(
         None => db.list_projects()?.into_iter().next(),
     };
     let wanted_subject = crate::db::normalize_subject_root(&subject);
-    let reply_target = db
-        .list_lead_messages(&lead_id)
-        .unwrap_or_default()
-        .into_iter()
-        .rev()
-        .find(|m| {
-            m.direction == "inbound"
-                && m.message_id_header.is_some()
-                && if campaign_id.is_some() {
-                    m.campaign_id.as_deref() == campaign_id.as_deref()
-                } else {
-                    crate::db::normalize_subject_root(&m.subject) == wanted_subject
-                }
-        })
-        .and_then(|m| m.message_id_header);
+    let reply_target = match effective_thread_key.as_deref() {
+        Some(key) => db
+            .list_thread_messages(key)
+            .unwrap_or_default()
+            .into_iter()
+            .rev()
+            .find(|m| m.direction == "inbound" && m.message_id_header.is_some()),
+        None => db
+            .list_lead_messages(&lead_id)
+            .unwrap_or_default()
+            .into_iter()
+            .rev()
+            .find(|m| {
+                m.direction == "inbound"
+                    && m.message_id_header.is_some()
+                    && if campaign_id.is_some() {
+                        m.campaign_id.as_deref() == campaign_id.as_deref()
+                    } else {
+                        crate::db::normalize_subject_root(&m.subject) == wanted_subject
+                    }
+            }),
+    }
+    .and_then(|m| m.message_id_header);
 
     let booking_sent = project
         .as_ref()
@@ -2283,10 +2446,20 @@ pub async fn send_inbox_reply(
         booking_sent,
         Some(&Utc::now().to_rfc3339()),
     )?;
+    if let Some(key) = effective_thread_key.as_deref() {
+        let _ = db.set_email_thread_key(&new_sent_id, key);
+    } else {
+        effective_thread_key = db
+            .get_email_message(&new_sent_id)
+            .ok()
+            .and_then(|m| m.thread_key);
+    }
 
-    // Tervezet nélkül küldött kézi válasz esetén is töröljük a lead függőben
-    // maradt választervezeteit — az auto-küldés ezzel biztosan megszűnik.
-    let _ = db.delete_other_pending_reply_drafts(&lead.id, &new_sent_id);
+    // Tervezet nélkül küldött kézi válasz esetén is töröljük a beszélgetés
+    // függőben maradt választervezeteit — más beszélgetésekét nem.
+    if let Some(key) = effective_thread_key.as_deref() {
+        let _ = db.delete_other_pending_reply_drafts(key, &new_sent_id);
+    }
 
     if booking_sent {
         let _ = db.update_lead_fields(LeadUpdateInput {
@@ -2298,10 +2471,7 @@ pub async fn send_inbox_reply(
     }
 
     let _ = app.emit("inbox-updated", ());
-    db.list_inbox_threads()?
-        .into_iter()
-        .find(|t| t.lead_id == lead_id)
-        .ok_or_else(|| "Beszélgetés nem található".to_string())
+    find_inbox_thread(&db, &lead_id, effective_thread_key.as_deref())
 }
 
 // ==================== SENDER ACCOUNTS, SETTINGS, ANALYTICS ====================

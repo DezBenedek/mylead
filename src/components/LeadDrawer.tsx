@@ -19,6 +19,7 @@ import {
   TextInput,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import { openExternalUrl } from "../lib/openExternal";
 import {
   IconCheck,
   IconExternalLink,
@@ -207,16 +208,27 @@ export function LeadDrawer({
               leftSection={<IconWorld size={12} />}
               rightSection={
                 <ActionIcon
-                  component="a"
-                  href={lead.websiteUrl}
-                  target="_blank"
-                  rel="noreferrer"
                   size="xs"
                   variant="transparent"
+                  title="Weboldal megnyitása külső böngészőben"
+                  onClick={async (e) => {
+                    e.stopPropagation();
+                    const res = await openExternalUrl(lead.websiteUrl);
+                    if (!res.ok) {
+                      notifications.show({
+                        title: "Megnyitás sikertelen",
+                        message: `${lead.websiteUrl}${res.error ? ` — ${res.error}` : ""}`,
+                        color: "red",
+                        autoClose: 8000,
+                      });
+                    }
+                  }}
                 >
                   <IconExternalLink size={11} />
                 </ActionIcon>
               }
+              styles={{ root: { cursor: "pointer" } }}
+              onClick={() => void openExternalUrl(lead.websiteUrl)}
             >
               {lead.domain || lead.websiteUrl}
             </Badge>

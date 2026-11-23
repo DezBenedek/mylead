@@ -1629,6 +1629,39 @@ pub fn compute_hungarian_salutation(lead: &Lead, _tone: &str) -> (String, bool) 
 
 /// Ensures every generated email starts with the exact proper Hungarian salutation (`Kedves XY!`),
 /// never uses `Szia` / `Sziasztok` / trailing comma, and fixes singular/plural drift.
+/// Tipikus gépi magyartalanságok determinisztikus javítása a választervezetekben.
+/// (Pl. indokolatlan 'Szívesen!'-nyitás érdeklődésre, vagy a hibás 'máris megyek'
+/// igehasználat ígéretként.) Minden automatikus útvonalon lefut, így ilyen hiba
+/// akkor sem mehet ki, ha a modell a prompt ellenére is elvéti.
+pub fn fix_hungarian_reply_phrasing(body: &str) -> String {
+    let mut out = body.to_string();
+
+    // 'Szívesen!' csak köszönetre válaszolhat — levélnyitásként köszönet jár.
+    // Csak a szöveg elején cserélünk (ott egyértelműen hibás nyitás).
+    let lead_ws_len = out.len() - out.trim_start().len();
+    let (ws, rest) = out.split_at(lead_ws_len);
+    for opener in ["Szívesen!", "Szívesen,", "szívesen!", "szívesen,"] {
+        if rest == opener || rest.starts_with(&format!("{} ", opener)) || rest.starts_with(&format!("{}\n", opener)) {
+            let after = rest[opener.len()..].trim_start().to_string();
+            out = format!("{}Köszönöm a megkeresést! {}", ws, after);
+            break;
+        }
+    }
+
+    // Hibás igehasználat ígéretként: 'megyek' (távozás) helyett 'küldöm'.
+    out = out
+        .replace("és máris megyek", "és máris küldöm")
+        .replace("És máris megyek", "És máris küldöm")
+        .replace("máris megyek", "máris küldöm")
+        .replace("Máris megyek", "Máris küldöm");
+    // Üres frázis helyett konkrét kérés.
+    out = out
+        .replace("Csak egy szó, és máris", "Csak jelezze, és máris")
+        .replace("csak egy szó, és máris", "csak jelezze, és máris");
+
+    out
+}
+
 pub fn enforce_hungarian_email_quality(
     mut email: GeneratedEmail,
     expected_greeting: &str,
@@ -1638,8 +1671,10 @@ pub fn enforce_hungarian_email_quality(
     if raw_body.is_empty() {
         return email;
     }
-
-    let lines: Vec<&str> = raw_body.lines().collect();
+    // Előbb a gépi fordulatok javítása, és csak utána a köszönés-építés,
+    // hogy a javított nyitás ('Köszönöm a megkeresést!') is megkapja a megszólítást.
+    let fixed_owned = fix_hungarian_reply_phrasing(raw_body);
+    let lines: Vec<&str> = fixed_owned.lines().collect();
     let first_non_empty_idx = lines.iter().position(|l| !l.trim().is_empty()).unwrap_or(0);
     let first_line = lines.get(first_non_empty_idx).copied().unwrap_or("").trim();
     let first_lower = first_line.to_lowercase();
@@ -2303,6 +2338,12 @@ async fn call_openrouter_decision_model(
 
 fn normalize_reply_classification(mut c: ReplyClassification) -> ReplyClassification {
     c.priority_score = c.priority_score.clamp(1, 100);
+    // Automata minőségi kapu: a modell által írt tervezet gépi fordulatait
+    // determinisztikusan javítjuk (a helyi sablonok eleve helyesek, azokon nem változtat).
+    if !c.suggested_reply.trim().is_empty() {
+        c.suggested_reply = fix_hungarian_reply_phrasing(&c.suggested_reply);
+    }
+    c.priority_score = c.priority_score.clamp(1, 100);
     if c.priority_tier.trim().is_empty() {
         c.priority_tier = if c.priority_score >= 82 {
             "hot".into()
@@ -2342,6 +2383,10 @@ pub async fn classify_and_draft_reply(
     thread_history: &[EmailMessage],
 ) -> ReplyClassification {
     let signature = resolve_email_signature(Some(project), settings);
+    // A megszólítás minden automatikus választervezet elejére kötelező —
+    // eddig egyik útvonal sem garantálta, ezért néha lemaradt.
+    let (expected_greeting, is_single_person) =
+        compute_hungarian_salutation(lead, "professional_formal");
     let offer_block = format_campaign_offer_block(offer_summary, offer_timing, offer_delivery, offer, false);
     let history_text = thread_history
         .iter()
@@ -2367,7 +2412,11 @@ pub async fn classify_and_draft_reply(
    - 40..64 ('medium'): Kifogás, halogatás ('most nincs rá idő', 'drága', 'már van rendszerünk'), amit egy jó válasszal még meg lehet fordítani.\n\
    - 1..39 ('low'): Nem érdekli ('not_interested'), házon kívül ('out_of_office') vagy leiratkozás ('unsubscribe').\n\
 2. AUTOMATIKUS TARTALMI CÍMKÉZÉS ('tags'): Adj 2-4 rövid, magyar nyelvű címkét a levél konkrét tartalma alapján (pl. 'Időpontot kér', 'Demó', 'Árazás kérdés', 'Google Naptár', 'Technikai kérdés', 'Kedvezmény', 'Időhiány kifogás', 'Döntéshozó', 'Házon kívül', 'Leiratkozás').\n\
-3. VÁLASZ MEGÍRÁSA ('suggested_reply'): Írj rövid, lényegre törő, természetes magyar választ (maximum 3-4 rövid mondat, sallang és ömlengés nélkül; csak leiratkozás vagy házon kívüli auto-válasz esetén hagyd üresen). SZIGORÚAN TARTSD BE A KAMPÁNY-AJÁNLAT TÁLALÁSI SZABÁLYÁT! Ha időpontot/bemutatót kér, illeszd be a projekt időpontfoglaló linkjét! A megadott Aláírást pontosan használd a végén.\n\
+3. VÁLASZ MEGÍRÁSA ('suggested_reply'): Rövid, lényegre törő, természetes magyar B2B válasz (maximum 3-4 rövid mondat, sallang és ömlengés nélkül; csak leiratkozás vagy házon kívüli auto-válasz esetén hagyd üresen). SZIGORÚ MAGYAR STÍLUSSZABÁLYOK:\n\
+   - MINDIG köszönéssel kezd ('Köszönöm a megkeresést!' vagy 'Köszönöm a visszajelzést!'). TILOS 'Szívesen!'-nel nyitni — az kizárólag köszönetre adott válasz lehet, érdeklődésre NEM!\n\
+   - Végig magázódó, udvarias üzleti hang, következetes ragozással. TILOS a 'megyek' ige ígéretként ('máris megyek' HELYETT mindig 'máris küldöm'); TILOS az üres 'csak egy szó' frázis (HELYETTE: 'csak jelezze').\n\
+   - Minden mondatnak legyen tartalma: reagálás a levélre + egy konkrétum + egyértelmű következő lépés (konkrét kérdés vagy időpontfoglaló link). TILOS tartalmatlan általánosság ('rövid ötleteim a folyamatba rendezésről' jellegű ködösítés).\n\
+SZIGORÚAN TARTSD BE A KAMPÁNY-AJÁNLAT TÁLALÁSI SZABÁLYÁT! Ha időpontot/bemutatót kér, illeszd be a projekt időpontfoglaló linkjét! A megadott Aláírást pontosan használd a végén.\n\
 Kizárólag JSON-t adj vissza: {\"intent\":\"interested|booking_request|question|objection|not_interested|out_of_office|unsubscribe\",\"priority_score\":88,\"priority_tier\":\"hot|high|medium|low\",\"tags\":[\"...\"],\"suggested_reply\":\"...\",\"should_include_booking_link\":true|false,\"summary\":\"...\"}";
 
     let user = format!(
@@ -2573,7 +2622,7 @@ Kizárólag JSON-t adj vissza: {\"intent\":\"interested|booking_request|question
     }
     };
 
-    if let Some(mut decision) = decision_result {
+    let mut out = if let Some(mut decision) = decision_result {
         let local = build_local_reply();
         if decision.tags.is_empty() {
             decision.tags = local.tags;
@@ -2605,19 +2654,34 @@ Kizárólag JSON-t adj vissza: {\"intent\":\"interested|booking_request|question
                 decision.tags.join(", ")
             }
         );
-        return normalize_reply_classification(decision);
-    }
-
-    // 2. Otherwise use the workspace's active AI provider (OpenCode CLI / Claude CLI / Codex CLI / OpenRouter / Gemini / etc.)
-    if has_live_ai(settings) {
-        if let Ok(json_str) = call_llm_json(settings, system, &user).await {
-            if let Ok(parsed) = serde_json::from_str::<ReplyClassification>(&json_str) {
-                return normalize_reply_classification(parsed);
-            }
+        normalize_reply_classification(decision)
+    } else if has_live_ai(settings) {
+        // 2. Otherwise use the workspace's active AI provider (OpenCode CLI / Claude CLI / Codex CLI / OpenRouter / Gemini / etc.)
+        match call_llm_json(settings, system, &user).await {
+            Ok(json_str) => match serde_json::from_str::<ReplyClassification>(&json_str) {
+                Ok(parsed) => normalize_reply_classification(parsed),
+                Err(_) => build_local_reply(),
+            },
+            Err(_) => build_local_reply(),
         }
-    }
+    } else {
+        build_local_reply()
+    };
 
-    build_local_reply()
+    // Minden automatikus választervezet kötelezően a helyes megszólítással
+    // ("Kedves XY!") kezdődjön — az üres (leiratkozó/házon kívüli) kivételével.
+    if !out.suggested_reply.trim().is_empty() {
+        let fixed = enforce_hungarian_email_quality(
+            GeneratedEmail {
+                subject: String::new(),
+                body: std::mem::take(&mut out.suggested_reply),
+            },
+            &expected_greeting,
+            is_single_person,
+        );
+        out.suggested_reply = fixed.body;
+    }
+    out
 }
 
 /// Rewrites an email draft or inbox auto-reply strictly following the user's comment/instruction
@@ -3097,5 +3161,100 @@ mod tests {
         assert!(with_sig.ends_with(sig));
         // Calling it again when signature is already present does not duplicate it
         assert_eq!(ensure_signature_present(&with_sig, sig), with_sig);
+    }
+
+    fn make_test_project() -> Project {
+        Project {
+            id: "p".into(),
+            name: "OKOSűrlap".into(),
+            website_url: "https://okosurlap.hu".into(),
+            industry: String::new(),
+            language: "hu".into(),
+            description: String::new(),
+            booking_url: "https://naptar.hu/foglalas".into(),
+            landing_url: "https://okosurlap.hu".into(),
+            email_signature: "Üdvözlettel,\nDezső Benedek".into(),
+            value_proposition: "Magyar űrlapkészítő megoldás.".into(),
+            target_audience: String::new(),
+            pain_points_solved: vec![],
+            pitch_angles: vec![],
+            objection_handlers: vec![],
+            crawled_summary: String::new(),
+            crawled_pages_count: 0,
+            last_crawled_at: None,
+            offers: vec![],
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    fn make_test_lead() -> Lead {
+        Lead {
+            id: "l".into(),
+            company_name: "ProMan Consulting".into(),
+            domain: String::new(),
+            website_url: String::new(),
+            industry: String::new(),
+            location: String::new(),
+            address: String::new(),
+            phone: String::new(),
+            primary_email: "info@promanconsulting.hu".into(),
+            employee_estimate: String::new(),
+            google_rating: None,
+            google_reviews: None,
+            source: String::new(),
+            status: "new".into(),
+            fit_score: 0,
+            enriched: false,
+            company_summary: "ProMan Consulting képzések".into(),
+            pain_points: vec![],
+            how_we_can_help: String::new(),
+            recommended_pitch: String::new(),
+            tech_stack: vec![],
+            contacts: vec![],
+            audit: None,
+            tags: vec![],
+            notes: String::new(),
+            searches: vec![],
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_auto_reply_drafts_always_start_with_salutation() {
+        // AI-kulcsok nélkül a helyi sablonépítő fut — minden intentre
+        // kötelező a "Kedves XY!" megszólítás a tervezet elején.
+        let settings = AppSettings::default();
+        let project = make_test_project();
+        let lead = make_test_lead();
+
+        for inbound in [
+            "Szeretnénk időpontot egyeztetni egy bemutatóra a jövő héten.",
+            "Mennyibe kerül a megoldás, és hogyan működik a fizetés?",
+            "Köszönjük, érdekes a megoldás, küldjenek részleteket!",
+            "Most nincs rá időnk, de talán később.",
+        ] {
+            let c = classify_and_draft_reply(
+                &settings,
+                &project,
+                None,
+                "",
+                "on_interest",
+                "",
+                &lead,
+                inbound,
+                &[],
+            )
+            .await;
+            if c.suggested_reply.trim().is_empty() {
+                continue;
+            }
+            assert!(
+                c.suggested_reply.starts_with("Kedves ProMan Csapat!\n\n"),
+                "hiányzik a megszólítás ennél: {:?}",
+                inbound
+            );
+        }
     }
 }
