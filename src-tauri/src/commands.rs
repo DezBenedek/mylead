@@ -1372,6 +1372,16 @@ pub(crate) async fn sync_imap_inbox_inner(
     db: &Database,
     sender_account_id: Option<&str>,
 ) -> Result<usize, String> {
+    // A frontend csendes pollja és a backend saját ütemezett pollja könnyen
+    // átfedésbe kerül — ilyenkor ugyanaz a levél kétszer is bekerülne
+    // (check-then-insert verseny). Ha már fut egy szinkron, ezt kihagyjuk.
+    static IMAP_SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = match IMAP_SYNC_LOCK.try_lock() {
+        Ok(g) => g,
+        Err(_) => return Ok(0),
+    };
+    // Korábban beragadt duplikált bejövő üzenetek takarítása.
+    let _ = db.delete_duplicate_inbound_messages();
     let accounts = db.list_sender_accounts()?;
     let targets: Vec<SenderAccount> = match sender_account_id {
         Some(id) if !id.is_empty() => accounts.into_iter().filter(|a| a.id == id).collect(),
@@ -1689,36 +1699,71 @@ pub(crate) async fn process_inbound_reply(
         let booking_link_included = classification.should_include_booking_link
             || (!project.booking_url.is_empty() && classification.suggested_reply.contains(&project.booking_url));
 
-        db.insert_email_message_full(
-            campaign.as_ref().map(|c| c.id.as_str()),
-            &lead.id,
-            "outbound",
-            if auto_schedule { "queued" } else { "draft" },
-            2,
-            &reply_subject,
-            &classification.suggested_reply,
-            None,
-            msg_id,
-            None,
-            None,
-            booking_link_included,
-            None,
-            if auto_schedule { Some(scheduled_at.as_str()) } else { None },
-            Some(if auto_schedule { "scheduled" } else { "paused" }),
-            Some(&classification.summary),
-            None,
-        )?;
+        // Ha ugyanebben a beszélgetésben már van el nem küldött választervezet,
+        // nem halmozunk mellé újat, hanem azt frissítjük az új levél alapján.
+        // Automatikus tervezet új időzítést kap, megállított megállítva marad.
+        // Így nem torlódnak tervezetek, és új levélig nem generálódik újabb.
+        let existing_pending = thread_history.iter().rev().find(|m| {
+            m.direction == "outbound"
+                && (m.status == "queued" || m.status == "draft")
+                && m.step_number >= 2
+                && m.campaign_id == campaign.as_ref().map(|c| c.id.clone())
+        });
+        if let Some(pend) = existing_pending {
+            let _ = db.update_email_message_content(
+                &pend.id,
+                &reply_subject,
+                &classification.suggested_reply,
+                None,
+            );
+            if pend.status == "queued" && auto_schedule {
+                let refreshed_at = ai::compute_random_business_send_time(&settings);
+                let _ = db.update_email_schedule(
+                    &pend.id,
+                    "queued",
+                    Some("scheduled"),
+                    Some(&refreshed_at),
+                    None,
+                );
+            }
+            db.log_activity(
+                "reply",
+                "AI választervezet frissítve az új levél alapján",
+                &format!("{} — bármikor megállítható vagy átírható a Beérkező oldalon", lead.company_name),
+                Some(&lead.id),
+            );
+        } else {
+            db.insert_email_message_full(
+                campaign.as_ref().map(|c| c.id.as_str()),
+                &lead.id,
+                "outbound",
+                if auto_schedule { "queued" } else { "draft" },
+                2,
+                &reply_subject,
+                &classification.suggested_reply,
+                None,
+                msg_id,
+                None,
+                None,
+                booking_link_included,
+                None,
+                if auto_schedule { Some(scheduled_at.as_str()) } else { None },
+                Some(if auto_schedule { "scheduled" } else { "paused" }),
+                Some(&classification.summary),
+                None,
+            )?;
 
-        db.log_activity(
-            "reply",
-            if auto_schedule {
-                "AI auto-válasz előkészítve és időzítve"
-            } else {
-                "AI választervezet elkészült (jóváhagyásra vár)"
-            },
-            &format!("{} — bármikor megállítható vagy átírható a Beérkező oldalon", lead.company_name),
-            Some(&lead.id),
-        );
+            db.log_activity(
+                "reply",
+                if auto_schedule {
+                    "AI auto-válasz előkészítve és időzítve"
+                } else {
+                    "AI választervezet elkészült (jóváhagyásra vár)"
+                },
+                &format!("{} — bármikor megállítható vagy átírható a Beérkező oldalon", lead.company_name),
+                Some(&lead.id),
+            );
+        }
     }
 
     let _ = app.emit("inbox-updated", ());
@@ -2151,6 +2196,9 @@ pub async fn send_inbox_reply(
         db.update_email_message_content(&pid, &subject, &body, None)?;
         let msg = db.get_email_message(&pid)?;
         execute_send_for_message(&db, &msg, dry_run).await?;
+        // Kézi küldés = auto-küldés vége: a lead többi mentett választervezetét töröljük,
+        // hogy semmi ne mehessen ki magától később, és új tervezet se maradjon vissza.
+        let _ = db.delete_other_pending_reply_drafts(&lead_id, &pid);
         let _ = app.emit("inbox-updated", ());
         return db
             .list_inbox_threads()?
@@ -2220,7 +2268,7 @@ pub async fn send_inbox_reply(
         id
     };
 
-    db.insert_email_message(
+    let new_sent_id = db.insert_email_message(
         campaign.as_ref().map(|c| c.id.as_str()),
         &lead.id,
         "outbound",
@@ -2235,6 +2283,10 @@ pub async fn send_inbox_reply(
         booking_sent,
         Some(&Utc::now().to_rfc3339()),
     )?;
+
+    // Tervezet nélkül küldött kézi válasz esetén is töröljük a lead függőben
+    // maradt választervezeteit — az auto-küldés ezzel biztosan megszűnik.
+    let _ = db.delete_other_pending_reply_drafts(&lead.id, &new_sent_id);
 
     if booking_sent {
         let _ = db.update_lead_fields(LeadUpdateInput {

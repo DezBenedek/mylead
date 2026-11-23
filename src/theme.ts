@@ -45,16 +45,25 @@ export const myleadTheme = createTheme({
   },
   defaultRadius: "sm",
   radius: {
-    xs: "3px",
-    sm: "5px",
-    md: "7px",
-    lg: "9px",
-    xl: "12px",
+    xs: "4px",
+    sm: "6px",
+    md: "10px",
+    lg: "14px",
+    xl: "20px",
+  },
+  spacing: {
+    xs: "10px",
+    sm: "14px",
+    md: "20px",
+    lg: "28px",
+    xl: "40px",
   },
   shadows: {
-    xs: "0 1px 2px rgba(24, 24, 27, 0.04)",
-    sm: "0 1px 3px rgba(24, 24, 27, 0.06)",
-    md: "0 4px 12px rgba(24, 24, 27, 0.06)",
+    xs: "0 1px 2px rgba(24, 24, 27, 0.05)",
+    sm: "0 1px 3px rgba(24, 24, 27, 0.07), 0 1px 2px rgba(24, 24, 27, 0.04)",
+    md: "0 6px 18px rgba(24, 24, 27, 0.08), 0 1px 4px rgba(24, 24, 27, 0.05)",
+    lg: "0 12px 32px rgba(24, 24, 27, 0.12), 0 2px 8px rgba(24, 24, 27, 0.06)",
+    xl: "0 24px 56px rgba(24, 24, 27, 0.16), 0 4px 12px rgba(24, 24, 27, 0.08)",
   },
   components: {
     Paper: {

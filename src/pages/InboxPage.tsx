@@ -6,51 +6,32 @@ import {
   Button,
   Checkbox,
   Group,
-  Menu,
   Modal,
   NumberInput,
   Paper,
   ScrollArea,
-  SegmentedControl,
   Select,
   SimpleGrid,
   Stack,
   Switch,
   Text,
   Textarea,
-  TextInput,
   Tooltip,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import {
-  IconAdjustments,
-  IconArrowsSort,
-  IconBolt,
-  IconCalendarEvent,
-  IconCheck,
-  IconChevronDown,
-  IconClock,
-  IconFlame,
-  IconHistory,
-  IconMailPlus,
-  IconPlayerPause,
-  IconPlayerPlay,
-  IconRefresh,
-  IconSearch,
-  IconSend,
-  IconSparkles,
-  IconTag,
-  IconTrash,
-  IconUser,
-  IconWand,
-  IconWorld,
-} from "@tabler/icons-react";
+import { IconArrowBackUp, IconMailPlus, IconPlayerPause, IconRefresh, IconSparkles, IconTrash } from "@tabler/icons-react";
 import { DirectEmailModal } from "../components/DirectEmailModal";
+import { ComposerStudio } from "../components/inbox/ComposerStudio";
+import { EmailBody } from "../components/inbox/EmailBody";
+import { InboxContextRail } from "../components/inbox/InboxContextRail";
+import { InboxTopBar } from "../components/inbox/InboxTopBar";
+import { MessageTimeline } from "../components/inbox/MessageTimeline";
+import { ThreadHeader } from "../components/inbox/ThreadHeader";
+import { ThreadListPane } from "../components/inbox/ThreadListPane";
 import {
   api,
   formatCountdown,
   formatShortDate,
-  INTENT_META,
   LEAD_STATUS_META,
 } from "../lib/api";
 import type {
@@ -84,20 +65,6 @@ const WEEKDAY_LABELS = [
   { day: 7, short: "V" },
 ];
 
-const QUICK_REWRITE_PRESETS = [
-  { label: "Rövidebben (4-5 mondat)", note: "Írd sokkal tömörebbre, max 4-5 mondatba, lényegre törően." },
-  { label: "Közvetlenebb (tegező)", note: "Írd át közvetlen, barátságos tegező stílusra." },
-  { label: "Hivatalosabb (magázó)", note: "Írd át udvarias, magázódó üzleti stílusra." },
-  {
-    label: "Okosűrlap fókusz",
-    note: "Emeld ki konkrétan, hogyan segít az okosűrlap ennek a cégnek (előszűrés, gyorsabb ajánlatadás, több foglalás).",
-  },
-  {
-    label: "Időpontfoglalóval",
-    note: "Finoman tereld egy 15 perces egyeztetésre és illeszd be a foglalási linket.",
-  },
-];
-
 export function InboxPage({
   threads,
   leads,
@@ -123,6 +90,8 @@ export function InboxPage({
   const [aiComment, setAiComment] = useState("");
   const [customScheduleInput, setCustomScheduleInput] = useState("");
   const [showCustomSchedule, setShowCustomSchedule] = useState(false);
+  const [railOpen, setRailOpen] = useState(true);
+  const [composerOpen, setComposerOpen] = useState(false);
 
   const [syncing, setSyncing] = useState(false);
   const [reclassifying, setReclassifying] = useState(false);
@@ -145,6 +114,7 @@ export function InboxPage({
   const [deleting, setDeleting] = useState(false);
   const lastServerSettingsJsonRef = useRef<string>(JSON.stringify(settings));
   const activeComposerKeyRef = useRef<string>("");
+  const timelineViewportRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const incomingJson = JSON.stringify(settings);
@@ -508,6 +478,7 @@ export function InboxPage({
       );
       await onRefresh();
       setReplyBody("");
+      setComposerOpen(false);
       notifications.show({
         title: "Válasz elküldve",
         message: selected.leadEmail,
@@ -598,108 +569,50 @@ export function InboxPage({
   const isScheduled = pendingMsg?.autoSendStatus === "scheduled";
   const isPaused = !!pendingMsg && pendingMsg.autoSendStatus !== "scheduled";
 
+  // Mindig a legfrissebb üzenethez görget: váltáskor és új üzenet érkeztekor.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const timelineAnchor = `${selected?.threadKey ?? "none"}:${timelineMessages.length}`;
+  useEffect(() => {
+    const vp = timelineViewportRef.current;
+    if (vp) {
+      requestAnimationFrame(() => {
+        vp.scrollTop = vp.scrollHeight;
+      });
+    }
+  }, [timelineAnchor]);
+
+  const hotCount = threads.filter(
+    (t) =>
+      (t.priorityScore ?? 0) >= 80 ||
+      ["interested", "booking_request", "question"].includes(t.latestIntent || "")
+  ).length;
+  const autoLabel = `${workdaySummary} ${String(settings.autoReplyStartHour).padStart(2, "0")}–${String(
+    settings.autoReplyEndHour
+  ).padStart(2, "0")}h · ${settings.autoReplyMinDelayMin}–${settings.autoReplyMaxDelayMin}p`;
+  const footerStatus = hasImapAccount
+    ? lastAutoSyncAt
+      ? `Auto-IMAP ${lastAutoSyncAt} · ${settings.imapPollMinutes || 1} percenként`
+      : "Auto-IMAP aktív"
+    : "IMAP kikapcsolva";
+
   return (
-    <Box style={{ display: "flex", flexDirection: "column", height: "100vh", overflow: "hidden" }}>
-      {/* Single Ultra-Compact 50px Top Bar */}
-      <Group
-        justify="space-between"
-        px="md"
-        py={9}
-        wrap="nowrap"
-        style={{
-          borderBottom: "1px solid var(--ml-border)",
-          backgroundColor: "var(--ml-surface)",
-          minHeight: 50,
-          flexShrink: 0,
-        }}
-      >
-        <Group gap="sm" wrap="nowrap" style={{ minWidth: 0 }}>
-          <Text fw={700} size="md" style={{ letterSpacing: "-0.02em", whiteSpace: "nowrap" }}>
-            Beérkező
-          </Text>
-          <Badge
-            size="sm"
-            variant={settings.autoReplyEnabled ? "light" : "default"}
-            color={settings.autoReplyEnabled ? "forest" : "gray"}
-            leftSection={<IconClock size={11} />}
-            style={{ cursor: "pointer" }}
-            onClick={() => setRulesModalOpen(true)}
-          >
-            {workdaySummary} {String(settings.autoReplyStartHour).padStart(2, "0")}–
-            {String(settings.autoReplyEndHour).padStart(2, "0")}h • {settings.autoReplyMinDelayMin}–
-            {settings.autoReplyMaxDelayMin}p
-          </Badge>
-          <Switch
-            size="xs"
-            checked={settings.autoReplyEnabled}
-            label="Auto-válasz"
-            onChange={async (e) => {
-              await api.saveSettings({ ...settings, autoReplyEnabled: e.currentTarget.checked });
-              await onRefresh();
-            }}
-          />
-          <Badge
-            size="xs"
-            variant="dot"
-            color={hasImapAccount ? "green" : "gray"}
-            title={
-              hasImapAccount
-                ? `Automatikus háttér-szinkron aktív (${settings.imapPollMinutes || 1} percenként)`
-                : "Nincs aktív IMAP fiók bekapcsolva a Beállításokban"
-            }
-          >
-            {hasImapAccount
-              ? lastAutoSyncAt
-                ? `Auto-IMAP (${lastAutoSyncAt})`
-                : "Auto-IMAP aktív"
-              : "IMAP kikapcsolva"}
-          </Badge>
-        </Group>
+    <Box className="ml-inbox-page">
+      <InboxTopBar
+        totalCount={threads.length}
+        hotCount={hotCount}
+        autoEnabled={settings.autoReplyEnabled}
+        autoLabel={autoLabel}
+        onOpenRules={() => setRulesModalOpen(true)}
+        reclassifying={reclassifying}
+        onReclassify={handleReclassifyAll}
+        reclassifyDisabled={threads.length === 0}
+        decisionModelId={settings.decisionModelId || "google/gemini-2.5-flash"}
+        syncing={syncing}
+        onSync={handleImapSync}
+        composeDisabled={leads.length === 0}
+        onCompose={() => setComposeOpen(true)}
+      />
 
-        <Group gap={6} wrap="nowrap">
-          <Tooltip label="Auto-válasz és Decision Model szabályok">
-            <ActionIcon variant="default" size="md" onClick={() => setRulesModalOpen(true)}>
-              <IconAdjustments size={15} />
-            </ActionIcon>
-          </Tooltip>
-          <Tooltip
-            label={`OpenRouter Decisions (${
-              settings.decisionModelId || "google/gemini-2.5-flash"
-            }) futtatása a beérkező üzenetek újrarangsorolásához és címkézéséhez`}
-          >
-            <Button
-              size="xs"
-              variant="light"
-              color="forest"
-              leftSection={<IconBolt size={14} />}
-              loading={reclassifying}
-              disabled={threads.length === 0}
-              onClick={handleReclassifyAll}
-            >
-              AI Rangsorolás
-            </Button>
-          </Tooltip>
-          <Button
-            size="xs"
-            variant="default"
-            leftSection={<IconMailPlus size={14} />}
-            disabled={leads.length === 0}
-            onClick={() => setComposeOpen(true)}
-          >
-            Új üzenet
-          </Button>
-          <Button
-            size="xs"
-            leftSection={<IconRefresh size={14} />}
-            loading={syncing}
-            onClick={handleImapSync}
-          >
-            Frissítés
-          </Button>
-        </Group>
-      </Group>
-
-      {/* Full-Height Split-Pane Mail Client Body */}
       {threads.length === 0 ? (
         <Box p="xl">
           <Paper p="lg" maw={520}>
@@ -734,657 +647,181 @@ export function InboxPage({
           </Paper>
         </Box>
       ) : (
-        <Box style={{ display: "flex", flex: 1, minHeight: 0, overflow: "hidden" }}>
-          {/* Left Compact Thread List */}
-          <Box
-            style={{
-              width: 315,
-              minWidth: 285,
-              borderRight: "1px solid var(--ml-border)",
-              backgroundColor: "var(--ml-canvas)",
-              display: "flex",
-              flexDirection: "column",
-            }}
-          >
-            <Stack gap={6} p={10} style={{ borderBottom: "1px solid var(--ml-border)" }}>
-              <Group gap={6} wrap="nowrap">
-                <TextInput
-                  size="xs"
-                  placeholder="Keresés név, címke, tartalom..."
-                  leftSection={<IconSearch size={13} />}
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.currentTarget.value)}
-                  style={{ flex: 1 }}
-                />
-                <Tooltip
-                  label={
-                    sortMode === "priority"
-                      ? "Rendezés: OpenRouter Decisions prioritás szerint (Kattints az időrendhez)"
-                      : "Rendezés: Legutóbbi üzenet szerint (Kattints az AI prioritás szerinti rendezéshez)"
-                  }
-                >
-                  <Button
-                    size="xs"
-                    variant={sortMode === "priority" ? "light" : "default"}
-                    color={sortMode === "priority" ? "forest" : "gray"}
-                    px={8}
-                    leftSection={<IconArrowsSort size={13} />}
-                    onClick={() =>
-                      setSortMode((prev) => (prev === "priority" ? "recent" : "priority"))
-                    }
-                  >
-                    {sortMode === "priority" ? "AI Rangsor" : "Időrend"}
-                  </Button>
-                </Tooltip>
-              </Group>
-              <SegmentedControl
-                size="xs"
-                fullWidth
-                value={threadFilter}
-                onChange={setThreadFilter}
-                data={[
-                  { value: "all", label: `Mind (${threads.length})` },
-                  { value: "hot", label: "🔥 Fókusz" },
-                  { value: "scheduled", label: `⏰ ${scheduledCount}` },
-                  { value: "paused", label: `⏸ ${pausedCount}` },
-                ]}
-              />
-            </Stack>
+        <Box className="ml-inbox-body">
+          <ThreadListPane
+            threads={filteredThreads}
+            selectedKey={selected?.threadKey ?? null}
+            onSelect={setSelectedThreadKey}
+            searchQuery={searchQuery}
+            onSearchChange={setSearchQuery}
+            sortMode={sortMode}
+            onToggleSort={() =>
+              setSortMode((prev) => (prev === "priority" ? "recent" : "priority"))
+            }
+            filter={threadFilter}
+            onFilterChange={setThreadFilter}
+            counts={{ total: threads.length, scheduled: scheduledCount, paused: pausedCount }}
+            footerStatus={footerStatus}
+          />
 
-            <ScrollArea style={{ flex: 1 }} p={8}>
-              <Stack gap={6}>
-                {filteredThreads.length === 0 ? (
-                  <Text size="xs" c="dimmed" ta="center" py="md">
-                    Nincs találat.
-                  </Text>
-                ) : (
-                  filteredThreads.map((t) => {
-                    const active = selected?.threadKey === t.threadKey;
-                    const intentMeta = t.latestIntent ? INTENT_META[t.latestIntent] : null;
-                    const prio = t.priorityScore ?? 50;
-                    const prioColor =
-                      prio >= 80
-                        ? "red"
-                        : prio >= 65
-                        ? "orange"
-                        : prio >= 50
-                        ? "forest"
-                        : "gray";
-                    const tags = t.aiTags || [];
-                    return (
-                      <Box
-                        key={t.threadKey}
-                        p="xs"
-                        onClick={() => setSelectedThreadKey(t.threadKey)}
-                        style={{
-                          cursor: "pointer",
-                          borderRadius: 6,
-                          border: active
-                            ? "1px solid #166534"
-                            : prio >= 80
-                            ? "1px solid rgba(220, 38, 38, 0.45)"
-                            : t.autoSendStatus === "scheduled"
-                            ? "1px solid #d97706"
-                            : "1px solid var(--ml-border)",
-                          backgroundColor: active ? "var(--ml-surface)" : "transparent",
-                        }}
-                      >
-                        <Group justify="space-between" wrap="nowrap" gap={4}>
-                          <Group gap={5} wrap="nowrap" style={{ minWidth: 0 }}>
-                            <Badge
-                              size="xs"
-                              color={prioColor}
-                              variant={prio >= 75 ? "filled" : "light"}
-                              className="ml-tabular"
-                              leftSection={prio >= 80 ? <IconFlame size={10} /> : undefined}
-                              style={{ flexShrink: 0 }}
-                            >
-                              {prio}
-                            </Badge>
-                            <Text size="xs" fw={600} truncate>
-                              {t.leadCompany}
-                            </Text>
-                          </Group>
-                          <Text
-                            size="10px"
-                            c="dimmed"
-                            className="ml-tabular"
-                            style={{ whiteSpace: "nowrap" }}
-                          >
-                            {formatShortDate(t.lastMessageAt)}
-                          </Text>
-                        </Group>
-                        <Text size="11px" c="dimmed" className="ml-mono" truncate mt={1}>
-                          {t.leadEmail}
-                        </Text>
-                        <Text size="11px" fw={600} truncate mt={2} title={t.subject}>
-                          {t.subject || "(nincs tárgy)"}
-                        </Text>
-                        {t.campaignName && (
-                          <Text size="10px" c="dimmed" truncate>
-                            {t.campaignName}
-                          </Text>
-                        )}
-                        {t.decisionSummary && (
-                          <Text size="11px" c="dimmed" lineClamp={1} mt={2} fw={500}>
-                            {t.decisionSummary}
-                          </Text>
-                        )}
-                        <Group gap={4} mt={5} wrap="wrap">
-                          {intentMeta && (
-                            <Badge size="xs" color={intentMeta.color}>
-                              {intentMeta.label}
-                            </Badge>
-                          )}
-                          {tags.slice(0, 3).map((tag) => (
-                            <Badge
-                              key={tag}
-                              size="xs"
-                              variant="outline"
-                              color="dark"
-                              style={{ textTransform: "none" }}
-                            >
-                              #{tag}
-                            </Badge>
-                          ))}
-                          {t.autoSendStatus === "scheduled" && t.scheduledSendAt && (
-                            <Badge size="xs" color="yellow" variant="filled">
-                              ⏰ {formatShortDate(t.scheduledSendAt)}
-                            </Badge>
-                          )}
-                          {t.hasPendingDraft && t.autoSendStatus !== "scheduled" && (
-                            <Badge size="xs" variant="outline" color="gray">
-                              {t.pendingReplyId ? "⏸ Tervezet" : "Válaszra vár"}
-                            </Badge>
-                          )}
-                        </Group>
-                      </Box>
-                    );
-                  })
-                )}
-              </Stack>
-            </ScrollArea>
-          </Box>
-
-          {/* Right Conversation + Spacious Reply Composer */}
           {selected && (
-            <Box
-              style={{
-                flex: 1,
-                minWidth: 0,
-                display: "flex",
-                flexDirection: "column",
-                backgroundColor: "var(--ml-surface)",
-                overflow: "hidden",
-              }}
-            >
-              {/* Compact 44px Thread Header */}
-              <Group
-                justify="space-between"
-                px="md"
-                py={8}
-                wrap="nowrap"
-                style={{
-                  borderBottom: "1px solid var(--ml-border)",
-                  flexShrink: 0,
+            <Box className="ml-thread-col">
+              <ThreadHeader
+                thread={selected}
+                onOpenHistory={openHistory}
+                onDelete={() => setDeleteOpen(true)}
+                onOpenLead={() => {
+                  const found = leads.find((l) => l.id === selected.leadId);
+                  if (found) onSelectLead(found);
                 }}
-              >
-                <Group gap={8} wrap="nowrap" style={{ minWidth: 0 }}>
-                  <Badge
-                    size="sm"
-                    color={
-                      (selected.priorityScore ?? 50) >= 80
-                        ? "red"
-                        : (selected.priorityScore ?? 50) >= 65
-                        ? "orange"
-                        : "forest"
-                    }
-                    variant="filled"
-                    className="ml-tabular"
-                  >
-                    AI Prioritás: {selected.priorityScore ?? 50}/100
-                  </Badge>
-                  <Text fw={700} size="sm" truncate>
-                    {selected.leadCompany}
-                  </Text>
-                  <Text size="xs" c="dimmed" className="ml-mono" truncate>
-                    {selected.leadEmail}
-                  </Text>
-                  <Text size="xs" fw={500} truncate maw={260} title={selected.subject}>
-                    {selected.subject}
-                  </Text>
-                  {selected.campaignName && (
-                    <Badge size="xs" variant="light" color="gray">
-                      {selected.campaignName}
-                    </Badge>
-                  )}
-                  {selected.latestIntent && INTENT_META[selected.latestIntent] && (
-                    <Badge size="xs" color={INTENT_META[selected.latestIntent].color}>
-                      {INTENT_META[selected.latestIntent].label}
-                    </Badge>
-                  )}
-                </Group>
+                railOpen={railOpen}
+                onToggleRail={() => setRailOpen((v) => !v)}
+              />
 
-                <Group gap={6} wrap="nowrap">
-                  <Tooltip label="Előzmények — minden beszélgetés ezzel a személlyel">
-                    <ActionIcon variant="default" size="md" onClick={openHistory}>
-                      <IconHistory size={14} />
-                    </ActionIcon>
-                  </Tooltip>
-                  <Tooltip label="Beszélgetés törlése">
-                    <ActionIcon
-                      variant="light"
-                      color="red"
-                      size="md"
-                      onClick={() => setDeleteOpen(true)}
-                    >
-                      <IconTrash size={14} />
-                    </ActionIcon>
-                  </Tooltip>
-                  <Select
-                    size="xs"
-                    w={145}
-                    value={selected.leadStatus}
-                    onChange={async (v) => {
-                      if (!v) return;
+              <Box className="ml-thread-main">
+                <ScrollArea
+                  style={{ flex: 1, minHeight: 0 }}
+                  px="lg"
+                  py="md"
+                  type="auto"
+                  viewportRef={timelineViewportRef}
+                >
+                  <Text size="11px" fw={700} c="dimmed" tt="uppercase" mb={10} className="ml-section-mini">
+                    Beszélgetés · {timelineMessages.length}
+                  </Text>
+                  <MessageTimeline messages={timelineMessages} leadCompany={selected.leadCompany} />
+                </ScrollArea>
+
+                {railOpen && (
+                  <InboxContextRail
+                    thread={selected}
+                    leadStatusMeta={LEAD_STATUS_META}
+                    decisionModelId={settings.decisionModelId || "google/gemini-2.5-flash"}
+                    onLeadStatusChange={async (v) => {
                       await api.updateLead({ id: selected.leadId, status: v });
                       await onRefresh();
                     }}
-                    data={Object.entries(LEAD_STATUS_META).map(([value, meta]) => ({
-                      value,
-                      label: meta.label,
-                    }))}
+                    onOpenLead={() => {
+                      const found = leads.find((l) => l.id === selected.leadId);
+                      if (found) onSelectLead(found);
+                    }}
+                    onOpenHistory={openHistory}
+                    pendingMsg={pendingMsg}
+                    isScheduled={isScheduled}
+                    isPaused={isPaused}
+                    controlling={controlling}
+                    onControl={(a) => handleControlAutoSend(a)}
+                    customScheduleInput={customScheduleInput}
+                    onCustomScheduleInputChange={setCustomScheduleInput}
+                    showCustomSchedule={showCustomSchedule}
+                    onToggleCustomSchedule={() => setShowCustomSchedule((v) => !v)}
+                    formatCountdown={formatCountdown}
+                    formatShortDate={formatShortDate}
                   />
-                  <Tooltip label="Lead adatlap">
-                    <ActionIcon
-                      variant="default"
-                      size="md"
-                      onClick={() => {
-                        const found = leads.find((l) => l.id === selected.leadId);
-                        if (found) onSelectLead(found);
-                      }}
-                    >
-                      <IconUser size={14} />
-                    </ActionIcon>
-                  </Tooltip>
-                </Group>
-              </Group>
+                )}
+              </Box>
 
-              {/* OpenRouter Decisions Bar (Tags & Summary) */}
-              {((selected.aiTags && selected.aiTags.length > 0) || selected.decisionSummary) && (
-                <Group
-                  justify="space-between"
-                  px="md"
-                  py={6}
-                  gap="xs"
-                  wrap="wrap"
-                  style={{
-                    borderBottom: "1px solid var(--ml-border)",
-                    backgroundColor: "var(--ml-canvas)",
-                    flexShrink: 0,
-                  }}
-                >
-                  <Group gap={6} wrap="wrap">
-                    <Badge
-                      size="xs"
-                      variant="light"
-                      color="forest"
-                      leftSection={<IconTag size={10} />}
-                    >
-                      OpenRouter Decisions ({settings.decisionModelId || "google/gemini-2.5-flash"})
-                    </Badge>
-                    {(selected.aiTags || []).map((tag) => (
-                      <Badge
-                        key={tag}
-                        size="xs"
-                        variant="outline"
-                        color="dark"
-                        style={{ textTransform: "none" }}
-                      >
-                        #{tag}
-                      </Badge>
-                    ))}
-                  </Group>
-                  {selected.decisionSummary && (
-                    <Text size="xs" c="dimmed" fw={500}>
-                      {selected.decisionSummary}
+              <Box className="ml-replybar">
+                {isScheduled && pendingMsg ? (
+                  <Group gap={8} wrap="nowrap" style={{ flex: 1 }}>
+                    <Text size="12px" fw={600} truncate style={{ flex: 1 }}>
+                      Ütemezve: {formatShortDate(pendingMsg.scheduledSendAt)} (
+                      {formatCountdown(pendingMsg.scheduledSendAt)})
                     </Text>
-                  )}
-                </Group>
-              )}
-
-              {/* Scrollable Messages Timeline */}
-              <ScrollArea style={{ flex: 1, minHeight: 140 }} px="md" py="sm">
-                <Stack gap="xs">
-                  {timelineMessages.length === 0 ? (
-                    <Text size="xs" c="dimmed">
-                      Még nincs elküldött üzenet — lent szerkesztheted a tervezetet.
-                    </Text>
-                  ) : (
-                    timelineMessages.map((m) => {
-                      const isInbound = m.direction === "inbound";
-                      const msgTags = m.aiTags || [];
-                      return (
-                        <Box
-                          key={m.id}
-                          p="sm"
-                          style={{
-                            borderRadius: 6,
-                            border: "1px solid var(--ml-border)",
-                            backgroundColor: isInbound
-                              ? "var(--ml-canvas)"
-                              : "var(--ml-surface)",
-                            borderLeft: isInbound
-                              ? "3px solid #166534"
-                              : "3px solid var(--ml-border-strong)",
-                          }}
-                        >
-                          <Group justify="space-between" mb={4} wrap="wrap" gap={4}>
-                            <Group gap={6} wrap="wrap">
-                              <Text size="xs" fw={700}>
-                                {isInbound ? selected.leadCompany : "Te"}
-                              </Text>
-                              <Text size="xs" c="dimmed" truncate maw={360}>
-                                {m.subject}
-                              </Text>
-                              {isInbound && (m.aiPriorityScore ?? 0) > 0 && (
-                                <Badge
-                                  size="xs"
-                                  color={(m.aiPriorityScore ?? 0) >= 80 ? "red" : "forest"}
-                                  variant="light"
-                                >
-                                  Prioritás: {m.aiPriorityScore}/100
-                                </Badge>
-                              )}
-                              {isInbound &&
-                                msgTags.map((tg) => (
-                                  <Badge
-                                    key={tg}
-                                    size="xs"
-                                    variant="outline"
-                                    color="gray"
-                                    style={{ textTransform: "none" }}
-                                  >
-                                    #{tg}
-                                  </Badge>
-                                ))}
-                              {m.bookingLinkSent && (
-                                <Badge size="xs" color="green">
-                                  Foglalóval
-                                </Badge>
-                              )}
-                            </Group>
-                            <Text size="11px" c="dimmed" className="ml-tabular">
-                              {formatShortDate(m.sentAt || m.createdAt)}
-                            </Text>
-                          </Group>
-                          <Text size="sm" style={{ whiteSpace: "pre-wrap", lineHeight: 1.5 }}>
-                            {m.body}
-                          </Text>
-                        </Box>
-                      );
-                    })
-                  )}
-                </Stack>
-              </ScrollArea>
-
-              {/* Compact, Spacious Reply Composer Studio */}
-              <Box
-                px="md"
-                py="xs"
-                style={{
-                  borderTop: "1px solid var(--ml-border-strong)",
-                  backgroundColor: "var(--ml-canvas)",
-                  flexShrink: 0,
-                }}
-              >
-                <Stack gap={7}>
-                  {/* Tight 1-line Auto-Send Status Bar (when scheduled or paused) */}
-                  {isScheduled && pendingMsg && (
-                    <Group
-                      justify="space-between"
-                      px="xs"
-                      py={5}
-                      wrap="wrap"
-                      gap={6}
-                      style={{
-                        borderRadius: 5,
-                        border: "1px solid #d97706",
-                        backgroundColor: "rgba(217, 119, 6, 0.10)",
-                      }}
-                    >
-                      <Group gap={6}>
-                        <IconClock size={14} color="#b45309" />
-                        <Text size="xs" fw={600} c="orange.9">
-                          Auto-küldés: {formatShortDate(pendingMsg.scheduledSendAt)} (
-                          {formatCountdown(pendingMsg.scheduledSendAt)})
-                        </Text>
-                      </Group>
-                      <Group gap={5}>
-                        <Button
-                          size="compact-xs"
-                          color="red"
-                          leftSection={<IconPlayerPause size={12} />}
-                          loading={controlling}
-                          onClick={() => handleControlAutoSend("pause")}
-                        >
-                          Megállítás
-                        </Button>
-                        <Button
-                          size="compact-xs"
-                          variant="default"
-                          loading={controlling}
-                          onClick={() => handleControlAutoSend("reschedule_random")}
-                        >
-                          Új idő
-                        </Button>
-                        <Button
-                          size="compact-xs"
-                          variant="subtle"
-                          onClick={() => setShowCustomSchedule((v) => !v)}
-                        >
-                          Egyedi
-                        </Button>
-                      </Group>
-                    </Group>
-                  )}
-
-                  {showCustomSchedule && isScheduled && pendingMsg && (
-                    <Group gap={6}>
-                      <TextInput
-                        type="datetime-local"
-                        size="xs"
-                        value={customScheduleInput}
-                        onChange={(e) => setCustomScheduleInput(e.currentTarget.value)}
-                      />
-                      <Button
-                        size="xs"
-                        loading={controlling}
-                        onClick={() => handleControlAutoSend("reschedule_custom")}
-                      >
-                        Mentés
-                      </Button>
-                    </Group>
-                  )}
-
-                  {isPaused && pendingMsg && (
-                    <Group
-                      justify="space-between"
-                      px="xs"
-                      py={4}
-                      style={{
-                        borderRadius: 5,
-                        border: "1px solid var(--ml-border-strong)",
-                        backgroundColor: "var(--ml-surface)",
-                      }}
-                    >
-                      <Text size="xs" c={pendingMsg.errorMessage ? "red" : "dimmed"} fw={500}>
-                        {pendingMsg.errorMessage
-                          ? `⚠ Megállítva: ${pendingMsg.errorMessage}`
-                          : "⏸ Auto-küldés megállítva — nem megy ki magától"}
-                      </Text>
-                      <Group gap={5}>
-                        <Button
-                          size="compact-xs"
-                          variant="light"
-                          color="forest"
-                          leftSection={<IconPlayerPlay size={12} />}
-                          loading={controlling}
-                          onClick={() => handleControlAutoSend("resume")}
-                        >
-                          Időzítés (20p–2ó)
-                        </Button>
-                        <ActionIcon
-                          size="sm"
-                          variant="subtle"
-                          color="red"
-                          title="Tervezet törlése"
-                          loading={controlling}
-                          onClick={() => handleControlAutoSend("cancel")}
-                        >
-                          <IconTrash size={13} />
-                        </ActionIcon>
-                      </Group>
-                    </Group>
-                  )}
-
-                  {/* Single 1-Line AI Rewrite + Quick Presets Menu */}
-                  <Group gap={6} wrap="nowrap">
-                    <TextInput
-                      size="xs"
-                      placeholder="Megjegyzés az AI-nak az átíráshoz (pl. rövidebben, tegezve, 20% kedvezménnyel)..."
-                      value={aiComment}
-                      onChange={(e) => setAiComment(e.currentTarget.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" && aiComment.trim()) {
-                          e.preventDefault();
-                          handleAiRewrite();
-                        }
-                      }}
-                      style={{ flex: 1 }}
-                    />
+                    <Button size="xs" variant="default" onClick={() => setComposerOpen(true)}>
+                      Válasz e-mail
+                    </Button>
                     <Button
                       size="xs"
-                      variant="light"
-                      color="forest"
-                      leftSection={<IconWand size={13} />}
-                      loading={rewriting}
-                      disabled={!aiComment.trim() || !replyBody.trim()}
-                      onClick={() => handleAiRewrite()}
+                      variant="subtle"
+                      color="red"
+                      leftSection={<IconPlayerPause size={12} />}
+                      loading={controlling}
+                      onClick={() => handleControlAutoSend("pause")}
                     >
-                      AI átírás
+                      Stop
                     </Button>
-                    <Menu shadow="md" width={210} position="top-end">
-                      <Menu.Target>
-                        <Button
-                          size="xs"
-                          variant="default"
-                          rightSection={<IconChevronDown size={12} />}
-                          disabled={rewriting || !replyBody.trim()}
-                        >
-                          Gyors
-                        </Button>
-                      </Menu.Target>
-                      <Menu.Dropdown>
-                        {QUICK_REWRITE_PRESETS.map((p) => (
-                          <Menu.Item key={p.label} onClick={() => handleAiRewrite(p.note)}>
-                            {p.label}
-                          </Menu.Item>
-                        ))}
-                      </Menu.Dropdown>
-                    </Menu>
-                    <Tooltip label="Teljesen új AI válasz generálása">
-                      <ActionIcon
-                        size="md"
-                        variant="default"
-                        loading={generating}
-                        onClick={handleGenerateFreshReply}
-                      >
-                        <IconSparkles size={14} />
-                      </ActionIcon>
-                    </Tooltip>
                   </Group>
-
-                  {/* Subject + Inline Link Shortcuts */}
-                  <Group gap={6} wrap="nowrap">
-                    <TextInput
-                      size="xs"
-                      value={replySubject}
-                      onChange={(e) => setReplySubject(e.currentTarget.value)}
-                      placeholder="Tárgy"
+                ) : isPaused && pendingMsg ? (
+                  <Group gap={8} wrap="nowrap" style={{ flex: 1 }}>
+                    <Text size="12px" c="dimmed" truncate style={{ flex: 1 }}>
+                      Megállítva — nem megy ki magától
+                    </Text>
+                    <Button size="xs" variant="default" onClick={() => setComposerOpen(true)}>
+                      Válasz e-mail
+                    </Button>
+                  </Group>
+                ) : (
+                  <Group gap={8} wrap="nowrap" style={{ flex: 1 }}>
+                    <Button
+                      size="sm"
+                      color="forest"
+                      leftSection={<IconArrowBackUp size={15} />}
+                      onClick={() => setComposerOpen(true)}
                       style={{ flex: 1 }}
-                    />
-                    <Tooltip label="Weboldal link beszúrása">
-                      <ActionIcon size="md" variant="default" onClick={insertLandingLink}>
-                        <IconWorld size={14} />
-                      </ActionIcon>
-                    </Tooltip>
-                    <Tooltip label="Időpontfoglaló link beszúrása">
-                      <ActionIcon size="md" variant="default" onClick={insertBookingLink}>
-                        <IconCalendarEvent size={14} />
-                      </ActionIcon>
-                    </Tooltip>
-                  </Group>
-
-                  {/* Spacious, Comfortable Editable Reply Textarea */}
-                  <Textarea
-                    size="sm"
-                    autosize
-                    minRows={7}
-                    maxRows={13}
-                    value={replyBody}
-                    onChange={(e) => setReplyBody(e.currentTarget.value)}
-                    placeholder="Válasz szövege (manuálisan is bármikor átírható)..."
-                    styles={{
-                      input: {
-                        backgroundColor: "var(--ml-surface)",
-                        lineHeight: 1.5,
-                      },
-                    }}
-                  />
-
-                  {/* Single Clean Action Footer Row */}
-                  <Group justify="space-between" wrap="nowrap">
-                    <Group gap={6}>
-                      <Button
-                        size="xs"
+                    >
+                      Válasz írása
+                    </Button>
+                    <Tooltip label="AI válasz generálása">
+                      <ActionIcon
+                        size="lg"
                         variant="default"
-                        leftSection={<IconCheck size={13} />}
-                        loading={savingDraft}
-                        disabled={!replyBody.trim()}
-                        onClick={() => handleSaveManualEdit(isScheduled)}
+                        onClick={async () => {
+                          await handleGenerateFreshReply();
+                          setComposerOpen(true);
+                        }}
                       >
-                        {isScheduled ? "Átírás mentése" : "Mentés"}
-                      </Button>
-                      {!isScheduled && (
-                        <Button
-                          size="xs"
-                          variant="light"
-                          color="forest"
-                          leftSection={<IconClock size={13} />}
-                          loading={savingDraft}
-                          disabled={!replyBody.trim()}
-                          onClick={() => handleSaveManualEdit(true)}
-                        >
-                          Időzítés (20p–2ó)
-                        </Button>
-                      )}
-                    </Group>
-
-                    <Group gap={6}>
-                      <Button
-                        size="xs"
-                        leftSection={<IconSend size={13} />}
-                        loading={sending}
-                        disabled={!replyBody.trim()}
-                        onClick={handleSendReplyNow}
-                      >
-                        Küldés most
-                      </Button>
-                    </Group>
+                        <IconSparkles size={16} />
+                      </ActionIcon>
+                    </Tooltip>
                   </Group>
-                </Stack>
+                )}
               </Box>
+
+              <Modal
+                opened={composerOpen}
+                onClose={() => setComposerOpen(false)}
+                title={
+                  <Group gap={8} wrap="nowrap">
+                    <Text fw={700} size="sm">
+                      Válasz
+                    </Text>
+                    <Text size="xs" c="dimmed" className="ml-mono" truncate>
+                      {selected.leadEmail}
+                    </Text>
+                  </Group>
+                }
+                size={720}
+                className="ml-compose-modal"
+              >
+                <ComposerStudio
+                  replySubject={replySubject}
+                  onSubjectChange={setReplySubject}
+                  replyBody={replyBody}
+                  onBodyChange={setReplyBody}
+                  aiComment={aiComment}
+                  onAiCommentChange={setAiComment}
+                  onAiRewrite={() => handleAiRewrite()}
+                  rewriting={rewriting}
+                  onQuickRewrite={(note) => handleAiRewrite(note)}
+                  onGenerateFresh={handleGenerateFreshReply}
+                  generating={generating}
+                  onInsertLanding={insertLandingLink}
+                  onInsertBooking={insertBookingLink}
+                  onSaveDraft={(keep) => handleSaveManualEdit(keep)}
+                  savingDraft={savingDraft}
+                  onSendNow={handleSendReplyNow}
+                  sending={sending}
+                  pendingMsg={pendingMsg}
+                  isScheduled={isScheduled}
+                  isPaused={isPaused}
+                  controlling={controlling}
+                  onControl={(a) => handleControlAutoSend(a)}
+                  formatCountdown={formatCountdown}
+                  formatShortDate={formatShortDate}
+                  focusBody
+                />
+              </Modal>
             </Box>
           )}
         </Box>
@@ -1536,9 +973,7 @@ export function InboxPage({
                           )}
                         </Group>
                       </Group>
-                      <Text size="sm" style={{ whiteSpace: "pre-wrap", lineHeight: 1.5 }}>
-                        {m.body}
-                      </Text>
+                      <EmailBody body={m.body} />
                     </Paper>
                   );
                 })}

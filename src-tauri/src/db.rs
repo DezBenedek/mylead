@@ -1662,6 +1662,38 @@ impl Database {
         Ok(())
     }
 
+    /// Kézi küldés után a lead többi el nem küldött választervezetét törli,
+    /// hogy az auto-küldés biztosan megszűnjön. A kampány-leveleket (step 1)
+    /// nem érinti — csak a választervezeteket (step >= 2).
+    pub fn delete_other_pending_reply_drafts(
+        &self,
+        lead_id: &str,
+        exclude_id: &str,
+    ) -> Result<usize, String> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .execute(
+                "DELETE FROM email_messages WHERE lead_id = ?1 AND id <> ?2 AND direction = 'outbound' AND status IN ('queued', 'draft') AND step_number >= 2",
+                params![lead_id, exclude_id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(n)
+    }
+
+    /// Már beragadt duplikált bejövő üzenetek takarítása (azonos lead + tárgy +
+    /// törzs): a legkorábbit tartja meg. Előretekintő védelem az IMAP-szinkron
+    /// versenyhelyzetei ellen.
+    pub fn delete_duplicate_inbound_messages(&self) -> Result<usize, String> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .execute(
+                "DELETE FROM email_messages WHERE direction = 'inbound' AND rowid NOT IN (SELECT MIN(rowid) FROM email_messages WHERE direction = 'inbound' GROUP BY lead_id, subject, body)",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(n)
+    }
+
     pub fn delete_email_messages(&self, ids: &[String]) -> Result<usize, String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;

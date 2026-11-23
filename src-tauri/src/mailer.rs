@@ -13,6 +13,17 @@ use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Determinisztikus 64 bites FNV-1a hash — stabil szintetikus Message-ID-hez.
+/// (A `DefaultHasher` futásonként más kulcsot használ, ezért nem jó ide.)
+fn fnv1a64_hex(input: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in input.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{:016x}", h)
+}
+
 #[derive(Debug, Clone)]
 pub struct InboundEmail {
     pub from_email: String,
@@ -388,20 +399,27 @@ pub fn fetch_recent_imap_messages(account: &SenderAccount, max_fetch: u32) -> Re
                     .trim()
                     .to_string();
 
+                let received_at = parsed
+                    .date()
+                    .map(|d| d.to_rfc3339())
+                    .unwrap_or_else(|| Utc::now().to_rfc3339());
+
+                // Hiányzó Message-ID esetén STABIL szintetikus ID-t generálunk
+                // (feladó + tárgy + dátum + törzs hash), hogy az ismételt
+                // szinkronok ne szúrják be ugyanazt a levelet újra meg újra.
+                // (Véletlen UUID-val minden poll duplikátumot gyártana.)
                 let message_id = parsed
                     .message_id()
                     .map(|s| format!("<{}>", s.trim_matches(|c| c == '<' || c == '>')))
-                    .unwrap_or_else(|| format!("<imap-{}>", Uuid::new_v4()));
+                    .unwrap_or_else(|| {
+                        let seed = format!("{}|{}|{}|{}", from_email, subject, received_at, body);
+                        format!("<imap-{}.mylead@local>", fnv1a64_hex(&seed))
+                    });
 
                 let in_reply_to = parsed
                     .in_reply_to()
                     .as_text()
                     .map(|s| format!("<{}>", s.trim_matches(|c| c == '<' || c == '>')));
-
-                let received_at = parsed
-                    .date()
-                    .map(|d| d.to_rfc3339())
-                    .unwrap_or_else(|| Utc::now().to_rfc3339());
 
                 results.push(InboundEmail {
                     from_email,

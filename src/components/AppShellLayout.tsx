@@ -118,20 +118,20 @@ export function AppShellLayout({
       <Box
         className="ml-sidebar"
         style={{
-          width: 236,
-          minWidth: 236,
+          width: "var(--ml-sidebar-w)",
+          minWidth: "var(--ml-sidebar-w)",
           display: "flex",
           flexDirection: "column",
           justifyContent: "space-between",
         }}
       >
         <Box>
-          {/* Brand Header */}
+          {/* Brand Header — aligns to global topbar height */}
           <Group
             justify="space-between"
             px={16}
-            py={14}
-            style={{ borderBottom: "1px solid var(--ml-border)" }}
+            className="ml-brandbar"
+            style={{ borderBottom: "1px solid var(--ml-border)", paddingTop: 8, paddingBottom: 8 }}
           >
             <Group gap={9}>
               <Box
@@ -173,7 +173,7 @@ export function AppShellLayout({
           </Group>
 
           {/* Central Assistant Command Trigger */}
-          <Box px={12} pt={12}>
+          <Box px={12} pt={14} pb={2}>
             <Button
               fullWidth
               variant="default"
@@ -182,11 +182,12 @@ export function AppShellLayout({
               leftSection={<IconCommand size={14} />}
               rightSection={<Kbd size="xs">⌘K</Kbd>}
               onClick={onOpenAssistant}
+              className="ml-assistant-btn"
               styles={{
                 root: {
                   backgroundColor: "var(--ml-surface)",
                   borderColor: "var(--ml-border-strong)",
-                  height: 32,
+                  height: 34,
                 },
               }}
             >
@@ -195,10 +196,10 @@ export function AppShellLayout({
           </Box>
 
           {/* Navigation Sections */}
-          <Stack gap={18} p={12}>
+          <Stack gap={22} p={12} pt={14}>
             {navGroups.map((group) => (
-              <Box key={group.label}>
-                <Text className="ml-section-label" px={10} mb={5}>
+              <Box key={group.label} className="ml-nav-group">
+                <Text className="ml-section-label" px={10} mb={8}>
                   {group.label}
                 </Text>
                 <Stack gap={2}>
@@ -237,12 +238,8 @@ export function AppShellLayout({
         {/* Bottom Status / Active Job Dock */}
         <Box p={12} style={{ borderTop: "1px solid var(--ml-border)" }}>
           {activeJob ? (
-            <Box
-              p={10}
-              className="ml-surface"
-              style={{ borderRadius: 5, border: "1px solid var(--ml-border)" }}
-            >
-              <Group justify="space-between" mb={4}>
+            <Box p={0} className="ml-status-dock">
+              <Group justify="space-between" mb={6}>
                 <Text size="xs" fw={600}>
                   Folyamatban...
                 </Text>
@@ -254,14 +251,14 @@ export function AppShellLayout({
                 value={activeJob.total > 0 ? (activeJob.current / activeJob.total) * 100 : 100}
                 size="xs"
                 color="forest"
-                mb={6}
+                mb={8}
               />
-              <Text size="11px" c="dimmed" lineClamp={2}>
+              <Text size="11px" c="dimmed" lineClamp={2} lh={1.45}>
                 {activeJob.message}
               </Text>
             </Box>
           ) : (
-            <Group justify="space-between" px={4}>
+            <Group justify="space-between" className="ml-status-dock-idle" px={2}>
               <Text size="11px" c="dimmed">
                 SQLite lokális DB
               </Text>
