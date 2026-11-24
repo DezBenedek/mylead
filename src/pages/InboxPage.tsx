@@ -19,7 +19,7 @@ import {
   Tooltip,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import { IconArrowBackUp, IconMailPlus, IconPlayerPause, IconRefresh, IconSparkles, IconTrash } from "@tabler/icons-react";
+import { IconArrowBackUp, IconInbox, IconMailPlus, IconPlayerPause, IconRefresh, IconSparkles, IconTrash } from "@tabler/icons-react";
 import { DirectEmailModal } from "../components/DirectEmailModal";
 import { ComposerStudio } from "../components/inbox/ComposerStudio";
 import { EmailBody } from "../components/inbox/EmailBody";
@@ -53,6 +53,8 @@ interface Props {
   settings: AppSettings;
   onSelectLead: (lead: Lead) => void;
   onRefresh: () => Promise<void>;
+  focusThreadKey?: string | null;
+  onFocusConsumed?: () => void;
 }
 
 const WEEKDAY_LABELS = [
@@ -74,6 +76,8 @@ export function InboxPage({
   settings,
   onSelectLead,
   onRefresh,
+  focusThreadKey,
+  onFocusConsumed,
 }: Props) {
   const [selectedThreadKey, setSelectedThreadKey] = useState<string | null>(
     threads[0]?.threadKey ?? null
@@ -112,6 +116,8 @@ export function InboxPage({
   const [historyMessages, setHistoryMessages] = useState<EmailMessage[]>([]);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [adviceOpen, setAdviceOpen] = useState(false);
+  const [dismissingAdvice, setDismissingAdvice] = useState(false);
   const lastServerSettingsJsonRef = useRef<string>(JSON.stringify(settings));
   const activeComposerKeyRef = useRef<string>("");
   const timelineViewportRef = useRef<HTMLDivElement | null>(null);
@@ -139,15 +145,17 @@ export function InboxPage({
   const runQuietImapSync = useCallback(async () => {
     if (!hasImapAccount) return;
     try {
-      const count = await api.syncImapInbox();
+      const report = await api.syncImapInbox();
       setLastAutoSyncAt(
         new Date().toLocaleTimeString("hu-HU", { hour: "2-digit", minute: "2-digit" })
       );
-      if (count > 0) {
+      if (report.inserted > 0) {
         await onRefresh();
         notifications.show({
           title: "Új beérkező e-mail érkezett!",
-          message: `${count} új válasz automatikusan letöltve, rangsorolva és felcímkézve.`,
+          message:
+            `${report.inserted} új válasz automatikusan letöltve, rangsorolva és felcímkézve` +
+            (report.newLeads > 0 ? ` (${report.newLeads} új feladó felvéve leadnek).` : "."),
           color: "forest",
         });
       }
@@ -215,6 +223,15 @@ export function InboxPage({
       setSelectedThreadKey(filteredThreads[0]?.threadKey ?? threads[0]?.threadKey ?? null);
     }
   }, [threads, filteredThreads, selectedThreadKey]);
+
+  // Főoldalról érkező mélylink ("Megnyitás" a beavatkozás-kártyáról):
+  // a kért beszélgetésre ugrik.
+  useEffect(() => {
+    if (focusThreadKey && threads.some((t) => t.threadKey === focusThreadKey)) {
+      setSelectedThreadKey(focusThreadKey);
+      onFocusConsumed?.();
+    }
+  }, [focusThreadKey, threads, onFocusConsumed]);
 
   const selectedProject = useMemo(() => {
     if (selected?.campaignId) {
@@ -321,19 +338,34 @@ export function InboxPage({
   const handleImapSync = async () => {
     setSyncing(true);
     try {
-      const count = await api.syncImapInbox();
+      const report = await api.syncImapInbox();
       setLastAutoSyncAt(
         new Date().toLocaleTimeString("hu-HU", { hour: "2-digit", minute: "2-digit" })
       );
       await onRefresh();
+      const bits: string[] = [];
+      if (report.inserted > 0) {
+        bits.push(
+          `${report.inserted} új beérkező e-mail letöltve és AI Decision Modellel rangsorolva` +
+            (report.newLeads > 0 ? ` (${report.newLeads} új feladó felvéve leadnek)` : "")
+        );
+      }
+      if (report.skippedAutomated > 0) {
+        bits.push(`${report.skippedAutomated} automata rendszerlevél kihagyva`);
+      }
       notifications.show({
         title: "Postafiók frissítve",
         message:
-          count > 0
-            ? `${count} új beérkező e-mail letöltve és AI Decision Modellel rangsorolva.`
-            : "Nincs új beérkező e-mail.",
+          bits.length > 0 ? bits.join(" · ") + "." : "Nincs új beérkező e-mail.",
         color: "forest",
       });
+      if (report.errors.length > 0) {
+        notifications.show({
+          title: "Szinkron figyelmeztetés",
+          message: report.errors.slice(0, 2).join(" | "),
+          color: "orange",
+        });
+      }
     } catch (e) {
       notifications.show({ title: "IMAP szinkron", message: String(e), color: "orange" });
     } finally {
@@ -570,19 +602,55 @@ export function InboxPage({
     }
   };
 
+  const adviceMessage = useMemo(() => {
+    if (!selected) return null;
+    const flagged = selected.messages.filter(
+      (m) => m.direction === "inbound" && m.needsHuman
+    );
+    return flagged[flagged.length - 1] ?? null;
+  }, [selected]);
+
+  const handleDismissAdvice = async () => {
+    if (!selected) return;
+    setDismissingAdvice(true);
+    try {
+      await api.dismissHumanRequest(selected.threadKey);
+      setAdviceOpen(false);
+      await onRefresh();
+      notifications.show({ title: "Megoldva", message: "", color: "forest" });
+    } catch (e) {
+      notifications.show({ title: "Hiba", message: String(e), color: "red" });
+    } finally {
+      setDismissingAdvice(false);
+    }
+  };
+
   const isScheduled = pendingMsg?.autoSendStatus === "scheduled";
   const isPaused = !!pendingMsg && pendingMsg.autoSendStatus !== "scheduled";
 
-  // Mindig a legfrissebb üzenethez görget: váltáskor és új üzenet érkeztekor.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+  // Görgetés a legfrissebbhez, de csak ha nem zavarja az olvasást:
+  // szálváltáskor mindig, új üzenetnél csak ha már lent járt az olvasó.
   const timelineAnchor = `${selected?.threadKey ?? "none"}:${timelineMessages.length}`;
+  const prevAnchorRef = useRef(timelineAnchor);
   useEffect(() => {
     const vp = timelineViewportRef.current;
-    if (vp) {
+    const prev = prevAnchorRef.current;
+    prevAnchorRef.current = timelineAnchor;
+    if (!vp || prev === timelineAnchor) return;
+    const [prevKey, prevCount] = prev.split(":");
+    const [curKey, curCount] = timelineAnchor.split(":");
+    const threadChanged = prevKey !== curKey;
+    const newArrived = !threadChanged && Number(curCount) > Number(prevCount);
+    if (!threadChanged && !newArrived) return;
+    const nearBottom =
+      vp.scrollHeight - vp.scrollTop - vp.clientHeight < 160 ||
+      vp.scrollHeight <= vp.clientHeight + 1;
+    if (threadChanged || nearBottom) {
       requestAnimationFrame(() => {
         vp.scrollTop = vp.scrollHeight;
       });
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [timelineAnchor]);
 
   const hotCount = threads.filter(
@@ -617,58 +685,25 @@ export function InboxPage({
         onCompose={() => setComposeOpen(true)}
       />
 
-      {threads.length === 0 ? (
-        <Box p="xl">
-          <Paper p="lg" maw={520}>
-            <Stack gap="sm">
-              <Text fw={600} size="sm">
-                Még nincs aktív levelezés
-              </Text>
-              <Text size="xs" c="dimmed">
-                Az alkalmazás a háttérben automatikusan lekéri az új beérkező e-maileket, az
-                OpenRouter Decisions pedig azonnal rangsorolja (1–100) és felcímkézi őket.
-              </Text>
-              <Group gap="xs">
-                <Button
-                  size="xs"
-                  leftSection={<IconRefresh size={14} />}
-                  loading={syncing}
-                  onClick={handleImapSync}
-                >
-                  Frissítés most
-                </Button>
-                <Button
-                  size="xs"
-                  variant="default"
-                  leftSection={<IconMailPlus size={14} />}
-                  disabled={leads.length === 0}
-                  onClick={() => setComposeOpen(true)}
-                >
-                  Új üzenet küldése
-                </Button>
-              </Group>
-            </Stack>
-          </Paper>
-        </Box>
-      ) : (
-        <Box className="ml-inbox-body">
-          <ThreadListPane
-            threads={filteredThreads}
-            selectedKey={selected?.threadKey ?? null}
-            onSelect={setSelectedThreadKey}
-            searchQuery={searchQuery}
-            onSearchChange={setSearchQuery}
-            sortMode={sortMode}
-            onToggleSort={() =>
-              setSortMode((prev) => (prev === "priority" ? "recent" : "priority"))
-            }
-            filter={threadFilter}
-            onFilterChange={setThreadFilter}
-            counts={{ total: threads.length, scheduled: scheduledCount, paused: pausedCount }}
-            footerStatus={footerStatus}
-          />
+      <Box className="ml-inbox-body">
+        <ThreadListPane
+          threads={filteredThreads}
+          selectedKey={selected?.threadKey ?? null}
+          onSelect={setSelectedThreadKey}
+          searchQuery={searchQuery}
+          onSearchChange={setSearchQuery}
+          sortMode={sortMode}
+          onToggleSort={() =>
+            setSortMode((prev) => (prev === "priority" ? "recent" : "priority"))
+          }
+          filter={threadFilter}
+          onFilterChange={setThreadFilter}
+          counts={{ total: threads.length, scheduled: scheduledCount, paused: pausedCount }}
+          footerStatus={footerStatus}
+          hasAnyThreads={threads.length > 0}
+        />
 
-          {selected && (
+          {selected ? (
             <Box className="ml-thread-col">
               <ThreadHeader
                 thread={selected}
@@ -683,17 +718,42 @@ export function InboxPage({
               />
 
               <Box className="ml-thread-main">
+                {selected.needsAdvice && (
+                  <Box px="lg" pt="sm">
+                    <Paper
+                      py={6}
+                      px="sm"
+                      withBorder
+                      style={{ borderColor: "var(--mantine-color-orange-4)", background: "var(--mantine-color-orange-0)" }}
+                    >
+                      <Group justify="space-between" gap={8} wrap="nowrap">
+                        <Text size="xs" truncate style={{ flex: 1 }}>
+                          🙋 <Text span fw={700}>Élő embert kér</Text>
+                          <Text span c="dimmed"> — automata válasz leállítva</Text>
+                        </Text>
+                        <Button size="compact-xs" color="orange" onClick={() => setAdviceOpen(true)}>
+                          Megnyitás
+                        </Button>
+                      </Group>
+                    </Paper>
+                  </Box>
+                )}
                 <ScrollArea
                   style={{ flex: 1, minHeight: 0 }}
                   px="lg"
                   py="md"
                   type="auto"
+                  scrollbars="y"
                   viewportRef={timelineViewportRef}
                 >
                   <Text size="11px" fw={700} c="dimmed" tt="uppercase" mb={10} className="ml-section-mini">
                     Beszélgetés · {timelineMessages.length}
                   </Text>
-                  <MessageTimeline messages={timelineMessages} leadCompany={selected.leadCompany} />
+                  <MessageTimeline
+                    key={selected.threadKey}
+                    messages={timelineMessages}
+                    leadCompany={selected.leadCompany}
+                  />
                 </ScrollArea>
 
                 {railOpen && (
@@ -827,9 +887,58 @@ export function InboxPage({
                 />
               </Modal>
             </Box>
+          ) : (
+            <Box
+              className="ml-thread-col"
+              style={{ alignItems: "center", justifyContent: "center" }}
+            >
+              <Stack gap="sm" align="center" maw={440} px="xl" ta="center">
+                <IconInbox size={38} stroke={1.3} style={{ opacity: 0.3 }} />
+                {threads.length === 0 ? (
+                  <>
+                    <Text fw={600} size="sm">
+                      Még nincs aktív levelezés
+                    </Text>
+                    <Text size="xs" c="dimmed">
+                      Az alkalmazás a háttérben automatikusan lekéri az új beérkező
+                      e-maileket, az OpenRouter Decisions pedig azonnal rangsorolja
+                      (1–100) és felcímkézi őket.
+                    </Text>
+                    <Group gap="xs" justify="center">
+                      <Button
+                        size="xs"
+                        leftSection={<IconRefresh size={14} />}
+                        loading={syncing}
+                        onClick={handleImapSync}
+                      >
+                        Frissítés most
+                      </Button>
+                      <Button
+                        size="xs"
+                        variant="default"
+                        leftSection={<IconMailPlus size={14} />}
+                        disabled={leads.length === 0}
+                        onClick={() => setComposeOpen(true)}
+                      >
+                        Új üzenet küldése
+                      </Button>
+                    </Group>
+                  </>
+                ) : (
+                  <>
+                    <Text fw={600} size="sm">
+                      Válassz egy beszélgetést
+                    </Text>
+                    <Text size="xs" c="dimmed">
+                      Kattints egy beszélgetésre a bal oldali listában a levelek
+                      megnyitásához.
+                    </Text>
+                  </>
+                )}
+              </Stack>
+            </Box>
           )}
         </Box>
-      )}
 
       {/* Conversation delete confirmation */}
       <Modal
@@ -881,6 +990,66 @@ export function InboxPage({
         </Stack>
       </Modal>
 
+      {/* Human advice request: the decision model asks for the owner's call */}
+      <Modal
+        opened={adviceOpen}
+        onClose={() => setAdviceOpen(false)}
+        title="🙋 Tanácsot kér az AI"
+        size="lg"
+      >
+        <Stack gap="sm">
+          {selected && (
+            <Text size="xs" c="dimmed">
+              {selected.leadCompany} · {selected.leadEmail}
+            </Text>
+          )}
+          {selected?.humanQuestion && (
+            <Paper p="sm" withBorder>
+              <Text size="sm" style={{ whiteSpace: "pre-wrap" }}>
+                {selected.humanQuestion}
+              </Text>
+            </Paper>
+          )}
+          {selected?.decisionSummary && (
+            <Text size="xs" c="dimmed">
+              {selected.decisionSummary}
+            </Text>
+          )}
+          {adviceMessage && (
+            <Paper p="sm" withBorder>
+              <Text size="xs" fw={600} mb={4}>
+                {adviceMessage.subject || "(nincs tárgy)"} ·{" "}
+                {formatShortDate(adviceMessage.sentAt || adviceMessage.createdAt)}
+              </Text>
+              <EmailBody body={adviceMessage.body} />
+            </Paper>
+          )}
+          <Text size="xs" c="dimmed">
+            Erre a levélre nem készült automatikus válasz. Ha megírod és elküldöd a
+            választ, a kérés automatikusan megoldódik.
+          </Text>
+          <Group justify="flex-end">
+            <Button
+              variant="default"
+              loading={dismissingAdvice}
+              onClick={handleDismissAdvice}
+            >
+              Megoldva
+            </Button>
+            <Button
+              color="forest"
+              leftSection={<IconArrowBackUp size={15} />}
+              onClick={() => {
+                setAdviceOpen(false);
+                setComposerOpen(true);
+              }}
+            >
+              Válasz írása
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
+
       {/* Full history with this person across all conversations */}
       <Modal
         opened={historyOpen}
@@ -906,7 +1075,7 @@ export function InboxPage({
               {selected?.leadEmail} — összesen {historyMessages.length} üzenet, minden
               beszélgetéssel együtt.
             </Text>
-            <ScrollArea h={520} type="auto">
+            <ScrollArea h={520} type="auto" scrollbars="y">
               <Stack gap="xs" pr="xs">
                 {historyMessages.map((m) => {
                   const inbound = m.direction === "inbound";

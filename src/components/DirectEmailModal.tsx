@@ -49,7 +49,10 @@ export function DirectEmailModal({
 }: Props) {
   const [selectedLeadId, setSelectedLeadId] = useState<string>(lead?.id || "");
   const [senderAccountId, setSenderAccountId] = useState<string>(
-    senderAccounts.find((a) => a.isDefault)?.id || senderAccounts[0]?.id || ""
+    senderAccounts.find((a) => a.id === settings.replySenderAccountId)?.id ||
+      senderAccounts.find((a) => a.isDefault)?.id ||
+      senderAccounts[0]?.id ||
+      ""
   );
   const [tone, setTone] = useState<string>(settings.defaultTone || "professional_formal");
   const [subject, setSubject] = useState("");
@@ -67,7 +70,10 @@ export function DirectEmailModal({
     if (opened) {
       setSelectedLeadId(lead?.id || leads.find((l) => l.primaryEmail)?.id || "");
       setSenderAccountId(
-        senderAccounts.find((a) => a.isDefault)?.id || senderAccounts[0]?.id || ""
+        senderAccounts.find((a) => a.id === settings.replySenderAccountId)?.id ||
+          senderAccounts.find((a) => a.isDefault)?.id ||
+          senderAccounts[0]?.id ||
+          ""
       );
       setTone(settings.defaultTone || "professional_formal");
       setSubject(lead ? `${lead.companyName} — rövid megkeresés` : "");

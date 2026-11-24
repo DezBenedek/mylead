@@ -686,11 +686,23 @@ pub async fn enrich_leads(
                     .map(|a| a.tech_stack.clone())
                     .unwrap_or_else(|| lead.tech_stack.clone());
 
+                // Manual deep-enrich used to mark EVERYTHING "enriched" — even
+                // municipalities / authorities with Fit 10. Apply the same gate as the
+                // automatic search flow: public-sector or clear mismatch → disqualified.
+                let rejected = !analysis.matches_search
+                    || analysis.fit_score < 48
+                    || discovery::is_public_sector_lead(&analysis.company_name, &lead.domain);
+                let (status, enriched_flag) = if rejected {
+                    ("disqualified", false)
+                } else {
+                    ("enriched", true)
+                };
+
                 let saved = db.update_lead_enrichment(
                     &lead.id,
                     analysis.fit_score,
-                    "enriched",
-                    true,
+                    status,
+                    enriched_flag,
                     &analysis.employee_estimate,
                     &analysis.company_summary,
                     &analysis.pain_points,
@@ -703,6 +715,11 @@ pub async fn enrich_leads(
                     audit_ref,
                 )?;
 
+                let done_msg = if rejected {
+                    format!("Kiszűrve ({}/{}): {} — nem megkereshető / nem illeszkedik (Fit {})", done, total, saved.company_name, saved.fit_score)
+                } else {
+                    format!("Mély adatlap kész ({}/{}): {} — Fit {}", done, total, saved.company_name, saved.fit_score)
+                };
                 let _ = app.emit(
                     "search-live-event",
                     SearchLiveEvent {
@@ -713,7 +730,7 @@ pub async fn enrich_leads(
                         domain: Some(saved.domain.clone()),
                         fit_score: Some(saved.fit_score),
                         status: Some(saved.status.clone()),
-                        message: format!("Mély adatlap kész ({}/{}): {} — Fit {}", done, total, saved.company_name, saved.fit_score),
+                        message: done_msg.clone(),
                         current: done,
                         total,
                         round: 1,
@@ -731,7 +748,7 @@ pub async fn enrich_leads(
                     &saved.id,
                     done,
                     total,
-                    format!("Mély adatlap kész ({}/{}): {}", done, total, saved.company_name),
+                    done_msg,
                 );
                 updated.push(saved);
             }
@@ -1159,15 +1176,16 @@ pub async fn send_direct_email(
             format!("<direct-sim-{}.mylead@local>", uuid::Uuid::new_v4())
         } else {
             let accounts = db.list_sender_accounts()?;
+            // Közvetlen 1:1 üzenet: explicit választás → válasz-fiók → alapértelmezett → első.
             let account = input
                 .sender_account_id
                 .as_deref()
                 .and_then(|aid| accounts.iter().find(|a| a.id == aid))
-                .or_else(|| accounts.iter().find(|a| a.is_default))
-                .or_else(|| accounts.first())
+                .cloned()
+                .or_else(|| pick_reply_account(&accounts, &settings, None))
                 .ok_or_else(|| "Nincs beállított SMTP vagy Amazon SES fiók a küldéshez!".to_string())?;
             let id = mailer::send_email(
-                account,
+                &account,
                 &lead.primary_email,
                 &input.subject,
                 &input.body,
@@ -1258,7 +1276,10 @@ pub async fn send_campaign_drafts(
 
     db.update_campaign_status(&campaign_id, "active")?;
     let max_to_send = ((account.daily_limit - account.sent_today).max(0) as usize).min(campaign.daily_limit as usize);
-    let slice: Vec<EmailMessage> = messages.into_iter().take(if dry_run { 50 } else { max_to_send.max(1) }).collect();
+    if !dry_run && max_to_send == 0 {
+        return Err("Napi küldési limit elérve ennél a fióknál — holnap folytatható.".to_string());
+    }
+    let slice: Vec<EmailMessage> = messages.into_iter().take(if dry_run { 50 } else { max_to_send }).collect();
     let total = slice.len();
     let mut sent_ok = 0usize;
 
@@ -1368,24 +1389,130 @@ pub fn delete_inbox_conversation(
     Ok(deleted)
 }
 
+/// "Megoldva" jelölés egy tanácskérésre: a felhasználó elolvasta és eldöntötte
+/// az ügyet, így a főoldali figyelmeztetés eltűnik (a kérdés megmarad).
 #[tauri::command]
-pub async fn sync_imap_inbox(app: AppHandle, db: State<'_, Database>, sender_account_id: Option<String>) -> Result<usize, String> {
-    let count = sync_imap_inbox_inner(&app, &db, sender_account_id.as_deref()).await?;
-    Ok(count)
+pub fn dismiss_human_request(
+    app: AppHandle,
+    db: State<Database>,
+    thread_key: String,
+) -> Result<InboxThread, String> {
+    db.clear_needs_human_for_thread(&thread_key)?;
+    let thread = db
+        .list_inbox_threads()?
+        .into_iter()
+        .find(|t| t.thread_key == thread_key)
+        .ok_or_else(|| "Beszélgetés nem található".to_string())?;
+    db.log_activity(
+        "reply",
+        "Tanácskérés megoldva",
+        &format!("{} — {}", thread.lead_company, thread.subject),
+        Some(&thread.lead_id),
+    );
+    let _ = app.emit("inbox-updated", ());
+    Ok(thread)
+}
+
+#[tauri::command]
+pub async fn sync_imap_inbox(app: AppHandle, db: State<'_, Database>, sender_account_id: Option<String>) -> Result<SyncInboxReport, String> {
+    let report = sync_imap_inbox_inner(&app, &db, sender_account_id.as_deref()).await?;
+    Ok(report)
+}
+
+/// Automata / rendszerfeladók, amelyekből soha nem készül lead:
+/// hírlevél-küldők, kézbesítési jelentések, házon kívüli auto-válaszok.
+fn is_automated_sender(email: &str) -> bool {
+    let local = email.split('@').next().unwrap_or("").to_lowercase();
+    if local.is_empty() {
+        return true;
+    }
+    const EXACT: &[&str] = &[
+        "noreply",
+        "no-reply",
+        "donotreply",
+        "do-not-reply",
+        "mailer-daemon",
+        "mailerdaemon",
+        "postmaster",
+        "daemon",
+        "bounce",
+        "bounces",
+        "bounced",
+        "notification",
+        "notifications",
+        "notify",
+        "alerts",
+        "autoreply",
+        "auto-reply",
+        "automata",
+    ];
+    if EXACT.contains(&local.as_str()) {
+        return true;
+    }
+    // Előtag + elválasztó (pl. bounce-123, noreply.hirek, autoreply+tag).
+    // A pontot csak a legszembetűnőbb automata mintáknál engedjük, hogy a
+    // "notification.team" jellegű emberi címek ne essenek ki.
+    const PREFIX: &[&str] = &[
+        "noreply",
+        "no-reply",
+        "donotreply",
+        "do-not-reply",
+        "bounce",
+        "bounces",
+        "autoreply",
+        "auto-reply",
+        "mailer-daemon",
+    ];
+    PREFIX.iter().any(|p| {
+        local.starts_with(&format!("{}-", p))
+            || local.starts_with(&format!("{}_", p))
+            || local.starts_with(&format!("{}.", p))
+            || local.starts_with(&format!("{}+", p))
+    })
+}
+
+/// Cégnév becslése ismeretlen feladóhoz: a From megjelenő neve, vagy az
+/// e-mail cím helyi része (kovacs.marton → "Kovacs Marton").
+fn company_name_from_sender(from_name: &str, from_email: &str) -> String {
+    let n = from_name.trim();
+    if !n.is_empty() {
+        return n.to_string();
+    }
+    let local = from_email.split('@').next().unwrap_or("").trim();
+    let mut pretty = local
+        .replace(['.', '_', '-', '+'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if pretty.is_empty() {
+        pretty = from_email.to_string();
+    }
+    let mut chars = pretty.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+        None => pretty,
+    }
 }
 
 pub(crate) async fn sync_imap_inbox_inner(
     app: &AppHandle,
     db: &Database,
     sender_account_id: Option<&str>,
-) -> Result<usize, String> {
+) -> Result<SyncInboxReport, String> {
     // A frontend csendes pollja és a backend saját ütemezett pollja könnyen
     // átfedésbe kerül — ilyenkor ugyanaz a levél kétszer is bekerülne
     // (check-then-insert verseny). Ha már fut egy szinkron, ezt kihagyjuk.
     static IMAP_SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _guard = match IMAP_SYNC_LOCK.try_lock() {
         Ok(g) => g,
-        Err(_) => return Ok(0),
+        Err(_) => {
+            return Ok(SyncInboxReport {
+                inserted: 0,
+                new_leads: 0,
+                skipped_automated: 0,
+                errors: vec![],
+            })
+        }
     };
     // Korábban beragadt duplikált bejövő üzenetek takarítása.
     let _ = db.delete_duplicate_inbound_messages();
@@ -1399,8 +1526,12 @@ pub(crate) async fn sync_imap_inbox_inner(
         return Err("Nincs aktív IMAP postafiók beállítva a Beállítások → E-mail & IMAP fülön.".to_string());
     }
 
-    let mut new_replies = 0usize;
-    let mut last_err: Option<String> = None;
+    let mut report = SyncInboxReport {
+        inserted: 0,
+        new_leads: 0,
+        skipped_automated: 0,
+        errors: vec![],
+    };
 
     for target in targets {
         let account_clone = target.clone();
@@ -1428,8 +1559,90 @@ pub(crate) async fn sync_imap_inbox_inner(
                         );
                         continue;
                     }
-                    if let Some(lead) = db.find_lead_by_email(&mail.from_email)? {
-                        process_inbound_reply(
+                    // Automata rendszerlevelekből (kézbesítési jelentés,
+                    // házon kívüli auto-válasz, noreply) nem készül lead —
+                    // de megjelöljük, hogy minden pollnál ne számoljuk újra.
+                    if is_automated_sender(&mail.from_email)
+                        || (mail.subject.trim().is_empty() && mail.body.trim().is_empty())
+                    {
+                        let _ = db.mark_inbound_processed(
+                            &mail.message_id,
+                            &mail.from_email,
+                            &mail.subject,
+                            "skipped_auto",
+                        );
+                        report.skipped_automated += 1;
+                        continue;
+                    }
+                    // Ismeretlen feladó: ha a címe vagy a domainje sem szerepel
+                    // az adatbázisban, automatikusan felvesszük leadnek, hogy
+                    // egyetlen beérkező válasz se vesszen el csendben.
+                    let lead_opt = match db.find_lead_by_email(&mail.from_email)? {
+                        Some(lead) => Some((lead, false)),
+                        None => {
+                            let domain = mail
+                                .from_email
+                                .split('@')
+                                .nth(1)
+                                .unwrap_or("")
+                                .trim()
+                                .to_lowercase();
+                            match db.find_lead_by_domain(&domain)? {
+                                Some(lead) => {
+                                    // Meglévő cég új címe: összefésüljük, ha üres a mező.
+                                    let merged_id = db.upsert_discovered_lead(
+                                        None,
+                                        &lead.company_name,
+                                        &format!("https://{}", domain),
+                                        &lead.industry,
+                                        &lead.location,
+                                        "",
+                                        "",
+                                        &mail.from_email,
+                                        None,
+                                        None,
+                                        "Beérkező e-mail (új cím)",
+                                    )?;
+                                    Some((db.get_lead(&merged_id)?, false))
+                                }
+                                None => {
+                                    if domain.is_empty() {
+                                        let _ = db.mark_inbound_processed(
+                                            &mail.message_id,
+                                            &mail.from_email,
+                                            &mail.subject,
+                                            "skipped_auto",
+                                        );
+                                        report.skipped_automated += 1;
+                                        continue;
+                                    }
+                                    let company = company_name_from_sender(
+                                        &mail.from_name,
+                                        &mail.from_email,
+                                    );
+                                    let lead_id = db.upsert_discovered_lead(
+                                        None,
+                                        &company,
+                                        &format!("https://{}", domain),
+                                        "B2B",
+                                        "",
+                                        "",
+                                        "",
+                                        &mail.from_email,
+                                        None,
+                                        None,
+                                        "Beérkező e-mail (ismeretlen feladó)",
+                                    )?;
+                                    Some((db.get_lead(&lead_id)?, true))
+                                }
+                            }
+                        }
+                    };
+                    if let Some((lead, is_new)) = lead_opt {
+                        // Egy hibás levél nem akaszthatja meg a többit:
+                        // a hiba a riportba kerül, a levél jelöletlen marad,
+                        // így a következő szinkron újra megpróbálja.
+                        match process_inbound_reply(
                             app,
                             db,
                             &lead,
@@ -1439,29 +1652,40 @@ pub(crate) async fn sync_imap_inbox_inner(
                             Some(&mail.message_id),
                             mail.in_reply_to.as_deref(),
                         )
-                        .await?;
-                        let _ = db.mark_inbound_processed(
-                            &mail.message_id,
-                            &mail.from_email,
-                            &mail.subject,
-                            "inserted",
-                        );
-                        new_replies += 1;
+                        .await
+                        {
+                            Ok(_) => {
+                                let _ = db.mark_inbound_processed(
+                                    &mail.message_id,
+                                    &mail.from_email,
+                                    &mail.subject,
+                                    "inserted",
+                                );
+                                report.inserted += 1;
+                                if is_new {
+                                    report.new_leads += 1;
+                                }
+                            }
+                            Err(e) => {
+                                report.errors.push(format!("{}: {}", mail.from_email, e));
+                            }
+                        }
                     }
                 }
             }
             Err(e) => {
-                last_err = Some(e);
+                report.errors.push(format!("{}: {}", target.name, e));
             }
         }
     }
 
-    if new_replies > 0 {
+    if report.inserted > 0 {
         let _ = app.emit("inbox-updated", ());
-    } else if let Some(err) = last_err {
-        return Err(err);
     }
-    Ok(new_replies)
+    if report.inserted == 0 && !report.errors.is_empty() {
+        return Err(report.errors.join(" | "));
+    }
+    Ok(report)
 }
 
 #[tauri::command]
@@ -1515,6 +1739,7 @@ pub async fn reclassify_inbox_threads(app: AppHandle, db: State<'_, Database>) -
                 &lead,
                 &inbound.body,
                 &thread.messages,
+                None,
             )
             .await;
 
@@ -1525,6 +1750,16 @@ pub async fn reclassify_inbox_threads(app: AppHandle, db: State<'_, Database>) -
                 &classification.tags,
                 &classification.summary,
             )?;
+            if classification.needs_human {
+                let question = if classification.human_question.trim().is_empty() {
+                    "Ennél a levélnél emberi döntés kell: kérlek, olvasd el, és írd meg, mit válaszoljunk.".to_string()
+                } else {
+                    classification.human_question.clone()
+                };
+                let _ = db.mark_needs_human(&inbound.id, &question);
+                // Újrasoroláskor is álljanak le az időzített robotválaszok.
+                let _ = db.pause_scheduled_thread_messages(&thread.thread_key);
+            }
 
             let mut merged_tags = lead.tags.clone();
             for tg in &classification.tags {
@@ -1642,6 +1877,26 @@ pub(crate) async fn process_inbound_reply(
         None => Vec::new(),
     };
 
+    // Ha van el nem küldött választervezet, az új levéllel EGYBEVÉVE készül
+    // az új válasz — ezért a tervezet szövegét is megkapja a döntési modell.
+    // (Ugyanezt a tervezetet frissítjük lentebb, nem halmozunk mellé újat.)
+    let existing_pending = thread_history
+        .iter()
+        .rev()
+        .find(|m| {
+            m.direction == "outbound"
+                && m.status == "queued"
+                && m.step_number >= 2
+        })
+        .or_else(|| {
+            thread_history.iter().rev().find(|m| {
+                m.direction == "outbound"
+                    && (m.status == "queued" || m.status == "draft")
+                    && m.step_number >= 2
+            })
+        });
+    let pending_draft_body = existing_pending.map(|m| m.body.as_str());
+
     let classification = ai::classify_and_draft_reply(
         &settings,
         &project,
@@ -1652,6 +1907,7 @@ pub(crate) async fn process_inbound_reply(
         lead,
         body,
         &thread_history,
+        pending_draft_body,
     )
     .await;
 
@@ -1695,6 +1951,35 @@ pub(crate) async fn process_inbound_reply(
         &classification.tags,
         &classification.summary,
     );
+
+    // Emberi beavatkozást kérő levél: nincs automatikus válasz, helyette a
+    // főoldalon jelenik meg a tanácskérés. A függő tervezetet nem bántjuk,
+    // de a beszélgetés időzített automatikus válaszait megállítjuk, nehogy
+    // a robot válaszoljon, amikor az ügyfél élő embert kért.
+    if classification.needs_human {
+        let question = if classification.human_question.trim().is_empty() {
+            "Ennél a levélnél emberi döntés kell: kérlek, olvasd el, és írd meg, mit válaszoljunk.".to_string()
+        } else {
+            classification.human_question.clone()
+        };
+        let _ = db.mark_needs_human(&inbound_msg_id, &question);
+        let paused = db.pause_scheduled_thread_messages(&conversation_key).unwrap_or(0);
+        db.log_activity(
+            "reply",
+            "Emberi tanácsot kér az AI",
+            &format!(
+                "{} — {}{}",
+                lead.company_name,
+                question,
+                if paused > 0 {
+                    format!(" ({} időzített válasz megállítva)", paused)
+                } else {
+                    String::new()
+                }
+            ),
+            Some(&lead.id),
+        );
+    }
 
     // Update lead status, tags & suppression list based on AI Decision Model
     let new_status = match classification.intent.as_str() {
@@ -1761,28 +2046,10 @@ pub(crate) async fn process_inbound_reply(
             || (!project.booking_url.is_empty() && classification.suggested_reply.contains(&project.booking_url));
 
         // Ha ugyanebben a beszélgetésben már van el nem küldött választervezet,
-        // nem halmozunk mellé újat, hanem azt frissítjük az új levél alapján.
+        // nem halmozunk mellé újat, hanem azt frissítjük az új levél alapján
+        // (a döntési modell a két levelet egybevéve válaszolta meg).
         // Más beszélgetés tervezetét viszont nem írjuk felül.
-        let conversation_messages = if conversation_key.is_empty() {
-            thread_history.clone()
-        } else {
-            db.list_thread_messages(&conversation_key).unwrap_or_default()
-        };
-        let existing_pending = conversation_messages
-            .iter()
-            .rev()
-            .find(|m| {
-                m.direction == "outbound"
-                    && m.status == "queued"
-                    && m.step_number >= 2
-            })
-            .or_else(|| {
-                conversation_messages.iter().rev().find(|m| {
-                    m.direction == "outbound"
-                        && (m.status == "queued" || m.status == "draft")
-                        && m.step_number >= 2
-                })
-            });
+        // (existing_pending fentebb, a klasszifikáció előtt lett megkeresve.)
         if let Some(pend) = existing_pending {
             let _ = db.update_email_message_content(
                 &pend.id,
@@ -1852,6 +2119,36 @@ pub(crate) async fn process_inbound_reply(
     Ok(conversation_key)
 }
 
+/// A valódi ügyféllevelezés (1:1 válaszok: időzített AI-válasz, kézi válasz,
+/// "azonnal küldés") feladójának kiválasztása.
+///
+/// Ha a Beállításokban meg van adva a "Válaszok küldő fiókja", MINDIG az nyer —
+/// így a tömeges kampányküldés mehet egy "burner" domainről (pl. SES SES-sel),
+/// az élő ügyfélkommunikáció pedig a saját, védett domainről. Ha a Google a
+/// burnert letiltja, az ügyféllevelezés zavartalanul megy tovább.
+/// Fallback sorrend: kampány fiók → alapértelmezett fiók → első fiók.
+pub(crate) fn pick_reply_account(
+    accounts: &[SenderAccount],
+    settings: &AppSettings,
+    campaign: Option<&Campaign>,
+) -> Option<SenderAccount> {
+    if let Some(rid) = settings
+        .reply_sender_account_id
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        if let Some(acc) = accounts.iter().find(|a| a.id == rid) {
+            return Some(acc.clone());
+        }
+    }
+    campaign
+        .and_then(|c| c.sender_account_id.as_ref())
+        .and_then(|aid| accounts.iter().find(|a| &a.id == aid))
+        .or_else(|| accounts.iter().find(|a| a.is_default))
+        .or_else(|| accounts.first())
+        .cloned()
+}
+
 /// Dispatches a single scheduled outbound message (live SMTP/SES or dry-run)
 pub(crate) async fn execute_send_for_message(
     db: &Database,
@@ -1882,20 +2179,13 @@ pub(crate) async fn execute_send_for_message(
         format!("<auto-sim-{}.mylead@local>", uuid::Uuid::new_v4())
     } else {
         let accounts = db.list_sender_accounts()?;
-        let account = campaign
-            .as_ref()
-            .and_then(|c| c.sender_account_id.as_ref())
-            .and_then(|aid| accounts.iter().find(|a| &a.id == aid))
-            .or_else(|| accounts.iter().find(|a| a.is_default))
-            .or_else(|| accounts.first())
+        let settings = db.get_settings().unwrap_or_default();
+        // 1:1 ügyfélválasz → a beállított válasz-fiók nyer a kampányfiókkal szemben.
+        let account = pick_reply_account(&accounts, &settings, campaign.as_ref())
             .ok_or_else(|| "Nincs beállított SMTP vagy Amazon SES fiók a küldéshez!".to_string())?;
-        let fine_print = db
-            .get_settings()
-            .ok()
-            .map(|s| s.signature_fine_print)
-            .unwrap_or_default();
+        let fine_print = settings.signature_fine_print.clone();
         let id = mailer::send_email(
-            account,
+            &account,
             &msg.lead_email,
             &msg.subject,
             &msg.body,
@@ -1908,6 +2198,10 @@ pub(crate) async fn execute_send_for_message(
     };
 
     db.mark_email_sent(&msg.id, &sent_msg_id, booking_sent)?;
+
+    // Ha ebben a beszélgetésben tanácskérés volt függőben, a kiküldött válasz
+    // feloldja (a felhasználó a küldéssel döntött).
+    let _ = db.clear_needs_human_for_thread(msg.thread_key.as_deref().unwrap_or(""));
 
     if booking_sent {
         let _ = db.update_lead_fields(LeadUpdateInput {
@@ -2245,37 +2539,8 @@ pub async fn generate_inbox_reply_with_ai(
         format!("Re: {}", base_subj)
     };
 
-    let classification = ai::classify_and_draft_reply(
-        &settings,
-        &project,
-        offer.as_ref(),
-        camp.as_ref().map(|c| c.offer_summary.as_str()).unwrap_or(""),
-        camp.as_ref().map(|c| c.offer_timing.as_str()).unwrap_or("on_interest"),
-        camp.as_ref().map(|c| c.offer_delivery.as_str()).unwrap_or(""),
-        &lead,
-        inbound_text,
-        &history,
-    )
-    .await;
-    let sig = ai::resolve_email_signature(Some(&project), &settings);
-    let (expected_greeting, _) = ai::compute_hungarian_salutation(&lead, "professional_formal");
-    let body = if classification.suggested_reply.trim().is_empty() {
-        format!(
-            "{}\n\nKöszönöm a megkeresést!\n\nSzívesen egyeztetünk a(z) {} kapcsán. {}\n\n{}",
-            expected_greeting,
-            lead.company_name,
-            if !project.booking_url.is_empty() {
-                format!("Itt tud közvetlenül időpontot választani: {}", project.booking_url)
-            } else {
-                String::new()
-            },
-            sig
-        )
-    } else {
-        classification.suggested_reply
-    };
-
-    // If an existing pending/paused outbound reply exists, update it; otherwise insert new scheduled reply
+    // Ha van függő tervezet, az új válasz a két levelet egybevéve készül —
+    // ezért a tervezet szövegét is megkapja a döntési modell.
     let existing_pending = history
         .iter()
         .rev()
@@ -2288,6 +2553,45 @@ pub async fn generate_inbox_reply_with_ai(
                             && (m.step_number >= 2 || m.auto_send_status.is_some())))
             })
         });
+    let classification = ai::classify_and_draft_reply(
+        &settings,
+        &project,
+        offer.as_ref(),
+        camp.as_ref().map(|c| c.offer_summary.as_str()).unwrap_or(""),
+        camp.as_ref().map(|c| c.offer_timing.as_str()).unwrap_or("on_interest"),
+        camp.as_ref().map(|c| c.offer_delivery.as_str()).unwrap_or(""),
+        &lead,
+        inbound_text,
+        &history,
+        existing_pending.map(|m| m.body.as_str()),
+    )
+    .await;
+    let sig = ai::resolve_email_signature(Some(&project), &settings);
+    let (expected_greeting, is_single) = ai::compute_hungarian_salutation(&lead, "professional_formal");
+    let target_url = if !project.landing_url.trim().is_empty() {
+        project.landing_url.as_str()
+    } else {
+        project.website_url.as_str()
+    };
+    let body = if classification.suggested_reply.trim().is_empty() {
+        let cta = if is_single {
+            format!("A megoldás kipróbálását és az előfizetést itt tudja elkezdeni: {}", target_url)
+        } else {
+            format!("A megoldás kipróbálását és az előfizetést itt tudják elkezdeni: {}", target_url)
+        };
+        format!(
+            "{}\n\nKöszönöm a megkeresést!\n\nSzívesen egyeztetünk a(z) {} kapcsán. {}\n\n{}",
+            expected_greeting,
+            lead.company_name,
+            cta,
+            sig
+        )
+    } else {
+        classification.suggested_reply
+    };
+
+    // If an existing pending/paused outbound reply exists, update it; otherwise insert new scheduled reply
+    // (existing_pending fentebb, a klasszifikáció előtt lett megkeresve).
     let scheduled_at = ai::compute_random_business_send_time(&settings);
     if let Some(pend) = existing_pending {
         db.update_email_message_content(&pend.id, &reply_subject, &body, None)?;
@@ -2406,20 +2710,13 @@ pub async fn send_inbox_reply(
         format!("<reply-sim-{}.mylead@local>", uuid::Uuid::new_v4())
     } else {
         let accounts = db.list_sender_accounts()?;
-        let account = campaign
-            .as_ref()
-            .and_then(|c| c.sender_account_id.as_ref())
-            .and_then(|aid| accounts.iter().find(|a| &a.id == aid))
-            .or_else(|| accounts.iter().find(|a| a.is_default))
-            .or_else(|| accounts.first())
+        let settings = db.get_settings().unwrap_or_default();
+        // Kézi 1:1 válasz → a beállított válasz-fiók nyer a kampányfiókkal szemben.
+        let account = pick_reply_account(&accounts, &settings, campaign.as_ref())
             .ok_or_else(|| "Nincs beállított SMTP vagy Amazon SES fiók a küldéshez!".to_string())?;
-        let fine_print = db
-            .get_settings()
-            .ok()
-            .map(|s| s.signature_fine_print)
-            .unwrap_or_default();
+        let fine_print = settings.signature_fine_print.clone();
         let id = mailer::send_email(
-            account,
+            &account,
             &lead.primary_email,
             &subject,
             &body,
@@ -2453,6 +2750,11 @@ pub async fn send_inbox_reply(
             .get_email_message(&new_sent_id)
             .ok()
             .and_then(|m| m.thread_key);
+    }
+
+    // Kézi válasszal a felhasználó döntött — a függő tanácskérés feloldódik.
+    if let Some(key) = effective_thread_key.as_deref() {
+        let _ = db.clear_needs_human_for_thread(key);
     }
 
     // Tervezet nélkül küldött kézi válasz esetén is töröljük a beszélgetés
@@ -2584,4 +2886,156 @@ pub fn load_demo_data(db: State<Database>) -> Result<(), String> {
 #[tauri::command]
 pub fn clear_workspace_data(db: State<Database>) -> Result<(), String> {
     db.clear_all_data()
+}
+
+#[tauri::command]
+pub fn export_database(db: State<Database>) -> Result<String, String> {
+    db.export_database_json()
+}
+
+#[tauri::command]
+pub fn import_database(db: State<Database>, json: String) -> Result<String, String> {
+    db.import_database_json(&json)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_account(id: &str, from_email: &str, is_default: bool) -> SenderAccount {
+        SenderAccount {
+            id: id.to_string(),
+            name: id.to_string(),
+            provider: "smtp".to_string(),
+            from_name: String::new(),
+            from_email: from_email.to_string(),
+            reply_to: String::new(),
+            mailbox_email: from_email.to_string(),
+            smtp_host: "smtp.example.hu".to_string(),
+            smtp_port: 587,
+            smtp_username: String::new(),
+            smtp_password: String::new(),
+            smtp_security: "starttls".to_string(),
+            ses_region: String::new(),
+            ses_access_key: String::new(),
+            ses_secret_key: String::new(),
+            daily_limit: 50,
+            sent_today: 0,
+            imap_host: String::new(),
+            imap_port: 993,
+            imap_username: String::new(),
+            imap_password: String::new(),
+            imap_enabled: false,
+            is_default,
+            created_at: String::new(),
+            sent_day: String::new(),
+        }
+    }
+
+    fn test_settings_with_reply(reply_id: Option<&str>) -> AppSettings {
+        let mut s = AppSettings::default();
+        s.reply_sender_account_id = reply_id.map(|r| r.to_string());
+        s
+    }
+
+    #[test]
+    fn reply_account_setting_wins_over_campaign_account() {
+        let accounts = vec![
+            test_account("burner", "okosurlap@quan.hu", true),
+            test_account("real", "benedek@okosurlap.hu", false),
+        ];
+        let campaign = Campaign {
+            id: "c".into(),
+            name: "C".into(),
+            project_id: "p".into(),
+            project_name: "P".into(),
+            offer_id: None,
+            offer_title: None,
+            search_id: None,
+            search_name: None,
+            sender_account_id: Some("burner".into()),
+            sender_name: None,
+            status: "active".into(),
+            tone: "professional_formal".into(),
+            language: "hu".into(),
+            auto_reply_mode: "draft".into(),
+            daily_limit: 40,
+            min_delay_sec: 45,
+            follow_up_days: 3,
+            include_booking_link: false,
+            custom_instructions: String::new(),
+            offer_summary: String::new(),
+            offer_timing: "on_interest".into(),
+            offer_delivery: String::new(),
+            total_recipients: 0,
+            sent_count: 0,
+            failed_count: 0,
+            reply_count: 0,
+            positive_count: 0,
+            booked_count: 0,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+
+        // Beállított válasz-fiók nyer a kampány (burner) fiókkal szemben.
+        let picked =
+            pick_reply_account(&accounts, &test_settings_with_reply(Some("real")), Some(&campaign));
+        assert_eq!(picked.map(|a| a.from_email), Some("benedek@okosurlap.hu".to_string()));
+
+        // Beállítás nélkül a kampány fiókja marad (tömeges kiküldés).
+        let picked = pick_reply_account(&accounts, &test_settings_with_reply(None), Some(&campaign));
+        assert_eq!(picked.map(|a| a.from_email), Some("okosurlap@quan.hu".to_string()));
+
+        // Törölt/érvénytelen válasz-fiók esetén fallback, nem hiba.
+        let picked =
+            pick_reply_account(&accounts, &test_settings_with_reply(Some("gone")), Some(&campaign));
+        assert_eq!(picked.map(|a| a.from_email), Some("okosurlap@quan.hu".to_string()));
+
+        // Semmi sincs: kampány nélküli 1:1 levél az alapértelmezettet kapja.
+        let picked = pick_reply_account(&accounts, &test_settings_with_reply(None), None);
+        assert_eq!(picked.map(|a| a.from_email), Some("okosurlap@quan.hu".to_string()));
+
+        // Üres fióklista: nincs mit választani.
+        let picked: Option<SenderAccount> =
+            pick_reply_account(&[], &test_settings_with_reply(Some("real")), None);
+        assert!(picked.is_none());
+    }
+
+    #[test]
+    fn automated_senders_are_detected() {
+        for auto in [
+            "noreply@ceg.hu",
+            "no-reply@ceg.hu",
+            "donotreply@ceg.hu",
+            "mailer-daemon@ceg.hu",
+            "postmaster@ceg.hu",
+            "bounce-123@ceg.hu",
+            "autoreply@ceg.hu",
+            "",
+        ] {
+            assert!(is_automated_sender(auto), "automata: {}", auto);
+        }
+        for human in [
+            "info@ceg.hu",
+            "kovacs.marton@ceg.hu",
+            "notification.team@ceg.hu",
+            "support@ceg.hu",
+            "iroda@ceg.hu",
+        ] {
+            assert!(!is_automated_sender(human), "ember: {}", human);
+        }
+    }
+
+    #[test]
+    fn company_name_falls_back_to_email_local_part() {
+        assert_eq!(
+            company_name_from_sender("Kovács Márton", "m@ceg.hu"),
+            "Kovács Márton"
+        );
+        assert_eq!(
+            company_name_from_sender("", "kovacs.marton@ceg.hu"),
+            "Kovacs marton"
+        );
+        assert_eq!(company_name_from_sender("", "info@ceg.hu"), "Info");
+    }
 }

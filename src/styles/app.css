@@ -108,6 +108,57 @@ body,
   padding: 10px 12px;
 }
 
+/* ---- Sidebar AI status card (redesigned) ---- */
+
+.ml-status-card {
+  background-color: var(--ml-surface);
+  border: 1px solid var(--ml-border);
+  border-radius: var(--ml-radius-md);
+  box-shadow: var(--ml-shadow-sm);
+  padding: 11px 12px;
+}
+
+.ml-status-card-active {
+  border-color: var(--ml-forest);
+  box-shadow: 0 0 0 1px var(--ml-forest-ring), var(--ml-shadow-sm);
+}
+
+.ml-status-card-idle {
+  border-style: dashed;
+  border-color: var(--ml-border-strong);
+}
+
+.ml-pulse-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: #16a34a;
+  flex-shrink: 0;
+  animation: ml-pulse 1.4s ease-in-out infinite;
+}
+
+.ml-idle-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: #16a34a;
+  flex-shrink: 0;
+  box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.15);
+  margin-top: 2px;
+}
+
+@keyframes ml-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 rgba(22, 163, 74, 0.45);
+  }
+  50% {
+    opacity: 0.65;
+    box-shadow: 0 0 0 5px rgba(22, 163, 74, 0);
+  }
+}
+
 .ml-surface {
   background-color: var(--ml-surface);
   border-color: var(--ml-border);
@@ -678,7 +729,13 @@ body,
   flex-shrink: 0;
   min-height: 62px;
 }
-.ml-header-subject { flex-shrink: 1; }
+.ml-header-subject {
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .ml-thread-main {
   display: flex;
@@ -711,12 +768,14 @@ body,
   color: var(--ml-ink-subtle);
 }
 
-.ml-timeline { max-width: 720px; margin: 0 auto; width: 100%; }
+.ml-timeline { max-width: 720px; margin: 0 auto; width: 100%; min-width: 0; }
 .ml-msg {
   border-radius: 10px;
   padding: 12px 14px;
   border: 1px solid var(--ml-border);
   background: var(--ml-surface);
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .ml-msg.in { border-left: 3px solid #166534; }
 .ml-msg.out { background: var(--ml-canvas); border-left: 3px solid var(--ml-border-strong); }
@@ -761,7 +820,15 @@ body,
 
 /* ============ Email formatting: quotes, signatures, links ============ */
 
-.ml-email-body { min-width: 0; }
+.ml-email-body {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.ml-email-body .mantine-Text-root {
+  overflow-wrap: anywhere;
+}
 
 .ml-quote {
   border-left: 2px solid var(--ml-border-strong);
@@ -798,6 +865,24 @@ body,
   word-break: break-all;
 }
 [data-mantine-color-scheme="dark"] .ml-mail-link { color: #4ade80; }
+
+/* ============ Tables with action buttons: horizontal scroll + sticky action column ============ */
+
+.ml-table-scroll {
+  border-radius: 6px;
+}
+
+.ml-table-scroll table {
+  min-width: 960px;
+}
+
+.ml-table-scroll-narrow table {
+  min-width: 780px;
+}
+
+.ml-table-actions {
+  white-space: nowrap;
+}
 
 /* ============ Reply bar + compose modal ============ */
 

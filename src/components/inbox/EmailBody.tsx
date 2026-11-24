@@ -174,6 +174,21 @@ function QuoteBlock({ header, lines }: { header: string | null; lines: string[] 
   );
 }
 
+/** Rövid, egybefüggő kivonat a levél saját szövegéből (idézetek és
+ *  aláírás nélkül) a beszélgetés-listához. Szóhatárnál vág, "…" jellel. */
+export function getEmailSnippet(body: string, maxChars = 220): string {
+  const text = parseEmailBody(body || "")
+    .filter((b) => b.kind === "text")
+    .map((b) => (b as { kind: "text"; text: string }).text)
+    .join("\n")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (text.length <= maxChars) return text;
+  const cut = text.slice(0, maxChars);
+  const lastSpace = cut.lastIndexOf(" ");
+  return `${(lastSpace > maxChars * 0.5 ? cut.slice(0, lastSpace) : cut).trimEnd()}…`;
+}
+
 export function EmailBody({ body, hideQuoted }: { body: string; hideQuoted?: boolean }) {
   const blocks = useMemo(() => parseEmailBody(body || ""), [body]);
   const visible = hideQuoted ? blocks.filter((b) => b.kind !== "quote") : blocks;

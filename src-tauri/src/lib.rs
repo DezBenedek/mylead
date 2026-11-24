@@ -124,6 +124,7 @@ pub fn run() {
             commands::generate_direct_email_draft,
             commands::send_direct_email,
             commands::list_inbox_threads,
+            commands::dismiss_human_request,
             commands::list_lead_message_history,
             commands::delete_inbox_conversation,
             commands::sync_imap_inbox,
@@ -152,6 +153,8 @@ pub fn run() {
             commands::get_analytics,
             commands::load_demo_data,
             commands::clear_workspace_data,
+            commands::export_database,
+            commands::import_database,
         ])
         .run(tauri::generate_context!())
         .expect("Hiba a MyLead alkalmazás indításakor");

@@ -2,13 +2,35 @@ use crate::crawler::extract_domain;
 use crate::models::*;
 use chrono::{Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use uuid::Uuid;
 
+/// Teljes adatbázis-mentéshez kezelt táblák (függőségi sorrendben: szülő → gyerek).
+pub(crate) const BACKUP_TABLES: &[&str] = &[
+    "projects",
+    "offers",
+    "sender_accounts",
+    "searches",
+    "leads",
+    "search_leads",
+    "campaigns",
+    "email_messages",
+    "settings",
+    "suppression_list",
+    "inbound_processed",
+    "activity_log",
+];
+
 pub struct Database {
     pub conn: Mutex<Connection>,
+}
+
+/// Mai nap helyi idő szerint (YYYY-MM-DD) — a napi küldési limitekhez.
+pub(crate) fn today_str() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
 /// Strips mail client reply/forward prefixes so that "Re: Foo" and "Foo"
@@ -343,6 +365,7 @@ impl Database {
                 from_name TEXT NOT NULL DEFAULT '',
                 from_email TEXT NOT NULL DEFAULT '',
                 reply_to TEXT NOT NULL DEFAULT '',
+                mailbox_email TEXT NOT NULL DEFAULT '',
                 smtp_host TEXT NOT NULL DEFAULT '',
                 smtp_port INTEGER NOT NULL DEFAULT 587,
                 smtp_username TEXT NOT NULL DEFAULT '',
@@ -353,6 +376,7 @@ impl Database {
                 ses_secret_key TEXT NOT NULL DEFAULT '',
                 daily_limit INTEGER NOT NULL DEFAULT 50,
                 sent_today INTEGER NOT NULL DEFAULT 0,
+                sent_day TEXT NOT NULL DEFAULT '',
                 imap_host TEXT NOT NULL DEFAULT '',
                 imap_port INTEGER NOT NULL DEFAULT 993,
                 imap_username TEXT NOT NULL DEFAULT '',
@@ -394,6 +418,8 @@ impl Database {
                 message_id_header TEXT,
                 in_reply_to TEXT,
                 thread_key TEXT,
+                needs_human INTEGER NOT NULL DEFAULT 0,
+                human_question TEXT,
                 ai_intent TEXT,
                 ai_suggested_reply TEXT,
                 booking_link_sent INTEGER NOT NULL DEFAULT 0,
@@ -454,6 +480,13 @@ impl Database {
             "ALTER TABLE email_messages ADD COLUMN ai_priority_score INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE email_messages ADD COLUMN ai_tags TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE email_messages ADD COLUMN thread_key TEXT",
+            "ALTER TABLE email_messages ADD COLUMN needs_human INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE email_messages ADD COLUMN human_question TEXT",
+            "ALTER TABLE sender_accounts ADD COLUMN mailbox_email TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE sender_accounts ADD COLUMN sent_day TEXT NOT NULL DEFAULT ''",
+            // Régi fiókok: postafiók = IMAP-felhasználó (ha van), különben a feladó cím.
+            // A Reply-To-t a mentés úgyis automatikusan rendberakja.
+            "UPDATE sender_accounts SET mailbox_email = CASE WHEN TRIM(COALESCE(imap_username,'')) <> '' THEN imap_username ELSE from_email END WHERE TRIM(COALESCE(mailbox_email,'')) = ''",
         ];
         for sql in migrations {
             let _ = conn.execute(sql, []);
@@ -1390,6 +1423,30 @@ impl Database {
         }
     }
 
+    /// Lead keresése e-mail domain alapján (pl. info@cég.hu → cég.hu).
+    /// Az ismeretlen feladótól érkező válaszok beazonosítására kell, amikor a
+    /// feladó nem a lead rögzített elsődleges címéről ír.
+    pub fn find_lead_by_domain(&self, domain: &str) -> Result<Option<Lead>, String> {
+        let clean = domain.trim().to_lowercase();
+        if clean.is_empty() {
+            return Ok(None);
+        }
+        let id_opt: Option<String> = {
+            let conn = self.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT id FROM leads WHERE LOWER(domain) = ?1 ORDER BY updated_at DESC LIMIT 1",
+                params![&clean],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+        };
+        match id_opt {
+            Some(id) => Ok(Some(self.get_lead(&id)?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn update_email_decision_metadata(
         &self,
         message_id: &str,
@@ -1408,11 +1465,38 @@ impl Database {
         Ok(())
     }
 
+    /// Emberi tanácskérés rögzítése egy bejövő levélen (nem készül hozzá
+    /// automatikus válasz). A kérdés szövege a feloldás után is megmarad.
+    pub fn mark_needs_human(&self, message_id: &str, question: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE email_messages SET needs_human = 1, human_question = ?1 WHERE id = ?2",
+            params![question, message_id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Emberi tanácskérés feloldása egy beszélgetésben (válasz elküldve vagy
+    /// "Megoldva" jelölés).
+    pub fn clear_needs_human_for_thread(&self, thread_key: &str) -> Result<(), String> {
+        if thread_key.trim().is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE email_messages SET needs_human = 0 WHERE thread_key = ?1",
+            params![thread_key],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     // ==================== SENDER ACCOUNTS ====================
     pub fn list_sender_accounts(&self) -> Result<Vec<SenderAccount>, String> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT id, name, provider, from_name, from_email, reply_to, smtp_host, smtp_port, smtp_username, smtp_password, smtp_security, ses_region, ses_access_key, ses_secret_key, daily_limit, sent_today, imap_host, imap_port, imap_username, imap_password, imap_enabled, is_default, created_at FROM sender_accounts ORDER BY is_default DESC, created_at DESC")
+            .prepare("SELECT id, name, provider, from_name, from_email, reply_to, mailbox_email, smtp_host, smtp_port, smtp_username, smtp_password, smtp_security, ses_region, ses_access_key, ses_secret_key, daily_limit, sent_today, imap_host, imap_port, imap_username, imap_password, imap_enabled, is_default, created_at, sent_day FROM sender_accounts ORDER BY is_default DESC, created_at DESC")
             .map_err(|e| e.to_string())?;
 
         let rows = stmt
@@ -1424,23 +1508,29 @@ impl Database {
                     from_name: r.get(3)?,
                     from_email: r.get(4)?,
                     reply_to: r.get(5)?,
-                    smtp_host: r.get(6)?,
-                    smtp_port: r.get(7)?,
-                    smtp_username: r.get(8)?,
-                    smtp_password: r.get(9)?,
-                    smtp_security: r.get(10)?,
-                    ses_region: r.get(11)?,
-                    ses_access_key: r.get(12)?,
-                    ses_secret_key: r.get(13)?,
-                    daily_limit: r.get(14)?,
-                    sent_today: r.get(15)?,
-                    imap_host: r.get(16)?,
-                    imap_port: r.get(17)?,
-                    imap_username: r.get(18)?,
-                    imap_password: r.get(19)?,
-                    imap_enabled: r.get::<_, i64>(20)? != 0,
-                    is_default: r.get::<_, i64>(21)? != 0,
-                    created_at: r.get(22)?,
+                    mailbox_email: r.get(6).unwrap_or_default(),
+                    smtp_host: r.get(7)?,
+                    smtp_port: r.get(8)?,
+                    smtp_username: r.get(9)?,
+                    smtp_password: r.get(10)?,
+                    smtp_security: r.get(11)?,
+                    ses_region: r.get(12)?,
+                    ses_access_key: r.get(13)?,
+                    ses_secret_key: r.get(14)?,
+                    daily_limit: r.get(15)?,
+                    sent_today: {
+                        let raw: i64 = r.get(16)?;
+                        let day: String = r.get(24).unwrap_or_default();
+                        if day == today_str() { raw } else { 0 }
+                    },
+                    sent_day: r.get(24).unwrap_or_default(),
+                    imap_host: r.get(17)?,
+                    imap_port: r.get(18)?,
+                    imap_username: r.get(19)?,
+                    imap_password: r.get(20)?,
+                    imap_enabled: r.get::<_, i64>(21)? != 0,
+                    is_default: r.get::<_, i64>(22)? != 0,
+                    created_at: r.get(23)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -1461,6 +1551,27 @@ impl Database {
     pub fn save_sender_account(&self, input: SenderAccountInput) -> Result<SenderAccount, String> {
         let now = Utc::now().to_rfc3339();
         let id = input.id.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| Uuid::new_v4().to_string());
+        // Egyszerűsített invariánsok — a Reply-To mindig automatikus:
+        // a postafiók címe, ami üresen a feladó címére esik vissza.
+        let mailbox_email = input.mailbox_email.trim();
+        let mailbox_email = if mailbox_email.is_empty() {
+            input.from_email.trim().to_string()
+        } else {
+            mailbox_email.to_string()
+        };
+        // Postafiókos (SMTP) tömeges küldésnél a From is a postafiók.
+        let from_email = if input.provider == "ses" && !input.from_email.trim().is_empty() {
+            input.from_email.trim().to_string()
+        } else {
+            mailbox_email.clone()
+        };
+        let reply_to = mailbox_email.clone();
+        // Üres IMAP-felhasználó a postafiókra essen vissza.
+        let imap_username = if input.imap_username.trim().is_empty() {
+            mailbox_email.clone()
+        } else {
+            input.imap_username.trim().to_string()
+        };
         {
             let conn = self.conn.lock().unwrap();
             if input.is_default {
@@ -1472,12 +1583,12 @@ impl Database {
                 > 0;
             if exists {
                 conn.execute(
-                    "UPDATE sender_accounts SET name=?1, provider=?2, from_name=?3, from_email=?4, reply_to=?5, smtp_host=?6, smtp_port=?7, smtp_username=?8, smtp_password=?9, smtp_security=?10, ses_region=?11, ses_access_key=?12, ses_secret_key=?13, daily_limit=?14, imap_host=?15, imap_port=?16, imap_username=?17, imap_password=?18, imap_enabled=?19, is_default=?20 WHERE id=?21",
+                    "UPDATE sender_accounts SET name=?1, provider=?2, from_name=?3, from_email=?4, reply_to=?5, mailbox_email=?6, smtp_host=?7, smtp_port=?8, smtp_username=?9, smtp_password=?10, smtp_security=?11, ses_region=?12, ses_access_key=?13, ses_secret_key=?14, daily_limit=?15, imap_host=?16, imap_port=?17, imap_username=?18, imap_password=?19, imap_enabled=?20, is_default=?21 WHERE id=?22",
                     params![
-                        input.name, input.provider, input.from_name, input.from_email, input.reply_to,
+                        input.name, input.provider, input.from_name, from_email, reply_to, mailbox_email,
                         input.smtp_host, input.smtp_port, input.smtp_username, input.smtp_password, input.smtp_security,
                         input.ses_region, input.ses_access_key, input.ses_secret_key, input.daily_limit,
-                        input.imap_host, input.imap_port, input.imap_username, input.imap_password,
+                        input.imap_host, input.imap_port, imap_username, input.imap_password,
                         if input.imap_enabled { 1 } else { 0 },
                         if input.is_default { 1 } else { 0 },
                         &id
@@ -1486,12 +1597,12 @@ impl Database {
                 .map_err(|e| e.to_string())?;
             } else {
                 conn.execute(
-                    "INSERT INTO sender_accounts (id, name, provider, from_name, from_email, reply_to, smtp_host, smtp_port, smtp_username, smtp_password, smtp_security, ses_region, ses_access_key, ses_secret_key, daily_limit, imap_host, imap_port, imap_username, imap_password, imap_enabled, is_default, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
+                    "INSERT INTO sender_accounts (id, name, provider, from_name, from_email, reply_to, mailbox_email, smtp_host, smtp_port, smtp_username, smtp_password, smtp_security, ses_region, ses_access_key, ses_secret_key, daily_limit, imap_host, imap_port, imap_username, imap_password, imap_enabled, is_default, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
                     params![
-                        &id, input.name, input.provider, input.from_name, input.from_email, input.reply_to,
+                        &id, input.name, input.provider, input.from_name, from_email, reply_to, mailbox_email,
                         input.smtp_host, input.smtp_port, input.smtp_username, input.smtp_password, input.smtp_security,
                         input.ses_region, input.ses_access_key, input.ses_secret_key, input.daily_limit,
-                        input.imap_host, input.imap_port, input.imap_username, input.imap_password,
+                        input.imap_host, input.imap_port, imap_username, input.imap_password,
                         if input.imap_enabled { 1 } else { 0 },
                         if input.is_default { 1 } else { 0 },
                         &now
@@ -1511,8 +1622,13 @@ impl Database {
     }
 
     pub fn increment_sender_sent_today(&self, id: &str) {
+        let today = today_str();
         let conn = self.conn.lock().unwrap();
-        let _ = conn.execute("UPDATE sender_accounts SET sent_today = sent_today + 1 WHERE id = ?1", params![id]);
+        // Új napon az első küldés nullázza a számlálót, különben növeli.
+        let _ = conn.execute(
+            "UPDATE sender_accounts SET sent_today = CASE WHEN COALESCE(sent_day,'') = ?1 THEN sent_today + 1 ELSE 1 END, sent_day = ?1 WHERE id = ?2",
+            params![today, id],
+        );
     }
 
     // ==================== CAMPAIGNS & EMAIL MESSAGES ====================
@@ -1802,7 +1918,7 @@ impl Database {
                        em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
                        em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
                        em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note,
-                       em.ai_priority_score, em.ai_tags, em.thread_key
+                       em.ai_priority_score, em.ai_tags, em.thread_key, em.needs_human, em.human_question
                 FROM email_messages em
                 JOIN leads l ON l.id = em.lead_id
                 LEFT JOIN campaigns c ON c.id = em.campaign_id
@@ -1852,6 +1968,8 @@ impl Database {
             ai_tags: tags_raw
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default(),
+            needs_human: r.get::<_, i64>(26).unwrap_or(0) != 0,
+            human_question: r.get(27).ok().flatten(),
         })
     }
 
@@ -1864,7 +1982,7 @@ impl Database {
                    em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
                    em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
                    em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note,
-                   em.ai_priority_score, em.ai_tags, em.thread_key
+                   em.ai_priority_score, em.ai_tags, em.thread_key, em.needs_human, em.human_question
             FROM email_messages em
             JOIN leads l ON l.id = em.lead_id
             LEFT JOIN campaigns c ON c.id = em.campaign_id
@@ -2010,6 +2128,24 @@ impl Database {
         Ok(deleted)
     }
 
+    /// Emberi beavatkozást kérő levél érkezésekor az adott beszélgetés még ki
+    /// nem küldött, időzített automatikus válaszait megállítja (tervezetté
+    /// minősíti vissza), hogy a robot ne válaszoljon olyankor, amikor az
+    /// ügyfél élő embert kért. Más beszélgetéseket nem érint.
+    pub fn pause_scheduled_thread_messages(&self, thread_key: &str) -> Result<usize, String> {
+        if thread_key.trim().is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .execute(
+                "UPDATE email_messages SET status = 'draft', auto_send_status = 'paused' WHERE thread_key = ?1 AND auto_send_status = 'scheduled'",
+                params![thread_key],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(n)
+    }
+
     pub fn find_email_message_by_header(
         &self,
         message_id_header: &str,
@@ -2027,7 +2163,7 @@ impl Database {
                        em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
                        em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
                        em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note,
-                       em.ai_priority_score, em.ai_tags, em.thread_key
+                       em.ai_priority_score, em.ai_tags, em.thread_key, em.needs_human, em.human_question
                 FROM email_messages em
                 JOIN leads l ON l.id = em.lead_id
                 LEFT JOIN campaigns c ON c.id = em.campaign_id
@@ -2063,7 +2199,7 @@ impl Database {
                        em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
                        em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
                        em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note,
-                       em.ai_priority_score, em.ai_tags, em.thread_key
+                       em.ai_priority_score, em.ai_tags, em.thread_key, em.needs_human, em.human_question
                 FROM email_messages em
                 JOIN leads l ON l.id = em.lead_id
                 LEFT JOIN campaigns c ON c.id = em.campaign_id
@@ -2093,7 +2229,7 @@ impl Database {
                        em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
                        em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
                        em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note,
-                       em.ai_priority_score, em.ai_tags, em.thread_key
+                       em.ai_priority_score, em.ai_tags, em.thread_key, em.needs_human, em.human_question
                 FROM email_messages em
                 JOIN leads l ON l.id = em.lead_id
                 LEFT JOIN campaigns c ON c.id = em.campaign_id
@@ -2164,7 +2300,7 @@ impl Database {
                        em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
                        em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
                        em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note,
-                       em.ai_priority_score, em.ai_tags, em.thread_key
+                       em.ai_priority_score, em.ai_tags, em.thread_key, em.needs_human, em.human_question
                 FROM email_messages em
                 JOIN leads l ON l.id = em.lead_id
                 LEFT JOIN campaigns c ON c.id = em.campaign_id
@@ -2224,7 +2360,7 @@ impl Database {
                        em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
                        em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
                        em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note,
-                       em.ai_priority_score, em.ai_tags, em.thread_key
+                       em.ai_priority_score, em.ai_tags, em.thread_key, em.needs_human, em.human_question
                 FROM email_messages em
                 JOIN leads l ON l.id = em.lead_id
                 LEFT JOIN campaigns c ON c.id = em.campaign_id
@@ -2253,7 +2389,7 @@ impl Database {
                        em.message_id_header, em.in_reply_to, em.ai_intent, em.ai_suggested_reply,
                        em.booking_link_sent, em.error_message, em.sent_at, em.created_at,
                        em.scheduled_send_at, em.auto_send_status, em.ai_summary, em.ai_rewrite_note,
-                       l.status, l.fit_score, em.ai_priority_score, em.ai_tags, em.thread_key
+                       l.status, l.fit_score, em.ai_priority_score, em.ai_tags, em.thread_key, em.needs_human, em.human_question
                 FROM email_messages em
                 JOIN leads l ON l.id = em.lead_id
                 LEFT JOIN campaigns c ON c.id = em.campaign_id
@@ -2295,6 +2431,8 @@ impl Database {
                     ai_rewrite_note: r.get(23)?,
                     ai_priority_score: r.get::<_, Option<i64>>(26)?.unwrap_or(0),
                     ai_tags,
+                    needs_human: r.get::<_, i64>(29).unwrap_or(0) != 0,
+                    human_question: r.get(30).ok().flatten(),
                 };
                 Ok((
                     msg,
@@ -2396,11 +2534,19 @@ impl Database {
                 auto_send_status: None,
                 booking_link_sent: false,
                 has_subject_change: false,
+                needs_advice: false,
+                human_question: None,
                 message_count: 0,
                 messages: vec![],
             };
 
             let mut subject_roots: Vec<String> = Vec::new();
+            // Feloldatlan emberi tanácskérés: a legfrissebb olyan bejövő levél,
+            // ami után már nem ment ki válasz.
+            let mut last_advice_ts = String::new();
+            let mut last_advice_question: Option<String> = None;
+            let mut last_outbound_sent_ts = String::new();
+            let mut last_suggested_inbound_ts = String::new();
             for item in items {
                 let msg = item.message;
                 let ts = msg.sent_at.clone().unwrap_or_else(|| msg.created_at.clone());
@@ -2422,6 +2568,7 @@ impl Database {
                     } else if let Some(ref intent) = msg.ai_intent {
                         entry.priority_score = match intent.as_str() {
                             "booking_request" => 94,
+                            "needs_human" => 88,
                             "interested" => 85,
                             "question" => 74,
                             "objection" => 58,
@@ -2437,6 +2584,7 @@ impl Database {
                         if let Some(ref intent) = msg.ai_intent {
                             entry.ai_tags = match intent.as_str() {
                                 "booking_request" => vec!["Időpontkérés".to_string(), "Forró lead".to_string()],
+                                "needs_human" => vec!["Tanácsot kér".to_string(), "Emberi döntés".to_string()],
                                 "interested" => vec!["Érdeklődik".to_string(), "Potenciális ügyfél".to_string()],
                                 "question" => vec!["Kérdés".to_string(), "Válaszra vár".to_string()],
                                 "objection" => vec!["Kifogás".to_string(), "Utánkövetendő".to_string()],
@@ -2465,10 +2613,41 @@ impl Database {
                         entry.auto_send_status = msg.auto_send_status.clone();
                     }
                 } else if msg.direction == "inbound" && msg.ai_suggested_reply.as_ref().is_some_and(|s| !s.is_empty()) {
-                    entry.has_pending_draft = true;
+                    // Csak a legfrissebb, még meg nem válaszolt javaslat számít:
+                    // ha utána már kiment válasz, a badge-nek el kell tűnnie.
+                    // A döntést a ciklus végén hozzuk meg az időbélyegek alapján.
+                    let sts = msg.sent_at.clone().unwrap_or_else(|| msg.created_at.clone());
+                    if sts > last_suggested_inbound_ts {
+                        last_suggested_inbound_ts = sts;
+                    }
                 }
                 if msg.booking_link_sent {
                     entry.booking_link_sent = true;
+                }
+                if msg.direction == "inbound"
+                    && msg.needs_human
+                    && msg
+                        .human_question
+                        .as_ref()
+                        .is_some_and(|q| !q.trim().is_empty())
+                {
+                    let ts = msg
+                        .sent_at
+                        .clone()
+                        .unwrap_or_else(|| msg.created_at.clone());
+                    if ts >= last_advice_ts {
+                        last_advice_ts = ts;
+                        last_advice_question = msg.human_question.clone();
+                    }
+                }
+                if msg.direction == "outbound" && msg.status == "sent" {
+                    let ts = msg
+                        .sent_at
+                        .clone()
+                        .unwrap_or_else(|| msg.created_at.clone());
+                    if ts > last_outbound_sent_ts {
+                        last_outbound_sent_ts = ts;
+                    }
                 }
                 if msg.campaign_id.is_some() {
                     entry.campaign_id = msg.campaign_id.clone();
@@ -2478,6 +2657,19 @@ impl Database {
                 entry.messages.push(msg);
             }
             entry.has_subject_change = subject_roots.len() > 1;
+            if !last_advice_ts.is_empty() && last_advice_ts > last_outbound_sent_ts {
+                entry.needs_advice = true;
+                entry.human_question = last_advice_question;
+            }
+            // AI-javaslat miatti badge csak akkor, ha nincs függő kimenő tervezet
+            // ÉS a legfrissebb javasolt bejövő újabb, mint az utolsó kiküldött válasz.
+            // Enélkül egy már megválaszolt levél javaslata örökre beragasztotta az 1-es badget.
+            if !entry.has_pending_draft
+                && !last_suggested_inbound_ts.is_empty()
+                && last_suggested_inbound_ts > last_outbound_sent_ts
+            {
+                entry.has_pending_draft = true;
+            }
             threads.push(entry);
         }
 
@@ -2721,6 +2913,154 @@ impl Database {
         )
         .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Teljes adatbázis exportálása JSON-be (beállítások + minden munkaterületi tábla).
+    /// A táblanevek fix listából jönnek, így nincs SQL-injekciós felület.
+    pub fn export_database_json(&self) -> Result<String, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut tables = Map::new();
+        for table in BACKUP_TABLES {
+            let sql = format!("SELECT * FROM \"{}\"", table);
+            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+            let col_names: Vec<String> =
+                stmt.column_names().iter().map(|s| s.to_string()).collect();
+            let col_count = stmt.column_count();
+            let rows = stmt
+                .query_map([], |row| {
+                    let mut obj = Map::new();
+                    for idx in 0..col_count {
+                        let v: rusqlite::types::Value = row.get(idx)?;
+                        let json_val = match v {
+                            rusqlite::types::Value::Null => Value::Null,
+                            rusqlite::types::Value::Integer(i) => Value::from(i),
+                            rusqlite::types::Value::Real(f) => {
+                                serde_json::Number::from_f64(f)
+                                    .map(Value::Number)
+                                    .unwrap_or(Value::Null)
+                            }
+                            rusqlite::types::Value::Text(s) => Value::String(s),
+                            rusqlite::types::Value::Blob(b) => {
+                                Value::String(String::from_utf8_lossy(&b).into_owned())
+                            }
+                        };
+                        obj.insert(col_names[idx].clone(), json_val);
+                    }
+                    Ok(Value::Object(obj))
+                })
+                .map_err(|e| e.to_string())?;
+            let mut arr = Vec::new();
+            for r in rows {
+                arr.push(r.map_err(|e| e.to_string())?);
+            }
+            tables.insert(table.to_string(), Value::Array(arr));
+        }
+        let mut root = Map::new();
+        root.insert("app".to_string(), Value::String("mylead".to_string()));
+        root.insert("version".to_string(), Value::from(1));
+        root.insert(
+            "exportedAt".to_string(),
+            Value::String(Utc::now().to_rfc3339()),
+        );
+        root.insert("tables".to_string(), Value::Object(tables));
+        serde_json::to_string_pretty(&Value::Object(root)).map_err(|e| e.to_string())
+    }
+
+    /// Teljes adatbázis visszaállítása a fenti formátumú JSON-ből.
+    /// A meglévő adatokat cseréli (törli), majd az IDs-et is megtartva tölti vissza.
+    /// Visszaadja a visszaállított sorok számát táblánként ("tábla: darab" formában).
+    pub fn import_database_json(&self, json: &str) -> Result<String, String> {
+        let root: Value = serde_json::from_str(json).map_err(|e| format!("Érvénytelen JSON mentés: {}", e))?;
+        if root.get("app").and_then(|v| v.as_str()) != Some("mylead") {
+            return Err("Ez nem MyLead adatbázis-mentés (hiányzó app mező).".to_string());
+        }
+        let tables = root
+            .get("tables")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| "Érvénytelen mentés: hiányzik a tables objektum.".to_string())?;
+
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute_batch("PRAGMA foreign_keys=OFF;")
+            .map_err(|e| e.to_string())?;
+        // Törlés gyerek → szülő sorrendben (FK-kikapcsolva is biztonságos).
+        for table in BACKUP_TABLES.iter().rev() {
+            let sql = format!("DELETE FROM \"{}\";", table);
+            tx.execute_batch(&sql).map_err(|e| e.to_string())?;
+        }
+        let mut summary: Vec<String> = Vec::new();
+        for table in BACKUP_TABLES {
+            let rows = match tables.get(*table) {
+                Some(Value::Array(arr)) => arr.clone(),
+                Some(Value::Null) | None => {
+                    summary.push(format!("{}: 0", table));
+                    continue;
+                }
+                _ => return Err(format!("Érvénytelen mentés: a(z) {} tábla nem lista.", table)),
+            };
+            if rows.is_empty() {
+                summary.push(format!("{}: 0", table));
+                continue;
+            }
+            let first = rows[0]
+                .as_object()
+                .ok_or_else(|| format!("Érvénytelen mentés: a(z) {} sora nem objektum.", table))?;
+            let cols: Vec<String> = first.keys().cloned().collect();
+            if cols.is_empty() {
+                summary.push(format!("{}: 0", table));
+                continue;
+            }
+            let col_list = cols
+                .iter()
+                .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let placeholders = (1..=cols.len())
+                .map(|i| format!("?{}", i))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!("INSERT OR REPLACE INTO \"{}\" ({}) VALUES ({})", table, col_list, placeholders);
+            let mut stmt = tx.prepare(&sql).map_err(|e| e.to_string())?;
+            let mut count = 0usize;
+            for row in &rows {
+                let obj = row.as_object().ok_or_else(|| {
+                    format!("Érvénytelen mentés: a(z) {} egyik sora nem objektum.", table)
+                })?;
+                let params: Vec<rusqlite::types::Value> = cols
+                    .iter()
+                    .map(|c| match obj.get(c) {
+                        None | Some(Value::Null) => rusqlite::types::Value::Null,
+                        Some(Value::Bool(b)) => rusqlite::types::Value::Integer(if *b { 1 } else { 0 }),
+                        Some(Value::Number(n)) => {
+                            if let Some(i) = n.as_i64() {
+                                rusqlite::types::Value::Integer(i)
+                            } else if let Some(u) = n.as_u64() {
+                                if u <= i64::MAX as u64 {
+                                    rusqlite::types::Value::Integer(u as i64)
+                                } else {
+                                    rusqlite::types::Value::Real(u as f64)
+                                }
+                            } else if let Some(f) = n.as_f64() {
+                                rusqlite::types::Value::Real(f)
+                            } else {
+                                rusqlite::types::Value::Null
+                            }
+                        }
+                        Some(Value::String(s)) => rusqlite::types::Value::Text(s.clone()),
+                        Some(other) => rusqlite::types::Value::Text(other.to_string()),
+                    })
+                    .collect();
+                stmt.execute(rusqlite::params_from_iter(params.iter()))
+                    .map_err(|e| format!("Visszaállítási hiba ({}): {}", table, e))?;
+                count += 1;
+            }
+            drop(stmt);
+            summary.push(format!("{}: {}", table, count));
+        }
+        tx.execute_batch("PRAGMA foreign_keys=ON;")
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(summary.join(", "))
     }
 }
 
@@ -3090,5 +3430,204 @@ mod tests {
         assert_eq!(remaining.len(), 2, "same content, different Message-ID stays");
 
         std::fs::remove_file(&db_path).ok();
+    }
+
+    #[test]
+    fn advice_flag_appears_and_resolves_on_send() {
+        let (db_path, db) = open_test_db_with_lead();
+        let inbound_id = db
+            .insert_email_message_full(
+                None, "l1", "inbound", "received", 1, "Panasz", "Felháborító!",
+                Some("<adv-1@acme.hu>"), None, Some("needs_human"), None, false,
+                Some("2026-01-01T10:00:00Z"), None, None, None, None,
+            )
+            .unwrap();
+        db.mark_needs_human(&inbound_id, "Mit válaszoljunk?")
+            .unwrap();
+
+        let threads = db.list_inbox_threads().unwrap();
+        assert_eq!(threads.len(), 1);
+        assert!(threads[0].needs_advice);
+        assert_eq!(
+            threads[0].human_question.as_deref(),
+            Some("Mit válaszoljunk?")
+        );
+
+        // Kiküldött válasz után a kérés megoldottnak számít.
+        db.insert_email_message_full(
+            None, "l1", "outbound", "sent", 2, "Re: Panasz", "Elnézést.",
+            Some("<adv-out-1@acme.hu>"), Some("<adv-1@acme.hu>"), None, None, false,
+            Some("2026-01-01T11:00:00Z"), None, None, None, None,
+        )
+        .unwrap();
+        let threads = db.list_inbox_threads().unwrap();
+        assert!(!threads[0].needs_advice);
+
+        std::fs::remove_file(&db_path).ok();
+    }
+
+    fn test_account_input(provider: &str, from_email: &str, mailbox_email: &str) -> SenderAccountInput {
+        SenderAccountInput {
+            id: None,
+            name: "Teszt".to_string(),
+            provider: provider.to_string(),
+            from_name: "Teszt".to_string(),
+            from_email: from_email.to_string(),
+            reply_to: "kezileg@mas.hu".to_string(),
+            mailbox_email: mailbox_email.to_string(),
+            smtp_host: "smtp.example.hu".to_string(),
+            smtp_port: 587,
+            smtp_username: String::new(),
+            smtp_password: String::new(),
+            smtp_security: "starttls".to_string(),
+            ses_region: "eu-central-1".to_string(),
+            ses_access_key: String::new(),
+            ses_secret_key: String::new(),
+            daily_limit: 50,
+            imap_host: "imap.example.hu".to_string(),
+            imap_port: 993,
+            imap_username: String::new(),
+            imap_password: String::new(),
+            imap_enabled: true,
+            is_default: true,
+        }
+    }
+
+    #[test]
+    fn sender_account_save_enforces_mailbox_invariants() {
+        let (db_path, db) = open_test_db_with_lead();
+
+        // SES-es fiók: a From marad a burner (tömeges küldő), a Reply-To viszont
+        // mindig automatikusan a postafiók — a kézi érték felülíródik.
+        let ses = db
+            .save_sender_account(test_account_input("ses", "okosurlap@quan.hu", "benedek@okosurlap.hu"))
+            .unwrap();
+        assert_eq!(ses.from_email, "okosurlap@quan.hu");
+        assert_eq!(ses.reply_to, "benedek@okosurlap.hu");
+        assert_eq!(ses.mailbox_email, "benedek@okosurlap.hu");
+        assert_eq!(ses.imap_username, "benedek@okosurlap.hu");
+
+        // SMTP fiók: a From is a postafiók, nincs külön burner.
+        let smtp = db
+            .save_sender_account(test_account_input("smtp", "sales@cegem.hu", ""))
+            .unwrap();
+        assert_eq!(smtp.from_email, "sales@cegem.hu");
+        assert_eq!(smtp.reply_to, "sales@cegem.hu");
+        assert_eq!(smtp.mailbox_email, "sales@cegem.hu");
+
+        std::fs::remove_file(&db_path).ok();
+    }
+
+    #[test]
+    fn sent_today_resets_on_new_day() {
+        let (db_path, db) = open_test_db_with_lead();
+        let acc = db
+            .save_sender_account(test_account_input("smtp", "sales@cegem.hu", ""))
+            .unwrap();
+        db.increment_sender_sent_today(&acc.id);
+        db.increment_sender_sent_today(&acc.id);
+        let acc = db.get_sender_account(&acc.id).unwrap();
+        assert_eq!(acc.sent_today, 2);
+
+        // Tegnapi napot szimulálva: a kiolvasás 0-t mutat, a következő küldés
+        // pedig nulláról újraindítja a számlálót.
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE sender_accounts SET sent_today = 5, sent_day = '2000-01-01' WHERE id = ?1",
+                params![acc.id],
+            )
+            .unwrap();
+        }
+        let acc = db.get_sender_account(&acc.id).unwrap();
+        assert_eq!(acc.sent_today, 0, "új napon a limit újra él");
+        db.increment_sender_sent_today(&acc.id);
+        let acc = db.get_sender_account(&acc.id).unwrap();
+        assert_eq!(acc.sent_today, 1);
+
+        std::fs::remove_file(&db_path).ok();
+    }
+
+    #[test]
+    fn domain_lookup_finds_lead_with_different_sender_address() {
+        let db_path = std::env::temp_dir().join(format!("mylead-test-{}.sqlite", Uuid::new_v4()));
+        let db = Database::open(&db_path).unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO leads (id, company_name, domain, primary_email, created_at, updated_at) VALUES ('l1','Teszt Cég','ceg.hu','info@ceg.hu','2026-01-01','2026-01-01')",
+                [],
+            )
+            .unwrap();
+        }
+        // Pontos cím egyezik.
+        assert_eq!(
+            db.find_lead_by_email("info@ceg.hu").unwrap().map(|l| l.id),
+            Some("l1".to_string())
+        );
+        // Másik cím ugyanattól a cégtől: e-mailre nincs találat...
+        assert!(db.find_lead_by_email("masik@ceg.hu").unwrap().is_none());
+        // ...de domainre igen — így a válasz nem vész el.
+        assert_eq!(
+            db.find_lead_by_domain("ceg.hu").unwrap().map(|l| l.id),
+            Some("l1".to_string())
+        );
+        assert!(db.find_lead_by_domain("mas.hu").unwrap().is_none());
+        assert!(db.find_lead_by_domain("").unwrap().is_none());
+
+        std::fs::remove_file(&db_path).ok();
+    }
+
+    #[test]
+    fn database_export_import_roundtrip_preserves_data() {
+        let (db_path, db) = open_test_db_with_lead();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO searches (id, project_id, name, query, created_at) VALUES ('s1','p1','Teszt keresés','fogászat','2026-01-01')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO search_leads (search_id, lead_id, found_at) VALUES ('s1','l1','2026-01-01')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO suppression_list (email, reason, created_at) VALUES ('tiltott@ceg.hu','kérés','2026-01-01')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let json = db.export_database_json().unwrap();
+        assert!(json.contains("\"app\": \"mylead\"") || json.contains("\"app\":\"mylead\"") || json.contains("mylead"));
+
+        // Friss adatbázisba visszaállítva minden kapcsolat megmarad.
+        let db_path2 = std::env::temp_dir().join(format!("mylead-test-{}.sqlite", Uuid::new_v4()));
+        let db2 = Database::open(&db_path2).unwrap();
+        let summary = db2.import_database_json(&json).unwrap();
+        assert!(summary.contains("projects: 1"), "summary: {}", summary);
+        assert!(summary.contains("leads: 1"), "summary: {}", summary);
+
+        let projects = db2.list_projects().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].id, "p1");
+        let lead = db2.get_lead("l1").unwrap();
+        assert_eq!(lead.company_name, "Acme");
+        let searches = db2.list_searches().unwrap();
+        assert_eq!(searches.len(), 1);
+        assert_eq!(searches[0].name, "Teszt keresés");
+        let sups = db2.list_suppressions().unwrap();
+        assert_eq!(sups.len(), 1);
+        assert_eq!(sups[0].email, "tiltott@ceg.hu");
+
+        // Érvénytelen mentést elutasít, az adatbázist nem bántja.
+        assert!(db2.import_database_json("{\"app\":\"mas\"}").is_err());
+        assert!(db2.import_database_json("nem json").is_err());
+        assert_eq!(db2.list_projects().unwrap().len(), 1);
+
+        std::fs::remove_file(&db_path).ok();
+        std::fs::remove_file(&db_path2).ok();
     }
 }

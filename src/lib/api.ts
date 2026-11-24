@@ -32,6 +32,7 @@ import type {
   SenderAccount,
   SenderAccountInput,
   SuppressionEntry,
+  SyncInboxReport,
 } from "../types";
 
 export const api = {
@@ -153,8 +154,10 @@ export const api = {
     invoke<EmailMessage[]>("list_lead_message_history", { leadId }),
   deleteInboxConversation: (messageIds: string[]) =>
     invoke<number>("delete_inbox_conversation", { messageIds }),
+  dismissHumanRequest: (threadKey: string) =>
+    invoke<InboxThread>("dismiss_human_request", { threadKey }),
   syncImapInbox: (senderAccountId?: string | null) =>
-    invoke<number>("sync_imap_inbox", { senderAccountId: senderAccountId || null }),
+    invoke<SyncInboxReport>("sync_imap_inbox", { senderAccountId: senderAccountId || null }),
   reclassifyInboxThreads: () => invoke<number>("reclassify_inbox_threads"),
   simulateInboundReply: (leadId: string, campaignId: string | null, body: string) =>
     invoke<InboxThread>("simulate_inbound_reply", { leadId, campaignId, body }),
@@ -260,6 +263,10 @@ export const api = {
   getAnalytics: () => invoke<AnalyticsOverview>("get_analytics"),
   loadDemoData: () => invoke<void>("load_demo_data"),
   clearWorkspaceData: () => invoke<void>("clear_workspace_data"),
+
+  // Full database backup (JSON)
+  exportDatabase: () => invoke<string>("export_database"),
+  importDatabase: (json: string) => invoke<string>("import_database", { json }),
 
   // Live Events
   onJobProgress: (cb: (ev: JobProgressEvent) => void): Promise<UnlistenFn> =>

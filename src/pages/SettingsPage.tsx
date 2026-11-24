@@ -26,6 +26,7 @@ import {
 import { notifications } from "@mantine/notifications";
 import {
   IconCheck,
+  IconDatabase,
   IconDownload,
   IconEdit,
   IconMail,
@@ -33,6 +34,7 @@ import {
   IconRefresh,
   IconTerminal2,
   IconTrash,
+  IconUpload,
 } from "@tabler/icons-react";
 import { api, formatShortDate } from "../lib/api";
 import type {
@@ -66,6 +68,7 @@ const emptyAccount = {
   fromName: "",
   fromEmail: "",
   replyTo: "",
+  mailboxEmail: "",
   smtpHost: "smtp.gmail.com",
   smtpPort: 587,
   smtpUsername: "",
@@ -108,6 +111,11 @@ export function SettingsPage({
 
   const [newSupEmail, setNewSupEmail] = useState("");
   const [newSupReason, setNewSupReason] = useState("Kézi tiltás");
+  const [exportingDb, setExportingDb] = useState(false);
+  const [importingDb, setImportingDb] = useState(false);
+  const [clearingDb, setClearingDb] = useState(false);
+  const [lastBackupInfo, setLastBackupInfo] = useState<string | null>(null);
+  const importFileRef = useRef<HTMLInputElement | null>(null);
   const lastServerSettingsJsonRef = useRef<string>(JSON.stringify(settings));
   const latestFormRef = useRef<AppSettings>(form);
   const isEditingRef = useRef<boolean>(false);
@@ -316,6 +324,7 @@ export function SettingsPage({
       fromName: acc.fromName,
       fromEmail: acc.fromEmail,
       replyTo: acc.replyTo,
+      mailboxEmail: acc.mailboxEmail || acc.fromEmail,
       smtpHost: acc.smtpHost,
       smtpPort: acc.smtpPort,
       smtpUsername: acc.smtpUsername,
@@ -336,10 +345,18 @@ export function SettingsPage({
   };
 
   const handleSaveAccount = async () => {
-    if (!accForm.name.trim() || !accForm.fromEmail.trim()) {
+    if (!accForm.name.trim() || !accForm.mailboxEmail.trim()) {
       notifications.show({
         title: "Hiányzó adatok",
-        message: "Add meg a fiók nevét és a feladó e-mail címet!",
+        message: "Add meg a fiók nevét és a postafiók e-mail címét!",
+        color: "red",
+      });
+      return;
+    }
+    if (accForm.provider === "ses" && !accForm.fromEmail.trim()) {
+      notifications.show({
+        title: "Hiányzó SES feladó",
+        message: "Külön SES küldésnél add meg az SES feladó e-mail címet is!",
         color: "red",
       });
       return;
@@ -381,27 +398,100 @@ export function SettingsPage({
     await onRefresh();
   };
 
-  const handleClearDb = async () => {
-    await api.clearWorkspaceData();
-    await onRefresh();
-    notifications.show({
-      title: "Adatbázis kiürítve",
-      message: "Minden projekt, keresés, lead és kampány törölve lett.",
-      color: "gray",
-    });
+  const describeBackupJson = (json: string): string => {
+    try {
+      const parsed = JSON.parse(json);
+      const tables = parsed?.tables;
+      if (!tables || typeof tables !== "object") return "";
+      const pick = (k: string) =>
+        Array.isArray(tables[k]) ? (tables[k] as unknown[]).length : 0;
+      return [
+        `${pick("projects")} projekt`,
+        `${pick("searches")} keresés`,
+        `${pick("leads")} cég`,
+        `${pick("campaigns")} kampány`,
+        `${pick("email_messages")} levél`,
+      ].join(" • ");
+    } catch {
+      return "";
+    }
   };
 
-  const handleLoadDemo = async () => {
+  const handleExportDatabase = async () => {
+    setExportingDb(true);
     try {
-      await api.loadDemoData();
-      await onRefresh();
+      const json = await api.exportDatabase();
+      const stamp = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "");
+      const blob = new Blob([json], { type: "application/json;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `mylead-adatbazis-${stamp}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      const info = describeBackupJson(json);
+      setLastBackupInfo(
+        `${(blob.size / 1024).toFixed(1)} KB${info ? ` — ${info}` : ""}`
+      );
       notifications.show({
-        title: "Mintaadatok betöltve",
-        message: "A FoglaljPro B2B mintakészlet készen áll.",
+        title: "Adatbázis mentés letöltve",
+        message: info || "A teljes munkaterület JSON-be mentve.",
         color: "forest",
       });
     } catch (e) {
-      notifications.show({ title: "Információ", message: String(e), color: "orange" });
+      notifications.show({ title: "Export hiba", message: String(e), color: "red" });
+    } finally {
+      setExportingDb(false);
+    }
+  };
+
+  const handleImportDatabaseFile = async (file: File | undefined | null) => {
+    if (!file) return;
+    const text = await file.text();
+    if (!text.trim().startsWith("{")) {
+      notifications.show({
+        title: "Érvénytelen fájl",
+        message: "Válassz egy korábban exportált MyLead JSON mentést!",
+        color: "red",
+      });
+      return;
+    }
+    const ok = window.confirm(
+      "Biztosan visszaállítod ezt a mentést? A jelenlegi adatbázis teljes tartalma lecserélődik!"
+    );
+    if (!ok) return;
+    setImportingDb(true);
+    try {
+      const summary = await api.importDatabase(text);
+      await onRefresh();
+      setLastBackupInfo(`Visszaállítva: ${summary}`);
+      notifications.show({
+        title: "Adatbázis visszaállítva",
+        message: summary,
+        color: "forest",
+      });
+    } catch (e) {
+      notifications.show({ title: "Import hiba", message: String(e), color: "red" });
+    } finally {
+      setImportingDb(false);
+      if (importFileRef.current) importFileRef.current.value = "";
+    }
+  };
+
+  const handleClearWorkspace = async () => {
+    const ok = window.confirm(
+      "Biztosan törlöd a teljes munkaterületet (projektek, keresések, leadek, kampányok, levelek)? Ez nem vonható vissza — előbb készíts JSON mentést!"
+    );
+    if (!ok) return;
+    setClearingDb(true);
+    try {
+      await api.clearWorkspaceData();
+      await onRefresh();
+      notifications.show({ title: "Munkaterület törölve", message: "", color: "gray" });
+    } catch (e) {
+      notifications.show({ title: "Hiba", message: String(e), color: "red" });
+    } finally {
+      setClearingDb(false);
     }
   };
 
@@ -431,7 +521,7 @@ export function SettingsPage({
             <Tabs.Tab value="ai">AI Modell</Tabs.Tab>
             <Tabs.Tab value="discovery">Keresőmotorok</Tabs.Tab>
             <Tabs.Tab value="suppression">Tiltólista ({suppressions.length})</Tabs.Tab>
-            <Tabs.Tab value="data">Adatbázis</Tabs.Tab>
+            <Tabs.Tab value="database">Adatbázis</Tabs.Tab>
           </Tabs.List>
 
           {/* SMTP / SES / IMAP */}
@@ -499,8 +589,14 @@ export function SettingsPage({
                           </Table.Td>
                           <Table.Td>
                             <Text size="xs" className="ml-mono">
-                              {acc.fromEmail}
+                              {acc.mailboxEmail || acc.fromEmail}
                             </Text>
+                            {acc.provider === "ses" &&
+                              acc.fromEmail !== (acc.mailboxEmail || acc.fromEmail) && (
+                                <Text size="11px" c="dimmed" className="ml-mono">
+                                  SES: {acc.fromEmail}
+                                </Text>
+                              )}
                           </Table.Td>
                           <Table.Td>
                             <Text size="xs" c="dimmed" className="ml-mono">
@@ -553,6 +649,33 @@ export function SettingsPage({
                     </Table.Tbody>
                   </Table>
                 )}
+            </Paper>
+
+            <Paper p="sm" mt="sm">
+              <Stack gap="xs">
+                <Text fw={600} size="sm">
+                  Szerepkörök: kampány vs. ügyféllevelezés
+                </Text>
+                <Text size="xs" c="dimmed">
+                  Tömeges kampánylevelek: kampányonként állítható (Kampányok oldal), mehet
+                  „burner" domainről (pl. SES) — ha a Google letiltja, csak az bánja.
+                  Az élő ügyféllevelezés (automatikus és kézi válaszok, közvetlen
+                  üzenetek) mindig az alábbi fiókról menjen a saját, védett domainedről.
+                </Text>
+                <Select
+                  size="xs"
+                  label="Válaszok küldő fiókja (1:1 levelezés)"
+                  description="Pl. benedek@okosurlap.hu (SMTP). Üresen: kampányfiók → alapértelmezett → első."
+                  placeholder="Nincs külön válasz-fiók"
+                  clearable
+                  value={form.replySenderAccountId || null}
+                  onChange={(v) => setForm({ ...form, replySenderAccountId: v || null })}
+                  data={senderAccounts.map((a) => ({
+                    value: a.id,
+                    label: `${a.name} — ${a.mailboxEmail || a.fromEmail}`,
+                  }))}
+                />
+              </Stack>
             </Paper>
           </Tabs.Panel>
 
@@ -1296,28 +1419,83 @@ export function SettingsPage({
             </Paper>
           </Tabs.Panel>
 
-          {/* Database & Demo Data */}
-          <Tabs.Panel value="data">
-            <Paper p="md" maw={640}>
-              <Stack gap="md">
-                <Box>
-                  <Text fw={600} size="sm">
-                    Munkaterület adatok kezelése
+          {/* Full database backup (JSON export / import) */}
+          <Tabs.Panel value="database">
+            <Stack gap="sm" maw={760}>
+              <Paper p="md">
+                <Stack gap="sm">
+                  <Group gap={8}>
+                    <IconDatabase size={16} />
+                    <Text fw={600} size="sm">
+                      Teljes adatbázis mentés (JSON)
+                    </Text>
+                  </Group>
+                  <Text size="xs" c="dimmed">
+                    A mentés tartalmaz mindent: projektek + ajánlatok, keresések,
+                    leadek (+ kereső–lead kapcsolatok), kampányok, e-mail üzenetek,
+                    küldő fiókok, tiltólista, beállítások és aktivitásnapló. Az
+                    import a jelenlegi adatbázist teljesen lecseréli (az azonosítók
+                    megmaradnak, így a kapcsolatok sem törnek meg).
                   </Text>
-                  <Text size="xs" c="dimmed" mt={2}>
-                    Minden adat lokálisan, a gépeden lévő SQLite adatbázisban tárolódik.
+                  <Group gap="xs" wrap="wrap">
+                    <Button
+                      size="xs"
+                      leftSection={<IconDownload size={14} />}
+                      loading={exportingDb}
+                      onClick={handleExportDatabase}
+                    >
+                      Mentés letöltése (JSON)
+                    </Button>
+                    <Button
+                      size="xs"
+                      variant="default"
+                      leftSection={<IconUpload size={14} />}
+                      loading={importingDb}
+                      onClick={() => importFileRef.current?.click()}
+                    >
+                      Mentés visszaállítása
+                    </Button>
+                    <input
+                      ref={importFileRef}
+                      type="file"
+                      accept=".json,application/json"
+                      hidden
+                      onChange={(e) => handleImportDatabaseFile(e.currentTarget.files?.[0])}
+                    />
+                  </Group>
+                  {lastBackupInfo && (
+                    <Text size="xs" c="dimmed" className="ml-mono">
+                      {lastBackupInfo}
+                    </Text>
+                  )}
+                </Stack>
+              </Paper>
+
+              <Paper p="md" style={{ borderColor: "var(--ml-border-strong)" }}>
+                <Stack gap="xs">
+                  <Text fw={600} size="sm" c="red">
+                    Veszélyes zóna
                   </Text>
-                </Box>
-                <Group>
-                  <Button variant="default" onClick={handleLoadDemo}>
-                    Minta B2B adatok betöltése
-                  </Button>
-                  <Button color="red" variant="outline" onClick={handleClearDb}>
-                    Összes adat törlése (Üres munkaterület)
-                  </Button>
-                </Group>
-              </Stack>
-            </Paper>
+                  <Text size="xs" c="dimmed">
+                    A teljes munkaterület törlése (projektek, keresések, leadek,
+                    kampányok, levelek). A küldő fiókok és beállítások megmaradnak.
+                    Visszavonhatatlan — előbb készíts JSON mentést!
+                  </Text>
+                  <Group>
+                    <Button
+                      size="xs"
+                      variant="outline"
+                      color="red"
+                      leftSection={<IconTrash size={14} />}
+                      loading={clearingDb}
+                      onClick={handleClearWorkspace}
+                    >
+                      Munkaterület törlése
+                    </Button>
+                  </Group>
+                </Stack>
+              </Paper>
+            </Stack>
           </Tabs.Panel>
         </Tabs>
       </Box>
@@ -1326,62 +1504,48 @@ export function SettingsPage({
       <Modal
         opened={accModalOpen}
         onClose={() => setAccModalOpen(false)}
-        title={accForm.id ? "Küldő fiók szerkesztése" : "Új SMTP vagy Amazon SES fiók"}
+        title={accForm.id ? "E-mail küldő szerkesztése" : "Új e-mail küldő"}
         size="lg"
       >
         <Stack gap="sm">
-          <SegmentedControl
-            fullWidth
-            value={accForm.provider}
-            onChange={(v) => setAccForm({ ...accForm, provider: v })}
-            data={[
-              { value: "smtp", label: "Saját SMTP szerver" },
-              { value: "ses", label: "Amazon SES (AWS API)" },
-            ]}
-          />
-
-          <SimpleGrid cols={2}>
-            <TextInput
-              label="Fiók megnevezése"
-              placeholder="pl. Saját sales fiók / AWS SES EU"
-              required
-              value={accForm.name}
-              onChange={(e) => setAccForm({ ...accForm, name: e.currentTarget.value })}
-            />
-            <NumberInput
-              label="Napi küldési limit"
-              min={1}
-              max={10000}
-              value={accForm.dailyLimit}
-              onChange={(v) => setAccForm({ ...accForm, dailyLimit: Number(v) || 50 })}
-            />
-          </SimpleGrid>
-
-          <SimpleGrid cols={3}>
-            <TextInput
-              label="Feladó neve"
-              placeholder="Kovács Márton"
-              value={accForm.fromName}
-              onChange={(e) => setAccForm({ ...accForm, fromName: e.currentTarget.value })}
-            />
-            <TextInput
-              label="Feladó e-mail cím"
-              placeholder="sales@ceged.hu"
-              required
-              value={accForm.fromEmail}
-              onChange={(e) => setAccForm({ ...accForm, fromEmail: e.currentTarget.value })}
-            />
-            <TextInput
-              label="Reply-To cím"
-              placeholder="sales@ceged.hu"
-              value={accForm.replyTo}
-              onChange={(e) => setAccForm({ ...accForm, replyTo: e.currentTarget.value })}
-            />
-          </SimpleGrid>
-
-          {accForm.provider === "smtp" ? (
-            <>
-              <Divider label="SMTP szerver adatok" />
+          {/* 1. rész: a postafiók */}
+          <Paper p="sm" withBorder>
+            <Stack gap="xs">
+              <Text fw={600} size="sm">
+                1. Postafiók <Text span size="xs" c="dimmed" fw={400}>— ide jönnek a válaszok, innen olvas az app</Text>
+              </Text>
+              <SimpleGrid cols={2}>
+                <TextInput
+                  label="Fiók megnevezése"
+                  placeholder="pl. Saját postafiók / AWS SES burner"
+                  required
+                  value={accForm.name}
+                  onChange={(e) => setAccForm({ ...accForm, name: e.currentTarget.value })}
+                />
+                <NumberInput
+                  label="Napi küldési limit"
+                  min={1}
+                  max={10000}
+                  value={accForm.dailyLimit}
+                  onChange={(v) => setAccForm({ ...accForm, dailyLimit: Number(v) || 50 })}
+                />
+              </SimpleGrid>
+              <SimpleGrid cols={2}>
+                <TextInput
+                  label="Feladó neve"
+                  placeholder="Kovács Márton"
+                  value={accForm.fromName}
+                  onChange={(e) => setAccForm({ ...accForm, fromName: e.currentTarget.value })}
+                />
+                <TextInput
+                  label="Postafiók e-mail címe"
+                  description="Válaszcím automatikusan ez — külön nem kell beállítani."
+                  placeholder="benedek@okosurlap.hu"
+                  required
+                  value={accForm.mailboxEmail}
+                  onChange={(e) => setAccForm({ ...accForm, mailboxEmail: e.currentTarget.value })}
+                />
+              </SimpleGrid>
               <SimpleGrid cols={3}>
                 <TextInput
                   label="SMTP Host"
@@ -1417,67 +1581,111 @@ export function SettingsPage({
                   onChange={(e) => setAccForm({ ...accForm, smtpPassword: e.currentTarget.value })}
                 />
               </SimpleGrid>
-            </>
-          ) : (
-            <>
-              <Divider label="Amazon SES (AWS) hitelesítés" />
-              <SimpleGrid cols={3}>
-                <Select
-                  label="AWS Régió"
-                  value={accForm.sesRegion}
-                  onChange={(v) => setAccForm({ ...accForm, sesRegion: v || "eu-central-1" })}
-                  data={[
-                    { value: "eu-central-1", label: "eu-central-1 (Frankfurt)" },
-                    { value: "eu-west-1", label: "eu-west-1 (Írország)" },
-                    { value: "us-east-1", label: "us-east-1 (N. Virginia)" },
-                    { value: "us-west-2", label: "us-west-2 (Oregon)" },
-                  ]}
-                />
-                <TextInput
-                  label="AWS Access Key ID"
-                  value={accForm.sesAccessKey}
-                  onChange={(e) => setAccForm({ ...accForm, sesAccessKey: e.currentTarget.value })}
-                />
-                <PasswordInput
-                  label="AWS Secret Access Key"
-                  value={accForm.sesSecretKey}
-                  onChange={(e) => setAccForm({ ...accForm, sesSecretKey: e.currentTarget.value })}
-                />
-              </SimpleGrid>
-            </>
-          )}
+              <Switch
+                label="IMAP beérkező levelek figyelése erről a postafiókról"
+                checked={accForm.imapEnabled}
+                onChange={(e) => setAccForm({ ...accForm, imapEnabled: e.currentTarget.checked })}
+              />
+              {accForm.imapEnabled && (
+                <SimpleGrid cols={2}>
+                  <TextInput
+                    label="IMAP Host"
+                    placeholder="imap.gmail.com"
+                    value={accForm.imapHost}
+                    onChange={(e) => setAccForm({ ...accForm, imapHost: e.currentTarget.value })}
+                  />
+                  <NumberInput
+                    label="IMAP Port (TLS)"
+                    value={accForm.imapPort}
+                    onChange={(v) => setAccForm({ ...accForm, imapPort: Number(v) || 993 })}
+                  />
+                  <TextInput
+                    label="IMAP Felhasználónév"
+                    description="Üresen a postafiók címe."
+                    value={accForm.imapUsername}
+                    onChange={(e) => setAccForm({ ...accForm, imapUsername: e.currentTarget.value })}
+                  />
+                  <PasswordInput
+                    label="IMAP Jelszó / App Password"
+                    value={accForm.imapPassword}
+                    onChange={(e) => setAccForm({ ...accForm, imapPassword: e.currentTarget.value })}
+                  />
+                </SimpleGrid>
+              )}
+            </Stack>
+          </Paper>
 
-          <Divider label="Beérkező válaszok fogadása (IMAP)" />
-          <Switch
-            label="IMAP beérkező levelek figyelése ezen a fiókon"
-            checked={accForm.imapEnabled}
-            onChange={(e) => setAccForm({ ...accForm, imapEnabled: e.currentTarget.checked })}
-          />
-          {accForm.imapEnabled && (
-            <SimpleGrid cols={2}>
-              <TextInput
-                label="IMAP Host"
-                placeholder="imap.gmail.com"
-                value={accForm.imapHost}
-                onChange={(e) => setAccForm({ ...accForm, imapHost: e.currentTarget.value })}
+          {/* 2. rész: a tömeges küldő (main küldő) */}
+          <Paper p="sm" withBorder>
+            <Stack gap="xs">
+              <Text fw={600} size="sm">
+                2. Tömeges küldő <Text span size="xs" c="dimmed" fw={400}>— a reklámlevelek feladója</Text>
+              </Text>
+              <SegmentedControl
+                fullWidth
+                value={accForm.provider}
+                onChange={(v) => setAccForm({ ...accForm, provider: v })}
+                data={[
+                  { value: "smtp", label: "Postafiók SMTP-je" },
+                  { value: "ses", label: "Külön Amazon SES" },
+                ]}
               />
-              <NumberInput
-                label="IMAP Port (TLS)"
-                value={accForm.imapPort}
-                onChange={(v) => setAccForm({ ...accForm, imapPort: Number(v) || 993 })}
-              />
-              <TextInput
-                label="IMAP Felhasználónév"
-                value={accForm.imapUsername}
-                onChange={(e) => setAccForm({ ...accForm, imapUsername: e.currentTarget.value })}
-              />
-              <PasswordInput
-                label="IMAP Jelszó / App Password"
-                value={accForm.imapPassword}
-                onChange={(e) => setAccForm({ ...accForm, imapPassword: e.currentTarget.value })}
-              />
-            </SimpleGrid>
-          )}
+              {accForm.provider === "smtp" ? (
+                <Text size="xs" c="dimmed">
+                  A tömeges levelek is a postafiókról mennek
+                  {accForm.mailboxEmail ? `: ${accForm.mailboxEmail}` : ""} — egyszerű, kis
+                  volumenhez ideális.
+                </Text>
+              ) : (
+                <>
+                  <Text size="xs" c="dimmed">
+                    Burner domain SES-sel (pl. okosurlap@quan.hu) — ha a Google letiltja,
+                    csak ez bánja, a postafiók nem. A válaszok továbbra is a fenti
+                    postafiókba érkeznek.
+                  </Text>
+                  <SimpleGrid cols={3}>
+                    <TextInput
+                      label="SES feladó e-mail (From)"
+                      placeholder="okosurlap@quan.hu"
+                      required
+                      value={accForm.fromEmail}
+                      onChange={(e) => setAccForm({ ...accForm, fromEmail: e.currentTarget.value })}
+                    />
+                    <Select
+                      label="AWS Régió"
+                      value={accForm.sesRegion}
+                      onChange={(v) => setAccForm({ ...accForm, sesRegion: v || "eu-central-1" })}
+                      data={[
+                        { value: "eu-central-1", label: "eu-central-1 (Frankfurt)" },
+                        { value: "eu-west-1", label: "eu-west-1 (Írország)" },
+                        { value: "us-east-1", label: "us-east-1 (N. Virginia)" },
+                        { value: "us-west-2", label: "us-west-2 (Oregon)" },
+                      ]}
+                    />
+                    <NumberInput
+                      label="Napi küldési limit"
+                      min={1}
+                      max={10000}
+                      value={accForm.dailyLimit}
+                      onChange={(v) => setAccForm({ ...accForm, dailyLimit: Number(v) || 50 })}
+                    />
+                  </SimpleGrid>
+                  <SimpleGrid cols={2}>
+                    <TextInput
+                      label="AWS Access Key ID"
+                      value={accForm.sesAccessKey}
+                      onChange={(e) => setAccForm({ ...accForm, sesAccessKey: e.currentTarget.value })}
+                    />
+                    <PasswordInput
+                      label="AWS Secret Access Key"
+                      value={accForm.sesSecretKey}
+                      onChange={(e) => setAccForm({ ...accForm, sesSecretKey: e.currentTarget.value })}
+                    />
+                  </SimpleGrid>
+                </>
+              )}
+            </Stack>
+          </Paper>
 
           <Switch
             label="Alapértelmezett küldő fiók"

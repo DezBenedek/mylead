@@ -87,7 +87,7 @@ pub struct SearchJob {
     pub query: String,
     pub industry: String,
     pub location: String,
-    pub company_size: String, // any | 1-10 | 11-50 | 51-200 | 200+
+    pub company_size: String, // any | MIN-MAX szabad tartomány (pl. 1-50) — legacy: 1-10 | 11-50 | 51-200 | 200+
     pub target_problem: String,
     pub source: String, // osm | google_places | serper | manual
     pub max_results: i64,
@@ -262,6 +262,11 @@ pub struct SenderAccount {
     pub from_name: String,
     pub from_email: String,
     pub reply_to: String,
+    /// A valódi postafiók e-mail címe: ide jönnek a válaszok (Reply-To mindig
+    /// automatikusan ez), innen olvas az IMAP. SES-es tömeges küldőnél ez
+    /// eltérhet a From címtől (pl. SES: okosurlap@quan.hu, postafiók:
+    /// benedek@okosurlap.hu).
+    pub mailbox_email: String,
     pub smtp_host: String,
     pub smtp_port: i64,
     pub smtp_username: String,
@@ -272,6 +277,9 @@ pub struct SenderAccount {
     pub ses_secret_key: String,
     pub daily_limit: i64,
     pub sent_today: i64,
+    /// Melyik napra vonatkozik a sent_today (YYYY-MM-DD, helyi idő). Új napon
+    /// az első küldés nullázza a számlálót — így a napi limit tényleg napi.
+    pub sent_day: String,
     pub imap_host: String,
     pub imap_port: i64,
     pub imap_username: String,
@@ -290,6 +298,11 @@ pub struct SenderAccountInput {
     pub from_name: String,
     pub from_email: String,
     pub reply_to: String,
+    /// A valódi postafiók e-mail címe: ide jönnek a válaszok (Reply-To mindig
+    /// automatikusan ez), innen olvas az IMAP. SES-es tömeges küldőnél ez
+    /// eltérhet a From címtől (pl. SES: okosurlap@quan.hu, postafiók:
+    /// benedek@okosurlap.hu).
+    pub mailbox_email: String,
     pub smtp_host: String,
     pub smtp_port: i64,
     pub smtp_username: String,
@@ -395,9 +408,18 @@ pub struct EmailMessage {
     /// beszélgetés is tartozhat; a válaszok ezt öröklik az In-Reply-To alapján.
     #[serde(default)]
     pub thread_key: Option<String>,
-    pub ai_intent: Option<String>, // interested | booking_request | question | objection | not_interested | out_of_office | unsubscribe
+    pub ai_intent: Option<String>, // interested | booking_request | question | objection | not_interested | out_of_office | unsubscribe | needs_human
     pub ai_suggested_reply: Option<String>,
     pub booking_link_sent: bool,
+    /// Igaz, ha a döntési modell emberi beavatkozást kér ehhez a levélhez
+    /// (nem készült hozzá automatikus válasz). Feloldás: válasz küldése
+    /// vagy explicit "Megoldva" jelölés.
+    #[serde(default)]
+    pub needs_human: bool,
+    /// A döntési modell kérdése/kérése a felhasználó felé (mi történt,
+    /// miben kell dönteni). Csak needs_human esetén kitöltött.
+    #[serde(default)]
+    pub human_question: Option<String>,
     pub error_message: Option<String>,
     pub sent_at: Option<String>,
     pub created_at: String,
@@ -456,6 +478,14 @@ pub struct InboxThread {
     /// érdemes ellenőrizni, hogy nem keveredett-e össze két beszélgetés.
     #[serde(default)]
     pub has_subject_change: bool,
+    /// Igaz, ha a beszélgetésben olyan bejövő levél van, amihez a döntési
+    /// modell emberi tanácsot kér (nincs hozzá automatikus válasz).
+    #[serde(default)]
+    pub needs_advice: bool,
+    /// A legfrissebb feloldatlan emberi kérés szövege (mi történt, miben
+    /// kell dönteni). Csak needs_advice esetén kitöltött.
+    #[serde(default)]
+    pub human_question: Option<String>,
     pub message_count: i64,
     pub messages: Vec<EmailMessage>,
 }
@@ -574,6 +604,13 @@ pub struct AppSettings {
     pub decision_model_id: String, // Decisions model slug, e.g. typesafe/jev-1.14, cloudflare/clef-flash
     #[serde(default = "default_true")]
     pub decision_auto_sort_inbox: bool,
+    /// A valódi ügyféllevelezés (1:1 bejövő válaszok, időzített AI-válaszok,
+    /// kézi válaszok) küldő fiókja. Ha be van állítva, MINDIG ez nyer a
+    /// kampány fiókjával szemben — így a tömeges kampányküldés mehet egy
+    /// "burner" domainről (pl. SES), az élő ügyfélkommunikáció pedig a saját,
+    /// védett domainről. Üresen: kampányfiók → alapértelmezett → első.
+    #[serde(default)]
+    pub reply_sender_account_id: Option<String>,
 }
 
 fn default_decision_provider() -> String {
@@ -650,6 +687,7 @@ impl Default for AppSettings {
             decision_model_api_key: String::new(),
             decision_model_id: default_decision_model_id(),
             decision_auto_sort_inbox: true,
+            reply_sender_account_id: None,
         }
     }
 }
@@ -756,6 +794,15 @@ pub struct AnalyticsOverview {
     pub daily_metrics: Vec<DailyMetric>,
     pub search_stats: Vec<SearchStat>,
     pub recent_activity: Vec<ActivityItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncInboxReport {
+    pub inserted: usize,
+    pub new_leads: usize,
+    pub skipped_automated: usize,
+    pub errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

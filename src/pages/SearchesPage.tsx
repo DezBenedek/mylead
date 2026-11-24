@@ -9,8 +9,10 @@ import {
   Loader,
   Modal,
   NumberInput,
+  Pagination,
   Paper,
   Progress,
+  RangeSlider,
   ScrollArea,
   SegmentedControl,
   Select,
@@ -101,6 +103,95 @@ export function sourceLabel(src: string): string {
   }
 }
 
+/** Slider domain: 1..500 (500 = "500+"). Accepts legacy buckets + free "MIN-MAX". */
+export const COMPANY_SIZE_MAX = 500;
+
+export function parseCompanySizeRange(raw: string): [number, number] {
+  const t = (raw || "").trim().toLowerCase().replace(/[–—]/g, "-");
+  if (!t || t === "any" || t === "all") return [1, COMPANY_SIZE_MAX];
+  if (t === "200+") return [200, COMPANY_SIZE_MAX];
+  const m = t.match(/^(\d+)\s*-\s*(\d+)\+?$/);
+  if (m) {
+    let lo = Math.max(1, Math.min(COMPANY_SIZE_MAX, parseInt(m[1], 10)));
+    let hi = Math.max(1, Math.min(COMPANY_SIZE_MAX, parseInt(m[2], 10)));
+    if (lo > hi) [lo, hi] = [hi, lo];
+    return [lo, hi];
+  }
+  const single = t.match(/^(\d+)\+?$/);
+  if (single) {
+    const n = Math.max(1, parseInt(single[1], 10));
+    return [1, Math.min(COMPANY_SIZE_MAX, n)];
+  }
+  return [1, COMPANY_SIZE_MAX];
+}
+
+export function formatCompanySize(raw: string): string {
+  const t = (raw || "").trim().toLowerCase();
+  if (!t || t === "any") return "Bármilyen";
+  const [lo, hi] = parseCompanySizeRange(raw);
+  if (lo <= 1 && hi >= COMPANY_SIZE_MAX) return "Bármilyen";
+  return `${lo}–${hi}${hi >= COMPANY_SIZE_MAX ? "+" : ""} fő`;
+}
+
+function sizeRangeToString(v: [number, number]): string {
+  const [lo, hi] = v;
+  if (lo <= 1 && hi >= COMPANY_SIZE_MAX) return "any";
+  return `${lo}-${hi}`;
+}
+
+/** Min–max headcount slider with exact numeric inputs. */
+function CompanySizeField({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (next: string) => void;
+}) {
+  const range = parseCompanySizeRange(value);
+  const isAny = range[0] <= 1 && range[1] >= COMPANY_SIZE_MAX;
+  return (
+    <Stack gap={4}>
+      <Group justify="space-between" align="center">
+        <Text size="sm" fw={500}>
+          Cégméret (fő)
+        </Text>
+        <Text size="xs" c={isAny ? "dimmed" : undefined} fw={isAny ? 400 : 600}>
+          {formatCompanySize(value)}
+        </Text>
+      </Group>
+      <RangeSlider
+        min={1}
+        max={COMPANY_SIZE_MAX}
+        step={1}
+        minRange={0}
+        value={range}
+        onChange={(v) => onChange(sizeRangeToString([v[0], v[1]]))}
+      />
+      <Group gap="xs" grow>
+        <NumberInput
+          size="xs"
+          label="Min"
+          min={1}
+          max={COMPANY_SIZE_MAX}
+          value={range[0]}
+          onChange={(v) => onChange(sizeRangeToString([Number(v) || 1, range[1]]))}
+        />
+        <NumberInput
+          size="xs"
+          label="Max"
+          min={1}
+          max={COMPANY_SIZE_MAX}
+          value={range[1]}
+          onChange={(v) => onChange(sizeRangeToString([range[0], Number(v) || COMPANY_SIZE_MAX]))}
+        />
+      </Group>
+      <Text size="11px" c="dimmed">
+        Állami / önkormányzati / óriás közigazgatási szervezetek automatikusan kizárva.
+      </Text>
+    </Stack>
+  );
+}
+
 export function SearchesPage({
   projects,
   searches,
@@ -125,6 +216,24 @@ export function SearchesPage({
   const [leadSubFilter, setLeadSubFilter] = useState<string>("all");
   const [aiInstruction, setAiInstruction] = useState("");
   const [aiReasoning, setAiReasoning] = useState("");
+  // Mely keresések futnak épp folyamatos (Stop-ig) módban — ez dönti el, hogy van-e "Max keret"!
+  const [continuousIds, setContinuousIds] = useState<string[]>([]);
+
+  // Ha egy folyamatos keresés véget ér / leáll, vegyük ki a folyamatos jelölést is
+  useEffect(() => {
+    setContinuousIds((prev) => prev.filter((id) => runningSearchIds.includes(id)));
+  }, [runningSearchIds]);
+
+  // Lapozás: max 100 sor / oldal (lista + találati tábla)
+  const PAGE_SIZE = 100;
+  const [listPage, setListPage] = useState(1);
+  const [leadsPage, setLeadsPage] = useState(1);
+  useEffect(() => {
+    setListPage(1);
+  }, [searches.length]);
+  useEffect(() => {
+    setLeadsPage(1);
+  }, [activeSearchId, leadSubFilter]);
 
   const [form, setForm] = useState({
     id: null as string | null,
@@ -188,6 +297,20 @@ export function SearchesPage({
     if (!activeSearch) return [];
     return leads.filter((l) => l.searches.some((sp) => sp.searchId === activeSearch.id));
   }, [leads, activeSearch]);
+
+  const listPageCount = Math.max(1, Math.ceil(searches.length / PAGE_SIZE));
+  const safeListPage = Math.min(listPage, listPageCount);
+  const pagedSearches = searches.slice(
+    (safeListPage - 1) * PAGE_SIZE,
+    safeListPage * PAGE_SIZE
+  );
+
+  const leadsPageCount = Math.max(1, Math.ceil(searchLeads.length / PAGE_SIZE));
+  const safeLeadsPage = Math.min(leadsPage, leadsPageCount);
+  const pagedSearchLeads = searchLeads.slice(
+    (safeLeadsPage - 1) * PAGE_SIZE,
+    safeLeadsPage * PAGE_SIZE
+  );
 
   const openCreateModal = () => {
     const firstProj = projects[0];
@@ -324,6 +447,13 @@ export function SearchesPage({
     setDetailTab("live");
     try {
       await api.startSearchJob(s.id, continuous);
+      setContinuousIds((prev) =>
+        continuous
+          ? prev.includes(s.id)
+            ? prev
+            : [...prev, s.id]
+          : prev.filter((id) => id !== s.id)
+      );
       await onRefresh();
       notifications.show({
         title: continuous ? "Folyamatos keresés elindítva" : "Keresés elindítva",
@@ -340,6 +470,7 @@ export function SearchesPage({
   const handleStop = async (searchId: string) => {
     try {
       await api.stopSearchJob(searchId);
+      setContinuousIds((prev) => prev.filter((id) => id !== searchId));
       await onRefresh();
       notifications.show({
         title: "Keresés leállítva",
@@ -397,6 +528,9 @@ export function SearchesPage({
     const latestEvent = logs[logs.length - 1];
     const isRunning =
       runningSearchIds.includes(activeSearch.id) || activeSearch.status === "running";
+    // Folyamatos módban NINCS felső keret — se a "Max keret" felirat, se a limit nem érvényes!
+    const isContinuousRun =
+      continuousIds.includes(activeSearch.id) || (latestEvent?.continuous ?? false);
     const pct =
       latestEvent && latestEvent.total > 0
         ? Math.min(100, (latestEvent.current / latestEvent.total) * 100)
@@ -515,7 +649,9 @@ export function SearchesPage({
                   {totalSearchLeads.length}
                 </Text>
                 <Text size="xs" c="dimmed">
-                  Max keret: {activeSearch.maxResults}
+                  {isContinuousRun
+                    ? "Folyamatos • nincs felső keret"
+                    : `Max keret: ${activeSearch.maxResults}`}
                 </Text>
               </Box>
               <Box className="ml-kpi-card">
@@ -770,7 +906,7 @@ export function SearchesPage({
                     </Button>
                   </Group>
 
-                  <Paper>
+                  <Paper style={{ overflow: "hidden" }}>
                     {searchLeads.length === 0 ? (
                       <Box p="xl" ta="center">
                         <Text size="sm" c="dimmed">
@@ -780,20 +916,20 @@ export function SearchesPage({
                         </Text>
                       </Box>
                     ) : (
+                      <ScrollArea type="auto" className="ml-table-scroll ml-table-scroll-narrow">
                       <Table>
                         <Table.Thead>
                           <Table.Tr>
                             <Table.Th>Cég & Weboldal</Table.Th>
                             <Table.Th>Kutatási mélység</Table.Th>
                             <Table.Th>E-mail & Létszám</Table.Th>
-                            <Table.Th>Feltárt probléma / Segítség</Table.Th>
                             <Table.Th ta="center">Fit</Table.Th>
                             <Table.Th>Státusz</Table.Th>
-                            <Table.Th ta="right">Művelet</Table.Th>
+                            <Table.Th ta="right" className="ml-table-actions">Művelet</Table.Th>
                           </Table.Tr>
                         </Table.Thead>
                         <Table.Tbody>
-                          {searchLeads.map((l) => {
+                          {pagedSearchLeads.map((l) => {
                             const worker = activeWorkersMap[l.id];
                             const meta = LEAD_STATUS_META[l.status] ?? {
                               label: l.status,
@@ -854,13 +990,6 @@ export function SearchesPage({
                                     {l.employeeEstimate || "—"}
                                   </Text>
                                 </Table.Td>
-                                <Table.Td maw={260}>
-                                  <Text size="xs" lineClamp={2} c={isNewUnaudited ? "dimmed" : undefined}>
-                                    {l.painPoints[0] ||
-                                      l.companySummary ||
-                                      (isNewUnaudited ? "Még nem vizsgált új cég" : "—")}
-                                  </Text>
-                                </Table.Td>
                                 <Table.Td ta="center">
                                   {isNewUnaudited ? (
                                     <Text size="xs" c="dimmed">
@@ -877,7 +1006,7 @@ export function SearchesPage({
                                     {isNewUnaudited ? "Új" : meta.label}
                                   </Badge>
                                 </Table.Td>
-                                <Table.Td ta="right" onClick={(e) => e.stopPropagation()}>
+                                <Table.Td ta="right" className="ml-table-actions" onClick={(e) => e.stopPropagation()}>
                                     <Button
                                       size="compact-xs"
                                       variant={isNewUnaudited ? "filled" : "default"}
@@ -893,6 +1022,15 @@ export function SearchesPage({
                           })}
                         </Table.Tbody>
                       </Table>
+                      </ScrollArea>
+                    )}
+                    {leadsPageCount > 1 && (
+                      <Group justify="space-between" p="xs" px="sm" style={{ borderTop: "1px solid var(--ml-border)" }}>
+                        <Text size="xs" c="dimmed" className="ml-tabular">
+                          {(safeLeadsPage - 1) * PAGE_SIZE + 1}–{Math.min(safeLeadsPage * PAGE_SIZE, searchLeads.length)} / {searchLeads.length} cég
+                        </Text>
+                        <Pagination size="xs" value={safeLeadsPage} onChange={setLeadsPage} total={leadsPageCount} />
+                      </Group>
                     )}
                   </Paper>
                 </Stack>
@@ -968,17 +1106,9 @@ export function SearchesPage({
                           value={form.location}
                           onChange={(e) => setForm({ ...form, location: e.currentTarget.value })}
                         />
-                        <Select
-                          label="Cégméret (fő)"
+                        <CompanySizeField
                           value={form.companySize}
-                          onChange={(v) => setForm({ ...form, companySize: v || "any" })}
-                          data={[
-                            { value: "any", label: "Bármilyen méret" },
-                            { value: "1-10", label: "1–10 fő" },
-                            { value: "11-50", label: "11–50 fő" },
-                            { value: "51-200", label: "51–200 fő" },
-                            { value: "200+", label: "200+ fő" },
-                          ]}
+                          onChange={(v) => setForm({ ...form, companySize: v })}
                         />
                       </SimpleGrid>
 
@@ -1121,7 +1251,8 @@ export function SearchesPage({
             </Stack>
           </Paper>
         ) : (
-          <Paper>
+          <Paper style={{ overflow: "hidden" }}>
+            <ScrollArea type="auto" className="ml-table-scroll">
             <Table>
               <Table.Thead>
                 <Table.Tr>
@@ -1131,11 +1262,11 @@ export function SearchesPage({
                   <Table.Th>Motor</Table.Th>
                   <Table.Th ta="right">Találatok</Table.Th>
                   <Table.Th>Státusz</Table.Th>
-                  <Table.Th ta="right">Műveletek</Table.Th>
+                  <Table.Th ta="right" className="ml-table-actions">Műveletek</Table.Th>
                 </Table.Tr>
               </Table.Thead>
               <Table.Tbody>
-                {searches.map((s) => (
+                {pagedSearches.map((s) => (
                   <Table.Tr
                     key={s.id}
                     style={{ cursor: "pointer" }}
@@ -1167,7 +1298,7 @@ export function SearchesPage({
                     </Table.Td>
                     <Table.Td>
                       <Text size="xs">
-                        {s.location || "Országos"} • {s.companySize} fő
+                        {s.location || "Országos"} • {formatCompanySize(s.companySize)}
                       </Text>
                       <Text size="11px" c="dimmed">
                         Mély kutatás: Fit ≥ {s.autoEnrichThreshold}
@@ -1211,13 +1342,13 @@ export function SearchesPage({
                         {formatShortDate(s.lastRunAt)}
                       </Text>
                     </Table.Td>
-                    <Table.Td onClick={(e) => e.stopPropagation()}>
-                      <Group justify="flex-end" gap={6} wrap="nowrap">
+                    <Table.Td className="ml-table-actions" onClick={(e) => e.stopPropagation()}>
+                      <Group justify="flex-end" gap={4} wrap="nowrap">
                         {runningSearchIds.includes(s.id) || s.status === "running" ? (
                           <Button
-                            size="xs"
+                            size="compact-xs"
                             color="red"
-                            leftSection={<IconPlayerStop size={13} />}
+                            leftSection={<IconPlayerStop size={12} />}
                             onClick={() => handleStop(s.id)}
                           >
                             Stop
@@ -1225,33 +1356,23 @@ export function SearchesPage({
                         ) : (
                           <>
                             <Button
-                              size="xs"
+                              size="compact-xs"
                               variant="default"
-                              leftSection={<IconPlayerPlay size={13} />}
+                              leftSection={<IconPlayerPlay size={12} />}
                               onClick={() => handleStart(s, false)}
                             >
                               Futtatás
                             </Button>
                             <Button
-                              size="xs"
+                              size="compact-xs"
                               variant="filled"
-                              leftSection={<IconInfinity size={13} />}
+                              leftSection={<IconInfinity size={12} />}
                               onClick={() => handleStart(s, true)}
                             >
                               Folyamatos
                             </Button>
                           </>
                         )}
-                        <Button
-                          size="xs"
-                          variant="default"
-                          onClick={() => {
-                            setDetailTab("live");
-                            onSelectSearchId(s.id);
-                          }}
-                        >
-                          Megnyitás
-                        </Button>
                         <ActionIcon
                           size="sm"
                           variant="subtle"
@@ -1279,6 +1400,15 @@ export function SearchesPage({
                 ))}
               </Table.Tbody>
             </Table>
+            </ScrollArea>
+            {listPageCount > 1 && (
+              <Group justify="space-between" p="xs" px="sm" style={{ borderTop: "1px solid var(--ml-border)" }}>
+                <Text size="xs" c="dimmed" className="ml-tabular">
+                  {(safeListPage - 1) * PAGE_SIZE + 1}–{Math.min(safeListPage * PAGE_SIZE, searches.length)} / {searches.length} keresés
+                </Text>
+                <Pagination size="xs" value={safeListPage} onChange={setListPage} total={listPageCount} />
+              </Group>
+            )}
           </Paper>
         )}
       </Box>
@@ -1350,17 +1480,9 @@ export function SearchesPage({
               value={form.location}
               onChange={(e) => setForm({ ...form, location: e.currentTarget.value })}
             />
-            <Select
-              label="Cégméret (fő)"
+            <CompanySizeField
               value={form.companySize}
-              onChange={(v) => setForm({ ...form, companySize: v || "any" })}
-              data={[
-                { value: "any", label: "Bármilyen méret" },
-                { value: "1-10", label: "1–10 fő" },
-                { value: "11-50", label: "11–50 fő" },
-                { value: "51-200", label: "51–200 fő" },
-                { value: "200+", label: "200+ fő" },
-              ]}
+              onChange={(v) => setForm({ ...form, companySize: v })}
             />
           </SimpleGrid>
 

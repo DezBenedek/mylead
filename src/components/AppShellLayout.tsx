@@ -16,6 +16,7 @@ import {
 import {
   IconBriefcase,
   IconChartBar,
+  IconCheck,
   IconCommand,
   IconDatabase,
   IconInbox,
@@ -24,9 +25,16 @@ import {
   IconRadar2,
   IconSend,
   IconSettings,
+  IconSparkles,
   IconSun,
 } from "@tabler/icons-react";
 import type { JobProgressEvent, NavSection } from "../types";
+
+export interface SidebarAiLoad {
+  runningSearches: number;
+  enrichingLeads: number;
+  activeWorkers: number;
+}
 
 interface Props {
   active: NavSection;
@@ -40,7 +48,29 @@ interface Props {
     unreadInbox: number;
   };
   activeJob: JobProgressEvent | null;
+  aiLoad?: SidebarAiLoad;
   children: React.ReactNode;
+}
+
+function jobTypeLabel(jobType: string): string {
+  switch (jobType) {
+    case "project_crawl":
+      return "Projekt feltérképezés";
+    case "import":
+      return "Importálás";
+    case "enrich":
+      return "Mély kutatás";
+    case "campaign_send":
+      return "Kampányküldés";
+    case "campaign_generate":
+      return "Levélgenerálás";
+    case "assistant":
+      return "Asszisztens";
+    case "search":
+      return "Keresés";
+    default:
+      return "AI folyamat";
+  }
 }
 
 export function AppShellLayout({
@@ -49,6 +79,7 @@ export function AppShellLayout({
   onOpenAssistant,
   counts,
   activeJob,
+  aiLoad,
   children,
 }: Props) {
   const { colorScheme, toggleColorScheme } = useMantineColorScheme();
@@ -235,38 +266,108 @@ export function AppShellLayout({
           </Stack>
         </Box>
 
-        {/* Bottom Status / Active Job Dock */}
+        {/* Bottom Status / Active AI Jobs Dock */}
         <Box p={12} style={{ borderTop: "1px solid var(--ml-border)" }}>
-          {activeJob ? (
-            <Box p={0} className="ml-status-dock">
-              <Group justify="space-between" mb={6}>
-                <Text size="xs" fw={600}>
-                  Folyamatban...
-                </Text>
-                <Text size="xs" c="dimmed" className="ml-tabular">
-                  {activeJob.current}/{activeJob.total}
-                </Text>
-              </Group>
-              <Progress
-                value={activeJob.total > 0 ? (activeJob.current / activeJob.total) * 100 : 100}
-                size="xs"
-                color="forest"
-                mb={8}
-              />
-              <Text size="11px" c="dimmed" lineClamp={2} lh={1.45}>
-                {activeJob.message}
-              </Text>
-            </Box>
-          ) : (
-            <Group justify="space-between" className="ml-status-dock-idle" px={2}>
-              <Text size="11px" c="dimmed">
-                SQLite lokális DB
-              </Text>
-              <Badge size="xs" color="forest" variant="dot">
-                Kész
-              </Badge>
-            </Group>
-          )}
+          {(() => {
+            const runningSearches = aiLoad?.runningSearches ?? 0;
+            const enrichingLeads = aiLoad?.enrichingLeads ?? 0;
+            const bgWorkers = aiLoad?.activeWorkers ?? 0;
+            const parallelTotal = runningSearches + enrichingLeads + bgWorkers;
+            const pct =
+              activeJob && activeJob.total > 0
+                ? Math.min(100, Math.round((activeJob.current / activeJob.total) * 100))
+                : activeJob
+                ? 100
+                : 0;
+            const loadBits: string[] = [];
+            if (runningSearches > 0)
+              loadBits.push(`${runningSearches} keresés`);
+            if (enrichingLeads > 0)
+              loadBits.push(`${enrichingLeads} mély kutatás`);
+            if (bgWorkers > 0 && enrichingLeads === 0)
+              loadBits.push(`${bgWorkers} háttérszál`);
+
+            if (activeJob) {
+              return (
+                <Box className="ml-status-card ml-status-card-active">
+                  <Group justify="space-between" wrap="nowrap" mb={6}>
+                    <Group gap={7} wrap="nowrap" style={{ minWidth: 0 }}>
+                      <span className="ml-pulse-dot" />
+                      <Text size="xs" fw={700} truncate>
+                        {jobTypeLabel(activeJob.jobType)}
+                      </Text>
+                    </Group>
+                    <Badge size="xs" color="forest" variant="filled" className="ml-tabular">
+                      {activeJob.total > 0
+                        ? `${activeJob.current}/${activeJob.total} · ${pct}%`
+                        : "dolgozik…"}
+                    </Badge>
+                  </Group>
+                  <Progress value={pct} size="sm" color="forest" mb={7} animated striped />
+                  <Text size="11px" c="dimmed" lineClamp={2} lh={1.45}>
+                    {activeJob.message}
+                  </Text>
+                  {loadBits.length > 0 && (
+                    <Group gap={4} mt={7} wrap="nowrap">
+                      <IconSparkles size={11} style={{ flexShrink: 0, opacity: 0.7 }} />
+                      <Text size="10.5px" c="dimmed" truncate>
+                        + {loadBits.join(" · ")} párhuzamosan
+                      </Text>
+                    </Group>
+                  )}
+                </Box>
+              );
+            }
+
+            if (parallelTotal > 0) {
+              return (
+                <Box className="ml-status-card ml-status-card-active">
+                  <Group justify="space-between" wrap="nowrap" mb={6}>
+                    <Group gap={7} wrap="nowrap" style={{ minWidth: 0 }}>
+                      <span className="ml-pulse-dot" />
+                      <Text size="xs" fw={700} truncate>
+                        AI dolgozik
+                      </Text>
+                    </Group>
+                    <Badge size="xs" color="forest" variant="filled" className="ml-tabular">
+                      {parallelTotal} folyamat
+                    </Badge>
+                  </Group>
+                  <Progress value={100} size="sm" color="forest" mb={7} animated striped />
+                  <Text size="11px" c="dimmed" lineClamp={2} lh={1.45}>
+                    {loadBits.join(" · ")} fut a háttérben — a táblázatok élőben frissülnek.
+                  </Text>
+                </Box>
+              );
+            }
+
+            return (
+              <Box className="ml-status-card ml-status-card-idle">
+                <Group justify="space-between" wrap="nowrap">
+                  <Group gap={7} wrap="nowrap" style={{ minWidth: 0 }}>
+                    <span className="ml-idle-dot" />
+                    <Box style={{ minWidth: 0 }}>
+                      <Group gap={5} wrap="nowrap">
+                        <Text size="xs" fw={700}>
+                          Minden kész
+                        </Text>
+                        <IconCheck size={12} style={{ opacity: 0.65 }} />
+                      </Group>
+                      <Group gap={4} wrap="nowrap" mt={1}>
+                        <IconDatabase size={10} style={{ opacity: 0.55 }} />
+                        <Text size="10.5px" c="dimmed" truncate>
+                          Helyi SQLite DB · szinkronizálva
+                        </Text>
+                      </Group>
+                    </Box>
+                  </Group>
+                  <Badge size="xs" color="forest" variant="light">
+                    Kész
+                  </Badge>
+                </Group>
+              </Box>
+            );
+          })()}
         </Box>
       </Box>
 

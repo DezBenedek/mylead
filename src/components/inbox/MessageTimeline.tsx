@@ -3,7 +3,7 @@ import { Badge, Box, Center, Group, Modal, Stack, Text } from "@mantine/core";
 import { IconCalendarCheck, IconInbox } from "@tabler/icons-react";
 import { formatShortDate } from "../../lib/api";
 import type { EmailMessage } from "../../types";
-import { EmailBody } from "./EmailBody";
+import { EmailBody, getEmailSnippet } from "./EmailBody";
 
 export interface MessageTimelineProps {
   messages: EmailMessage[];
@@ -65,7 +65,9 @@ export function MessageTimeline({ messages, leadCompany }: MessageTimelineProps)
               <Text size="12.5px" fw={600} lineClamp={1} mb={2}>
                 {m.subject || "(nincs tárgy)"}
               </Text>
-              <EmailBody body={m.body} hideQuoted />
+              <Text size="12.5px" c="dimmed" lineClamp={3} lh={1.55}>
+                {getEmailSnippet(m.body) || "—"}
+              </Text>
             </Box>
           );
         })}

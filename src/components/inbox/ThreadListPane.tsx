@@ -34,6 +34,8 @@ export interface ThreadListPaneProps {
   onFilterChange: (value: string) => void;
   counts: ThreadListCounts;
   footerStatus: string;
+  /** Hamis, ha egyáltalán nincs beszélgetés (nem csak a szűrő zár ki mindent). */
+  hasAnyThreads?: boolean;
 }
 
 function initialsOf(name: string): string {
@@ -98,6 +100,16 @@ function ThreadCard({
             {snippetOf(thread)}
           </Text>
           <Group gap={5} mt={6} wrap="nowrap" style={{ minHeight: 20 }}>
+            {thread.needsAdvice && (
+              <Badge
+                size="xs"
+                color="orange"
+                variant="filled"
+                style={{ textTransform: "none", flexShrink: 0 }}
+              >
+                🙋 Tanácsot kér
+              </Badge>
+            )}
             {prio >= 65 && (
               <span className={`ml-prio ${isHot ? "hot" : prio >= 80 ? "hot" : "warm"}`}>
                 {isHot && <IconFlame size={10} />}
@@ -143,6 +155,7 @@ export function ThreadListPane({
   onFilterChange,
   counts,
   footerStatus,
+  hasAnyThreads = true,
 }: ThreadListPaneProps) {
   return (
     <Box className="ml-inbox-list">
@@ -184,15 +197,17 @@ export function ThreadListPane({
         </Group>
       </Box>
 
-      <ScrollArea style={{ flex: 1 }} p={8} type="auto">
+      <ScrollArea style={{ flex: 1 }} p={8} type="auto" scrollbars="y">
         <Stack gap={8}>
           {threads.length === 0 ? (
-            <Box ta="center" py="xl">
+            <Box ta="center" py="xl" px="sm">
               <Text size="sm" fw={600}>
-                Nincs találat
+                {hasAnyThreads ? "Nincs találat" : "Még nincs levelezés"}
               </Text>
               <Text size="xs" c="dimmed" mt={4}>
-                Próbálj más szűrőt vagy keresést.
+                {hasAnyThreads
+                  ? "Próbálj más szűrőt vagy keresést."
+                  : "Az új beérkező e-mailek automatikusan itt jelennek meg."}
               </Text>
             </Box>
           ) : (

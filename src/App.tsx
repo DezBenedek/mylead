@@ -77,6 +77,7 @@ export default function App() {
 
   const [selectedLead, setSelectedLead] = useState<Lead | null>(null);
   const [activeSearchId, setActiveSearchId] = useState<string | null>(null);
+  const [inboxFocusKey, setInboxFocusKey] = useState<string | null>(null);
   const [leadsSearchFilter, setLeadsSearchFilter] = useState<string | null>(null);
   const [campaignPrefillSearch, setCampaignPrefillSearch] = useState<SearchJob | null>(null);
   const [campaignPrefillLeads, setCampaignPrefillLeads] = useState<string[]>([]);
@@ -341,7 +342,7 @@ export default function App() {
     }
   };
 
-  const unreadInbox = threads.filter((t) => t.hasPendingDraft).length;
+  const unreadInbox = threads.filter((t) => t.hasPendingDraft || t.needsAdvice).length;
 
   // Flatten all currently active lead research workers across all searches/enrichment jobs
   const activeLeadWorkers: Record<string, SearchLiveEvent> = {};
@@ -363,6 +364,7 @@ export default function App() {
         onNavigate={(next) => {
           if (next !== "leads") setLeadsSearchFilter(null);
           if (next !== "searches") setActiveSearchId(null);
+          if (next !== "inbox") setInboxFocusKey(null);
           setSection(next);
         }}
         onOpenAssistant={() => setAssistantOpen(true)}
@@ -374,6 +376,11 @@ export default function App() {
           unreadInbox,
         }}
         activeJob={activeJob}
+        aiLoad={{
+          runningSearches: runningSearchIds.length,
+          enrichingLeads: enrichingLeadIds.length,
+          activeWorkers: Object.keys(activeLeadWorkers).length,
+        }}
       >
         {section === "dashboard" && (
           <DashboardPage
@@ -381,6 +388,11 @@ export default function App() {
             loadingDemo={loadingDemo}
             onLoadDemo={handleLoadDemo}
             onNavigate={setSection}
+            threads={threads}
+            onOpenThread={(key) => {
+              setInboxFocusKey(key);
+              setSection("inbox");
+            }}
           />
         )}
 
@@ -459,6 +471,8 @@ export default function App() {
             settings={settings}
             onSelectLead={setSelectedLead}
             onRefresh={refreshAll}
+            focusThreadKey={inboxFocusKey}
+            onFocusConsumed={() => setInboxFocusKey(null)}
           />
         )}
 

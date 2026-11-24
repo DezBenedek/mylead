@@ -368,6 +368,7 @@ pub fn seed_demo_workspace(db: &Database) -> Result<(), String> {
         from_name: "Kovács Márton — FoglaljPro".to_string(),
         from_email: "marton@foglaljpro.hu".to_string(),
         reply_to: "marton@foglaljpro.hu".to_string(),
+        mailbox_email: "marton@foglaljpro.hu".to_string(),
         smtp_host: "smtp.postmarkapp.com".to_string(),
         smtp_port: 587,
         smtp_username: "".to_string(),

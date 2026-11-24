@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   ActionIcon,
   Badge,
@@ -9,8 +9,10 @@ import {
   Loader,
   Modal,
   NumberInput,
+  Pagination,
   Paper,
   Progress,
+  ScrollArea,
   Select,
   SimpleGrid,
   Stack,
@@ -88,6 +90,13 @@ export function LeadsPage({
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [bulkStatusTarget, setBulkStatusTarget] = useState<string>("");
 
+  // Lapozás: max 100 sor / oldal
+  const PAGE_SIZE = 100;
+  const [page, setPage] = useState(1);
+  useEffect(() => {
+    setPage(1);
+  }, [searchFilter, statusFilter, minScore, maxScore, sortBy, textQuery, onlyWithEmail, leads.length]);
+
   // Direct Email & Add to Campaign modals
   const [emailModalLead, setEmailModalLead] = useState<Lead | null>(null);
   const [addCampaignIds, setAddCampaignIds] = useState<string[]>([]);
@@ -139,6 +148,10 @@ export function LeadsPage({
       return b.fitScore - a.fitScore;
     });
   }, [leads, searchFilter, statusFilter, minScore, maxScore, sortBy, textQuery, onlyWithEmail]);
+
+  const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const safePage = Math.min(page, pageCount);
+  const paged = filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
 
   const allChecked = filtered.length > 0 && filtered.every((l) => selectedIds.includes(l.id));
 
@@ -486,7 +499,7 @@ export function LeadsPage({
           )}
 
           {/* Leads Table */}
-          <Paper>
+          <Paper style={{ overflow: "hidden" }}>
             {filtered.length === 0 ? (
               <Box p="xl" ta="center">
                 <Text size="sm" c="dimmed">
@@ -494,6 +507,7 @@ export function LeadsPage({
                 </Text>
               </Box>
             ) : (
+              <ScrollArea type="auto" className="ml-table-scroll">
               <Table>
                 <Table.Thead>
                   <Table.Tr>
@@ -502,14 +516,13 @@ export function LeadsPage({
                     </Table.Th>
                     <Table.Th>Cég & Weboldal</Table.Th>
                     <Table.Th>E-mail & Létszám</Table.Th>
-                    <Table.Th>Nagyságrendi áttekintés (Okosűrlap / Segítség)</Table.Th>
                     <Table.Th ta="center">Fit</Table.Th>
                     <Table.Th>Státusz</Table.Th>
-                    <Table.Th ta="right">Műveletek</Table.Th>
+                    <Table.Th ta="right" className="ml-table-actions">Műveletek</Table.Th>
                   </Table.Tr>
                 </Table.Thead>
                 <Table.Tbody>
-                  {filtered.map((l) => {
+                  {paged.map((l) => {
                     const meta = LEAD_STATUS_META[l.status] ?? { label: l.status, color: "gray" };
                     const worker = activeLeadWorkers[l.id];
                     const isNewUnaudited = !l.audit && l.fitScore === 0;
@@ -569,14 +582,6 @@ export function LeadsPage({
                             {l.employeeEstimate || "Létszám ismeretlen"}
                           </Text>
                         </Table.Td>
-                        <Table.Td maw={300}>
-                          <Text size="xs" c="dimmed" lineClamp={2}>
-                            {l.howWeCanHelp ||
-                              l.painPoints[0] ||
-                              l.companySummary ||
-                              (isNewUnaudited ? "Auditra váró új lead" : "Még nem auditált")}
-                          </Text>
-                        </Table.Td>
                         <Table.Td ta="center">
                           {isNewUnaudited ? (
                             <Text size="xs" c="dimmed">
@@ -591,8 +596,8 @@ export function LeadsPage({
                             {isNewUnaudited ? "Új (auditra vár)" : meta.label}
                           </Badge>
                         </Table.Td>
-                        <Table.Td ta="right" onClick={(e) => e.stopPropagation()}>
-                          <Group gap={4} justify="flex-end" wrap="nowrap">
+                        <Table.Td ta="right" className="ml-table-actions" onClick={(e) => e.stopPropagation()}>
+                          <Group gap={2} justify="flex-end" wrap="nowrap">
                             <Tooltip
                               label={
                                 l.websiteUrl || l.domain
@@ -685,6 +690,15 @@ export function LeadsPage({
                   })}
                 </Table.Tbody>
               </Table>
+              </ScrollArea>
+            )}
+            {pageCount > 1 && (
+              <Group justify="space-between" p="xs" px="sm" style={{ borderTop: "1px solid var(--ml-border)" }}>
+                <Text size="xs" c="dimmed" className="ml-tabular">
+                  {(safePage - 1) * PAGE_SIZE + 1}–{Math.min(safePage * PAGE_SIZE, filtered.length)} / {filtered.length} cég
+                </Text>
+                <Pagination size="xs" value={safePage} onChange={setPage} total={pageCount} />
+              </Group>
             )}
           </Paper>
         </Stack>

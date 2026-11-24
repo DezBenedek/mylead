@@ -59,7 +59,7 @@ fn default_priority_score() -> i64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplyClassification {
-    pub intent: String, // interested | booking_request | question | objection | not_interested | out_of_office | unsubscribe
+    pub intent: String, // interested | booking_request | question | objection | not_interested | out_of_office | unsubscribe | needs_human
     #[serde(default = "default_priority_score")]
     pub priority_score: i64, // 1..100 urgency & conversion score
     #[serde(default)]
@@ -72,6 +72,15 @@ pub struct ReplyClassification {
     pub should_include_booking_link: bool,
     #[serde(default)]
     pub summary: String,
+    /// Igaz, ha az AI nem mer egyedül válaszolni, hanem emberi döntést kér.
+    /// Ilyenkor nincs automatikus választervezet, helyette a felhasználó
+    /// kap egy kérdést a főoldalon.
+    #[serde(default)]
+    pub needs_human: bool,
+    /// A felhasználónak szóló kérdés: mi történt, miben kell dönteni,
+    /// mit válaszoljon. Csak needs_human esetén kitöltött.
+    #[serde(default)]
+    pub human_question: String,
 }
 
 /// Computes a human-like randomized send timestamp strictly inside configured business hours
@@ -1043,6 +1052,88 @@ pub fn refine_company_name(
 }
 
 /// Checks if a crawled website or lead is clearly unrelated noise relative to the active SearchJob
+/// (also used as the last line of defence against municipal / authority / giant-org hits
+/// that slipped through the discovery-level filters).
+fn is_public_sector_text(name: &str, domain: &str, summary: &str) -> bool {
+    crate::discovery::is_public_sector_lead(&format!("{} {}", name, summary), domain)
+}
+
+/// Parses the search `company_size` field into an inclusive (min, max) headcount range.
+/// Supports legacy buckets ("any", "1-10", "11-50", "51-200", "200+") and the new
+/// free-range "MIN-MAX" format from the UI slider (e.g. "1-50"). Max is capped at 10 000.
+pub fn parse_company_size_range(raw: &str) -> (i64, i64) {
+    let t = raw.trim().to_lowercase().replace(['–', '—'], "-");
+    if t.is_empty() || t == "any" || t == "all" || t == "bármilyen" {
+        return (1, 10_000);
+    }
+    if t == "200+" || t == "200 -" || t == "200-" {
+        return (200, 10_000);
+    }
+    let parts: Vec<&str> = t.split('-').collect();
+    let num = |s: &str| {
+        s.trim()
+            .trim_end_matches('+')
+            .trim_end_matches(" fő")
+            .trim_end_matches(" fo")
+            .trim()
+            .parse::<i64>()
+            .ok()
+    };
+    if parts.len() == 2 {
+        if let (Some(mut lo), Some(mut hi)) = (num(parts[0]), num(parts[1])) {
+            lo = lo.clamp(1, 10_000);
+            hi = hi.clamp(1, 10_000);
+            if lo > hi {
+                std::mem::swap(&mut lo, &mut hi);
+            }
+            return (lo, hi);
+        }
+    }
+    if let Some(single) = num(&t) {
+        return (1, single.max(1));
+    }
+    // Legacy fallbacks
+    match t.as_str() {
+        "1-10" => (1, 10),
+        "11-50" => (11, 50),
+        "51-200" => (51, 200),
+        _ => (1, 10_000),
+    }
+}
+
+/// Rough midpoint estimate from a free-text headcount label like "5-15 fő", "250-500 fő",
+/// "1000+ fő", "Ismeretlen". Returns None when no number can be extracted.
+fn estimate_headcount_mid(text: &str) -> Option<i64> {
+    let lower = text.to_lowercase().replace(['–', '—'], "-");
+    let mut nums: Vec<i64> = Vec::new();
+    let mut cur = String::new();
+    for c in lower.chars() {
+        if c.is_ascii_digit() {
+            cur.push(c);
+        } else if !cur.is_empty() {
+            if let Ok(n) = cur.parse::<i64>() {
+                nums.push(n);
+            }
+            cur.clear();
+        }
+    }
+    if !cur.is_empty() {
+        if let Ok(n) = cur.parse::<i64>() {
+            nums.push(n);
+        }
+    }
+    if nums.is_empty() {
+        return None;
+    }
+    if lower.contains('+') && nums.len() == 1 {
+        return Some(nums[0]);
+    }
+    if nums.len() == 1 {
+        return Some(nums[0]);
+    }
+    Some((nums[0] + nums[nums.len() - 1]) / 2)
+}
+
 fn check_search_relevance(
     search: Option<&SearchJob>,
     lead: &Lead,
@@ -1051,6 +1142,13 @@ fn check_search_relevance(
     company_summary: &str,
 ) -> bool {
     if crate::discovery::is_noise_domain(&lead.domain) {
+        return false;
+    }
+    // Municipal / authority / state-giant hits are NEVER valid B2B outreach leads,
+    // regardless of the search niche.
+    if is_public_sector_text(&lead.company_name, &lead.domain, company_summary)
+        || is_public_sector_text(&lead.company_name, &lead.domain, crawled_text)
+    {
         return false;
     }
 
@@ -1166,7 +1264,10 @@ pub async fn audit_and_score_lead(
 SZIGORÚ MINŐSÍTÉSI ÉS NÉVADÁSI SZABÁLYOK:\n\
 1. 'company_name' (VALÓDI CÉGNÉV / MÁRKANÉV): Add meg a cég, márka, intézmény vagy szakember VALÓDI, TISZTA nevét a weboldal tartalma, impresszuma, lábléce és domainje alapján (pl. 'Sugár Márton Coaching', 'ASCON Consulting', 'ProMan Consulting', 'Wiesner & Snír Academy', 'Sport & Grow', 'Magyar Felnőttképző Kft.', 'VIKOTE', 'Coach School'). TILOS menüpontot, SEO kulcsszót vagy aloldal-címet visszaadni cégnévként (pl. TILOS: 'Coaching árak', 'Coaching szolgáltatások', 'Nyílt nap', 'GYIK', 'Főoldal', 'Főlap', 'Vezetőfejlesztő tréningek és képzések', 'Coach Budapest 11. kerület')!\n\
 2. 'matches_search' (true|false) & 'fit_score' (0..100):\n\
-   - KRITIKUS IPARÁGI SZŰRŐ: Ha a cég NEM a KERESÉSI CÉLBAN megadott iparágban/témában működik (pl. coaching/tréning keresésnél földmérés, garázskapu, mobilgarázs, trapézlemez, weboldalkészítő vagy szoftverfejlesztő ügynökség, ügyviteli/hírlevélküldő SaaS, rendszerintegráció, szobakiadás), VAGY nem valódi megkereshető célcég (hírportál mint The Guardian, hatóság mint NKFH, állami intézmény, PDF-tár, külföldi szolgáltató mint BT Email, blogcikk), akkor KÖTELEZŐEN: 'matches_search': false ÉS 'fit_score': 0..25! Soha ne adj 25-nél többet más iparágú cégnek akkor sem, ha az általános szoftverünk elméletileg nekik is jó lenne!\n\
+   - KRITIKUS IPARÁGI SZŰRŐ: Ha a cég NEM a KERESÉSI CÉLBAN megadott iparágban/témában működik (pl. coaching/tréning keresésnél földmérés, garázskapu, mobilgarázs, trapézlemez, weboldalkészítő vagy szoftverfejlesztő ügynökség, ügyviteli/hírlevélküldő SaaS, rendszerintegráció, szobakiadás), VAGY nem valódi megkereshető célcég (hírportál mint The Guardian, hatóság mint NKFH, állami intézmény, PDF-tár, külföldi szolgáltató mint BT Email, blogcikk), akkor KÖTELEZŐEN: 'matches_search': false ÉS 'fit_score': 0..25!\n\
+Soha ne adj 25-nél többet más iparágú cégnek akkor sem, ha az általános szoftverünk elméletileg nekik is jó lenne!\n\
+   - KÖZIGAZGATÁSI / ÁLLAMI KIZÁRÁS (mindig érvényes, iparágtól függetlenül): ha a vizsgált szervezet önkormányzat, polgármesteri / járási / kormányhivatal, bíróság / törvényszék / ügyészség, rendőrség / katasztrófavédelem / honvédség, minisztérium, NAV / adóhatóság / államkincstár / tankerület / oktatási hivatal, vagy 250+ fős állami óriásszervezet (pl. 'Budapest Főváros Önkormányzata', 'Józsefvárosi Önkormányzat', 'Magyarország Bíróságai'), akkor KÖTELEZŐEN: 'matches_search': false ÉS 'fit_score': 5..20! Az 'employee_estimate' mezőbe írd be a becsült valós létszámot (pl. '500+ fő (önkormányzati hivatal)'), a 'company_summary' első mondatában pedig jelezd: 'Nem megkereshető közigazgatási / állami szervezet - kizárva.'!\n\
+   - CÉGMÉRET SZŰRŐ: a keresés 'Cél cégméret' mezője (pl. '1-50') KÖTELEZŐ szűrő! Ha a becsült létszám egyértelműen a tartományon kívül van (pl. 1-50-es keresésnél 250+ fős óriáscég / multicég / 1000+ fős intézményhálózat), akkor 'matches_search': false ÉS 'fit_score': 10..30! Kis eltérésnél még adható 55..70 pont 'matches_search': true-val, de a 'company_summary'-ban jelezd a méreteltérést!\n\
    - KERESETT PROBLÉMA ELLENŐRZÉSE (pl. 'béna emailes jelentkezés / manuális fizetés'):\n\
      • 82..96 pont ('matches_search': true): Pontosan a keresett iparágba tartozik ÉS a weboldalán tényleg fennáll a keresett probléma (nincs modern automatizált fizetős/időpontfoglalós regisztráció, hanem e-mailre/telefonra vagy egyszerű statikus kapcsolatfelvételi űrlapra és kézi utalásra/számlázásra támaszkodik).\n\
      • 58..79 pont ('matches_search': true): Releváns iparág, de már van részlegesen kiépített online foglaló vagy komolyabb űrlap/képzési rendszer (ahol egy előszűrő/fizetős okosűrlap még javíthat, de a probléma kevésbé égető), vagy határterület (pl. egyetem, nagy pszichológiai rendelőhálózat).\n\
@@ -1210,6 +1311,35 @@ Kizárólag érvényes JSON-t adj vissza ezekkel a kulcsokkal: company_name (str
                     crawled_text,
                     &parsed.company_summary,
                 );
+                // Deterministic hard gates (work even if the model ignores the prompt):
+                // public-sector leads are never marketable, and headcounts clearly
+                // outside the search's size range (e.g. 1-50) are demoted.
+                let public_sector_hit = search.is_some()
+                    && (is_public_sector_text(&parsed.company_name, &lead.domain, &parsed.company_summary)
+                        || is_public_sector_text(&lead.company_name, &lead.domain, crawled_text));
+                let size_mismatch = match search {
+                    Some(s) => {
+                        let (lo, hi) = parse_company_size_range(&s.company_size);
+                        match estimate_headcount_mid(&parsed.employee_estimate) {
+                            Some(mid) => mid < lo || mid > hi * 2,
+                            None => false,
+                        }
+                    }
+                    None => false,
+                };
+                if public_sector_hit {
+                    parsed.matches_search = false;
+                    parsed.fit_score = parsed.fit_score.min(20).max(5);
+                    if !parsed.company_summary.contains("kizárva") {
+                        parsed.company_summary = format!(
+                            "Nem megkereshető közigazgatási / állami szervezet — kizárva. {}",
+                            parsed.company_summary
+                        );
+                    }
+                } else if size_mismatch {
+                    parsed.matches_search = false;
+                    parsed.fit_score = parsed.fit_score.min(30).max(10);
+                }
                 if !heuristic_relevant || !parsed.matches_search || parsed.fit_score < 45 {
                     parsed.matches_search = false;
                     parsed.fit_score = parsed.fit_score.min(30).max(10);
@@ -1319,15 +1449,32 @@ Kizárólag érvényes JSON-t adj vissza ezekkel a kulcsokkal: company_name (str
         pain_points.push("Manuális e-mailes jelentkezéskezelés — okosűrlappal automatizálható".to_string());
     }
 
+    // Deterministic size gate for the heuristic path: a headcount clearly outside the
+    // search's size range (e.g. 500+ fő on a 1-50 search) can never be a match.
+    let (mut matches, mut final_score) = (score >= 48, score.clamp(15, 95));
+    if let Some(s) = search {
+        let (lo, hi) = parse_company_size_range(&s.company_size);
+        if let Some(mid) = estimate_headcount_mid(&employee_estimate) {
+            if mid < lo || mid > hi * 2 {
+                matches = false;
+                final_score = final_score.min(35).max(15);
+                pain_points.push(format!(
+                    "Méreteltérés: becsült létszám ({}) kívül esik a keresett tartományon ({}–{} fő)",
+                    employee_estimate, lo, hi
+                ));
+            }
+        }
+    }
+
     LeadAiAnalysis {
         company_name: cleaned_name.clone(),
-        matches_search: score >= 48,
+        matches_search: matches,
         detected_industry: if lead.industry.is_empty() {
             search.map(|s| s.industry.clone()).unwrap_or_else(|| "B2B szolgáltató".into())
         } else {
             lead.industry.clone()
         },
-        fit_score: score.clamp(15, 95),
+        fit_score: final_score,
         employee_estimate,
         company_summary: format!(
             "{} ({}, {}) — {} területen működő vállalkozás, manuális/alap online jelentkezési folyamattal.",
@@ -1724,8 +1871,19 @@ pub fn enforce_hungarian_email_quality(
             .replace("Vagy inkább csak kíváncsi, hogyan", "Vagy inkább csak kíváncsiak lennétek, hogyan");
     } else {
         // Single person email: fix accidental plural verbs if any slipped in
+        // (pl. az AI többesben fogalmazott egy "Kedves Benedek!"-nek induló levelet).
         body = body
             .replace("a ti arculatotokba", "a saját arculatodba")
+            .replace("tudnak közvetlenül", "tud közvetlenül")
+            .replace("tudnának", "tudna")
+            .replace("találják", "találja")
+            .replace("nézhetik", "nézheti")
+            .replace("választhatnak", "választhat")
+            .replace("írjanak", "írjon")
+            .replace("jelezzenek", "jelezzen")
+            .replace("kérdésüket", "kérdését")
+            .replace("Önöknek", "Önnek")
+            .replace("Önök", "Ön")
             .replace("a ti csomagjaitokra", "a saját csomagjaidra")
             .replace("Vagy inkább csak kíváncsi, hogyan nézne ki nálatok?", "Vagy inkább csak kíváncsi lennél, hogyan nézne ki ez nálad?");
     }
@@ -2065,6 +2223,10 @@ async fn call_openrouter_decisions_model(
             "tag_kifogas": {
                 "type": "noul",
                 "instructions": "Does the email raise an objection such as no time, too expensive or an existing solution?"
+            },
+            "human_needed": {
+                "type": "noul",
+                "instructions": "Does this email need the owner's personal decision instead of an automatic reply? Yes for: complaints, angry or threatening tone, legal/data-protection demands, refund or compensation claims, price exceptions, complex multi-part requests, anything sensitive the AI should not answer alone."
             }
         }
     });
@@ -2121,10 +2283,22 @@ async fn call_openrouter_decisions_model(
         "not_interested",
         "out_of_office",
         "unsubscribe",
+        "needs_human",
     ];
-    let intent = choice_answer("intent")
+    let mut intent = choice_answer("intent")
         .filter(|c| valid_intents.contains(&c.as_str()))
         .unwrap_or_else(|| "question".to_string());
+    // A "human_needed" nüansz-kérdés felülírhatja az intentet: ha emberi
+    // döntés kell, sose menjen ki automatikus válasz.
+    let needs_human = prob_answer("human_needed").unwrap_or(0.0) >= 0.5;
+    if needs_human
+        && !matches!(
+            intent.as_str(),
+            "unsubscribe" | "out_of_office" | "needs_human"
+        )
+    {
+        intent = "needs_human".to_string();
+    }
 
     let tier = choice_answer("priority_tier")
         .filter(|c| ["hot", "high", "medium", "low"].contains(&c.as_str()));
@@ -2179,6 +2353,8 @@ async fn call_openrouter_decisions_model(
         suggested_reply: String::new(),
         should_include_booking_link,
         summary: String::new(),
+        needs_human,
+        human_question: String::new(),
     })
 }
 
@@ -2220,9 +2396,10 @@ async fn call_openrouter_decision_model(
                             "objection",
                             "not_interested",
                             "out_of_office",
-                            "unsubscribe"
+                            "unsubscribe",
+                            "needs_human"
                         ],
-                        "description": "Primary intent of the inbound email."
+                        "description": "Primary intent of the inbound email. Use needs_human when the email needs the owner's personal decision (complaint, legal/threatening tone, refund claim, price exception, complex multi-part request) instead of an automatic reply."
                     },
                     "priority_score": {
                         "type": "integer",
@@ -2249,6 +2426,14 @@ async fn call_openrouter_decision_model(
                     "summary": {
                         "type": "string",
                         "description": "Concise 1-sentence Hungarian decision summary explaining why this score and tags were assigned."
+                    },
+                    "needs_human": {
+                        "type": "boolean",
+                        "description": "True when the email needs the owner's personal decision instead of an automatic reply (complaint, legal/threatening tone, refund claim, price exception, complex multi-part request). When true, suggested_reply must be an empty string."
+                    },
+                    "human_question": {
+                        "type": "string",
+                        "description": "Question for the owner in Hungarian (2-4 sentences): what happened, what decision is needed, and what the reply should say. Only filled when needs_human is true, otherwise empty string."
                     }
                 },
                 "required": [
@@ -2258,7 +2443,9 @@ async fn call_openrouter_decision_model(
                     "tags",
                     "suggested_reply",
                     "should_include_booking_link",
-                    "summary"
+                    "summary",
+                    "needs_human",
+                    "human_question"
                 ],
                 "additionalProperties": false
             }
@@ -2371,6 +2558,49 @@ fn normalize_reply_classification(mut c: ReplyClassification) -> ReplyClassifica
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Élő emberi átadást kérő levelek felismerése (telefon, visszahívás,
+/// ügyfélszolgálat, „élő ember"). A bemenet már kisbetűsített szöveg.
+/// Az ékezet nélküli alakokat is tartalmazza, mert az összehasonlítás
+/// nem végez ékezettelenítést.
+pub(crate) fn is_human_handoff_request(lower: &str) -> bool {
+    const HANDOFF_KW: &[&str] = &[
+        "élő ember",
+        "elo ember",
+        "élőember",
+        "emberrel beszél",
+        "emberrel szeretnék",
+        "emberi ügyintéző",
+        "emberi ugyintezo",
+        "élő ügyintéző",
+        "elo ugyintezo",
+        "hívjanak fel",
+        "hivjanak fel",
+        "hívjon fel",
+        "hivjon fel",
+        "hívjanak vissza",
+        "hivjanak vissza",
+        "hívjon vissza",
+        "hivjon vissza",
+        "visszahív",
+        "visszahiv",
+        "ügyfélszolgálat",
+        "ugyfelszolgalat",
+        "munkatárs",
+        "munkatars",
+        "telefonon",
+        "személyesen",
+        "szemelyesen",
+        "valódi ember",
+        "valodi ember",
+        "nem robot",
+        "nem géppel",
+        "nem geppel",
+        "ne automata",
+        "nem automata",
+    ];
+    HANDOFF_KW.iter().any(|k| lower.contains(k))
+}
+
 pub async fn classify_and_draft_reply(
     settings: &AppSettings,
     project: &Project,
@@ -2381,6 +2611,7 @@ pub async fn classify_and_draft_reply(
     lead: &Lead,
     inbound_body: &str,
     thread_history: &[EmailMessage],
+    pending_draft_body: Option<&str>,
 ) -> ReplyClassification {
     let signature = resolve_email_signature(Some(project), settings);
     // A megszólítás minden automatikus választervezet elejére kötelező —
@@ -2412,15 +2643,17 @@ pub async fn classify_and_draft_reply(
    - 40..64 ('medium'): Kifogás, halogatás ('most nincs rá idő', 'drága', 'már van rendszerünk'), amit egy jó válasszal még meg lehet fordítani.\n\
    - 1..39 ('low'): Nem érdekli ('not_interested'), házon kívül ('out_of_office') vagy leiratkozás ('unsubscribe').\n\
 2. AUTOMATIKUS TARTALMI CÍMKÉZÉS ('tags'): Adj 2-4 rövid, magyar nyelvű címkét a levél konkrét tartalma alapján (pl. 'Időpontot kér', 'Demó', 'Árazás kérdés', 'Google Naptár', 'Technikai kérdés', 'Kedvezmény', 'Időhiány kifogás', 'Döntéshozó', 'Házon kívül', 'Leiratkozás').\n\
-3. VÁLASZ MEGÍRÁSA ('suggested_reply'): Rövid, lényegre törő, természetes magyar B2B válasz (maximum 3-4 rövid mondat, sallang és ömlengés nélkül; csak leiratkozás vagy házon kívüli auto-válasz esetén hagyd üresen). SZIGORÚ MAGYAR STÍLUSSZABÁLYOK:\n\
+3. VÁLASZ MEGÍRÁSA ('suggested_reply'): Rövid, lényegre törő, természetes magyar B2B válasz (maximum 3-4 rövid mondat, sallang és ömlengés nélkül; csak leiratkozás, házon kívüli auto-válasz vagy 'needs_human' esetén hagyd üresen). SZIGORÚ MAGYAR STÍLUSSZABÁLYOK:\n\
    - MINDIG köszönéssel kezd ('Köszönöm a megkeresést!' vagy 'Köszönöm a visszajelzést!'). TILOS 'Szívesen!'-nel nyitni — az kizárólag köszönetre adott válasz lehet, érdeklődésre NEM!\n\
-   - Végig magázódó, udvarias üzleti hang, következetes ragozással. TILOS a 'megyek' ige ígéretként ('máris megyek' HELYETT mindig 'máris küldöm'); TILOS az üres 'csak egy szó' frázis (HELYETTE: 'csak jelezze').\n\
-   - Minden mondatnak legyen tartalma: reagálás a levélre + egy konkrétum + egyértelmű következő lépés (konkrét kérdés vagy időpontfoglaló link). TILOS tartalmatlan általánosság ('rövid ötleteim a folyamatba rendezésről' jellegű ködösítés).\n\
-SZIGORÚAN TARTSD BE A KAMPÁNY-AJÁNLAT TÁLALÁSI SZABÁLYÁT! Ha időpontot/bemutatót kér, illeszd be a projekt időpontfoglaló linkjét! A megadott Aláírást pontosan használd a végén.\n\
-Kizárólag JSON-t adj vissza: {\"intent\":\"interested|booking_request|question|objection|not_interested|out_of_office|unsubscribe\",\"priority_score\":88,\"priority_tier\":\"hot|high|medium|low\",\"tags\":[\"...\"],\"suggested_reply\":\"...\",\"should_include_booking_link\":true|false,\"summary\":\"...\"}";
+   - Végig magázódó, udvarias üzleti hang, következetes ragozással. SZEMÉLY-EGYEZTETÉS (KRITIKUS!): a megszólítás dönti el a számot — 'Kedves <keresztnév>!' esetén végig EGYES szám második személy (Ön, Önnek, írjon, találja, tudja, nézheti, választhat), 'Kedves <Cég> Csapat!' esetén végig TÖBBES szám (Önök, Önöknek, írjanak, találják, tudnak, nézhetik, választhatnak). SOHA ne keverd a kettőt egy levélen belül! TILOS a 'megyek' ige ígéretként ('máris megyek' HELYETT mindig 'máris küldöm'); TILOS az üres 'csak egy szó' frázis (HELYETTE: 'csak jelezze').\n\
+   - Minden mondatnak legyen tartalma: reagálás a levélre + egy konkrétum + egyértelmű következő lépés (konkrét kérdés vagy előfizetés/kipróbálás linkje). TILOS tartalmatlan általánosság ('rövid ötleteim a folyamatba rendezésről' jellegű ködösítés).\n\
+    - Ha van FÜGGŐBEN LÉVŐ VÁLASZTERVEZET (egy korábbi levélre írt, még ki nem küldött válasz), akkor a KÉT LEVELET EGYBEVÉVE válaszold meg: egyetlen koherens levél legyen, ami a tervezetben már megválaszolt pontokat is magában foglalja, nem két különálló üzenet egymás után.\n\
+ 4. EMBERI BEAVATKOZÁS ('intent':'needs_human', 'needs_human':true): Ha a levél emberi döntést igényel, NE írj automatikus választ ('suggested_reply' legyen üres string)! Ilyen esetek: panasz vagy felháborodott/fenyegető hangnem, jogi vagy adatvédelmi követelés, visszatérítési/kártérítési igény, egyedi árkedvezmény-kérés, bonyolult többrészes kérés, vagy bármi érzékeny, amit az AI nem válaszolhat meg egyedül. EMBERI ÁTADÁS: ha az ügyfél élő emberrel / telefonon / személyesen akar beszélni, visszahívást kér, vagy jelzi, hogy nem gépi (automata) választ akar, az is emberi beavatkozás ('needs_human':true, üres 'suggested_reply')! Ilyenkor a 'human_question' mezőbe írj 2-4 mondatos magyar kérdést a felhasználónak: mi történt pontosan, miben kell döntenie, és mit javasolsz válaszolni.\n\
+SZIGORÚAN TARTSD BE A KAMPÁNY-AJÁNLAT TÁLALÁSI SZABÁLYÁT! A FŐ CÉL MINDIG AZ ELŐFIZETÉS / KIPRÓBÁLÁS (landing URL) — a válasz az előfizetésre tereljen, ne időpontfoglalásra! Időpontfoglaló linket CSAK akkor tégy be (legfeljebb egy rövid mellékmondatban), ha az ügyfél kifejezetten időpontot, demót vagy hívást kér! A megadott Aláírást pontosan használd a végén.\n\
+Kizárólag JSON-t adj vissza: {\"intent\":\"interested|booking_request|question|objection|not_interested|out_of_office|unsubscribe|needs_human\",\"priority_score\":88,\"priority_tier\":\"hot|high|medium|low\",\"tags\":[\"...\"],\"suggested_reply\":\"...\",\"should_include_booking_link\":true|false,\"summary\":\"...\",\"needs_human\":false,\"human_question\":\"...\"}";
 
     let user = format!(
-        "Saját megoldás: {} ({})\nLanding URL: {}\nIdőpontfoglaló URL: {}\nKAMPÁNY AJÁNLAT ÉS TÁLALÁSI SZABÁLY:\n{}\nÉrtékajánlat: {}\nKifogáskezelés: {:?}\nGlobális válasz-szabályok: {}\nAláírás:\n{}\n\nCÉG ({} — {})\nMiben segíthetünk nekik:\n{}\n\nKORÁBBI LEVÉLVÁLTÁS:\n{}\n\nLEGÚJABB BEÉRKEZŐ ÜZENET (EZT RANGSOROLD, CÍMKÉZD ÉS VÁLASZOLD MEG):\n{}",
+        "Saját megoldás: {} ({})\nLanding URL: {}\nIdőpontfoglaló URL: {}\nKAMPÁNY AJÁNLAT ÉS TÁLALÁSI SZABÁLY:\n{}\nÉrtékajánlat: {}\nKifogáskezelés: {:?}\nGlobális válasz-szabályok: {}\nAláírás:\n{}\n\nCÉG ({} — {})\nMiben segíthetünk nekik:\n{}\n\nKORÁBBI LEVÉLVÁLTÁS:\n{}\n\nFÜGGŐBEN LÉVŐ VÁLASZTERVEZET (még ki nem küldött válasz egy korábbi levélre — ha nem üres, a két levelet EGYBEVÉVE válaszold meg egyetlen koherens levélben):\n{}\n\nLEGÚJABB BEÉRKEZŐ ÜZENET (EZT RANGSOROLD, CÍMKÉZD ÉS VÁLASZOLD MEG):\n{}",
         project.name,
         project.website_url,
         project.landing_url,
@@ -2434,6 +2667,7 @@ Kizárólag JSON-t adj vissza: {\"intent\":\"interested|booking_request|question
         lead.industry,
         lead.how_we_can_help,
         if history_text.is_empty() { "Nincs előzmény".into() } else { history_text },
+        pending_draft_body.filter(|s| !s.trim().is_empty()).unwrap_or("Nincs függő tervezet."),
         inbound_body
     );
 
@@ -2469,6 +2703,7 @@ Kizárólag JSON-t adj vissza: {\"intent\":\"interested|booking_request|question
     let unsub_kw = ["leiratkoz", "unsubscribe", "ne írjanak", "ne irjanak", "törölj", "torolj", "spam", "gdpr"];
     let no_kw = ["nem érdekel", "nem erdekel", "köszönjük nem", "koszonjuk nem", "nincs szükség", "nem aktuális", "nem aktualis"];
     let ooo_kw = ["házon kívül", "hazon kivul", "out of office", "szabadság", "szabadsag", "automatikus válasz"];
+    let human_kw = ["panasz", "felháborod", "felhaborod", "botrány", "botrany", "ügyvéd", "ugyved", "bíróság", "birosag", "perel", "feljelent", "hatóság", "hatosag", "fogyasztóvéd", "kártérítés", "karterites", "visszatérítés", "visszaterites", "visszafizet", "csalás", "csalas", "átverés", "atveres", "rémes", "remes", "szörnyű", "szornyu", "felháborító", "felhaborito", "azonnal hívjanak", "felelős vezetővel", "felelos vezetovel", "főnökével akarok beszélni"];
     let question_kw = ["?", "mennyibe", "ár", "ar ", "hogyan", "részletek", "reszletek", "milyen", "működik", "mukodik"];
 
     // Rich content tag extraction from message text
@@ -2504,6 +2739,8 @@ Kizárólag JSON-t adj vissza: {\"intent\":\"interested|booking_request|question
             suggested_reply: String::new(),
             should_include_booking_link: false,
             summary: "Leiratkozási kérés — automatikusan tiltólistára kerül (Prioritás: 5/100).".to_string(),
+            needs_human: false,
+            human_question: String::new(),
         };
     }
 
@@ -2516,6 +2753,47 @@ Kizárólag JSON-t adj vissza: {\"intent\":\"interested|booking_request|question
             suggested_reply: String::new(),
             should_include_booking_link: false,
             summary: "Automatikus házon kívüli (szabadság) válasz (Prioritás: 12/100).".to_string(),
+            needs_human: false,
+            human_question: String::new(),
+        };
+    }
+
+    // Emberi döntést / átadást igénylő levél: panasz, jogi fenyegetés,
+    // visszatérítés, VAGY az ügyfél élő emberrel akar beszélni (telefon,
+    // visszahívás, ügyfélszolgálat) — ilyenkor nincs automatikus válasz,
+    // a felhasználó kap kérdést (a főoldalon is megjelenik).
+    let handoff = is_human_handoff_request(&lower);
+    if handoff || human_kw.iter().any(|k| lower.contains(k)) {
+        let mut tags = vec![if handoff {
+            "Élő embert kér".to_string()
+        } else {
+            "Emberi döntést kér".to_string()
+        }];
+        for t in detected_tags {
+            if !tags.contains(&t) && tags.len() < 4 {
+                tags.push(t);
+            }
+        }
+        return ReplyClassification {
+            intent: "needs_human".to_string(),
+            priority_score: 90,
+            priority_tier: "hot".to_string(),
+            tags,
+            suggested_reply: String::new(),
+            should_include_booking_link: false,
+            summary: "Figyelmet igénylő ügy: a levél emberi döntést kér, automatikus válasz nem készült (Prioritás: 90/100).".to_string(),
+            needs_human: true,
+            human_question: if handoff {
+                format!(
+                    "Az ügyfél élő emberrel szeretne beszélni ({}). Automatikus válasz NEM készült és az időzített válaszok leálltak — vedd fel vele a kapcsolatot, majd jelöld megoldottnak.",
+                    lead.company_name
+                )
+            } else {
+                format!(
+                    "A(z) {} levelében olyan ügy van, amit nem merek egyedül megválaszolni (panasz, jogi vagy visszatérítési jelleg, érzékeny kérés). Kérlek, olvasd el a levelet, és döntsd el, mit válaszoljunk: elismerjük a hibát és kárpótoljuk, jogi útra tereljük, vagy udvariasan elhárítjuk? Amint megírod a választ, én már csak azt küldöm ki.",
+                    lead.company_name
+                )
+            },
         };
     }
 
@@ -2531,12 +2809,20 @@ Kizárólag JSON-t adj vissza: {\"intent\":\"interested|booking_request|question
             ),
             should_include_booking_link: false,
             summary: "Elutasító válasz — udvarias lezárás javasolt (Prioritás: 18/100).".to_string(),
+            needs_human: false,
+            human_question: String::new(),
         };
     }
 
     if booking_kw.iter().any(|k| lower.contains(k)) {
         let booking_part = if !project.booking_url.trim().is_empty() {
-            format!("Itt tudnak közvetlenül egy Önöknek megfelelő 15 perces időpontot foglalni:\n{}", project.booking_url)
+            if is_single_person {
+                format!("Itt tud közvetlenül egy Önnek megfelelő 15 perces időpontot foglalni:\n{}", project.booking_url)
+            } else {
+                format!("Itt tudnak közvetlenül egy Önöknek megfelelő 15 perces időpontot foglalni:\n{}", project.booking_url)
+            }
+        } else if is_single_person {
+            "Kérem írjon 2-3 Önnek megfelelő idősávot a következő napokban, és küldöm a meghívót!".to_string()
         } else {
             "Kérem írjanak 2-3 Önöknek megfelelő idősávot a következő napokban, és küldöm a meghívót!".to_string()
         };
@@ -2552,11 +2838,13 @@ Kizárólag JSON-t adj vissza: {\"intent\":\"interested|booking_request|question
             priority_tier: "hot".to_string(),
             tags,
             suggested_reply: format!(
-                "Nagyon örülök az érdeklődésnek! Szívesen átbeszéljük röviden, hogyan tudunk segíteni a(z) {} számára.\n\n{}\n\nAddig is a részleteket itt találják: {}\n\n{}",
-                lead.company_name, booking_part, target_url, signature
+                "Nagyon örülök az érdeklődésnek! Szívesen átbeszéljük röviden, hogyan tudunk segíteni a(z) {} számára.\n\n{}\n\nAddig is a részleteket itt {}: {}\n\n{}",
+                lead.company_name, booking_part, if is_single_person { "találja" } else { "találják" }, target_url, signature
             ),
             should_include_booking_link: !project.booking_url.trim().is_empty(),
             summary: "Kiemelt prioritás (94/100): az ügyfél konkrét időpontot / bemutatót kér.".to_string(),
+            needs_human: false,
+            human_question: String::new(),
         };
     }
 
@@ -2569,7 +2857,11 @@ Kizárólag JSON-t adj vissza: {\"intent\":\"interested|booking_request|question
                 .unwrap_or_default()
         };
         let booking_part = if !project.booking_url.trim().is_empty() {
-            format!("\n\nHa egyszerűbb szóban, 10 percben megválaszolom minden kérdésüket — itt foglalható időpont: {}", project.booking_url)
+            if is_single_person {
+                format!("\n\nHa inkább szóban egyeztetne, 10 percben megválaszolom minden kérdését — itt foglalhat időpontot: {}", project.booking_url)
+            } else {
+                format!("\n\nHa egyszerűbb szóban, 10 percben megválaszolom minden kérdésüket — itt foglalható időpont: {}", project.booking_url)
+            }
         } else {
             String::new()
         };
@@ -2588,16 +2880,22 @@ Kizárólag JSON-t adj vissza: {\"intent\":\"interested|booking_request|question
             priority_tier: "high".to_string(),
             tags,
             suggested_reply: format!(
-                "Köszönöm a kérdést! Röviden összefoglalva: {}\n{}\n\nA teljes leírást és példákat ezen az oldalon találják: {}{}\n\n{}",
-                project.value_proposition, offer_part, target_url, booking_part, signature
+                "Köszönöm a kérdést! Röviden összefoglalva: {}\n{}\n\nA részleteket és az előfizetést itt {}: {}{}\n\n{}",
+                project.value_proposition, offer_part, if is_single_person { "találja" } else { "találják" }, target_url, booking_part, signature
             ),
             should_include_booking_link: !project.booking_url.trim().is_empty(),
             summary: "Magas prioritás (82/100): konkrét szakmai/árazási kérdés érkezett.".to_string(),
+            needs_human: false,
+            human_question: String::new(),
         };
     }
 
     let booking_part = if !project.booking_url.trim().is_empty() {
-        format!("\n\nHa megfelel egy rövid 15 perces bemutató, itt választhatnak időpontot: {}", project.booking_url)
+        if is_single_person {
+            format!("\n\nHa inkább szóban egyeztetne, itt választhat időpontot: {}", project.booking_url)
+        } else {
+            format!("\n\nHa megfelel egy rövid 15 perces bemutató, itt választhatnak időpontot: {}", project.booking_url)
+        }
     } else {
         String::new()
     };
@@ -2614,11 +2912,13 @@ Kizárólag JSON-t adj vissza: {\"intent\":\"interested|booking_request|question
         priority_tier: "hot".to_string(),
         tags,
         suggested_reply: format!(
-            "Köszönöm a visszajelzést! Örülök, hogy releváns lehet a(z) {} számára a megoldásunk.\n\nA legfontosabb részleteket és az aktuális ajánlatot itt nézhetik meg: {}{}\n\n{}",
-            lead.company_name, target_url, booking_part, signature
+            "Köszönöm a visszajelzést! Örülök, hogy releváns lehet a(z) {} számára a megoldásunk.\n\nA legfontosabb részleteket és az előfizetést itt {}: {}{}\n\n{}",
+            lead.company_name, if is_single_person { "találja" } else { "találják" }, target_url, booking_part, signature
         ),
         should_include_booking_link: !project.booking_url.trim().is_empty(),
         summary: "Magas prioritás (86/100): pozitív, nyitott érdeklődő válasz érkezett.".to_string(),
+        needs_human: false,
+        human_question: String::new(),
     }
     };
 
@@ -2628,11 +2928,17 @@ Kizárólag JSON-t adj vissza: {\"intent\":\"interested|booking_request|question
             decision.tags = local.tags;
         }
         // A decision model only judges — it never writes prose. Use the local draft, but never
-        // draft a reply for an unsubscribe / out-of-office verdict.
+        // draft a reply for an unsubscribe / out-of-office verdict — or when it asks for a human.
         decision.suggested_reply = match decision.intent.as_str() {
-            "unsubscribe" | "out_of_office" => String::new(),
+            "unsubscribe" | "out_of_office" | "needs_human" => String::new(),
             _ => local.suggested_reply,
         };
+        if decision.needs_human && decision.human_question.trim().is_empty() {
+            decision.human_question = local.human_question.clone();
+        }
+        if decision.intent == "needs_human" {
+            decision.suggested_reply = String::new();
+        }
         let intent_label = match decision.intent.as_str() {
             "booking_request" => "Időpontot kér",
             "interested" => "Érdeklődik",
@@ -2641,6 +2947,7 @@ Kizárólag JSON-t adj vissza: {\"intent\":\"interested|booking_request|question
             "not_interested" => "Nem érdekelt",
             "out_of_office" => "Házon kívül",
             "unsubscribe" => "Leiratkozás",
+            "needs_human" => "Emberi döntést kér",
             _ => "Döntés",
         };
         decision.summary = format!(
@@ -2669,8 +2976,16 @@ Kizárólag JSON-t adj vissza: {\"intent\":\"interested|booking_request|question
     };
 
     // Minden automatikus választervezet kötelezően a helyes megszólítással
-    // ("Kedves XY!") kezdődjön — az üres (leiratkozó/házon kívüli) kivételével.
-    if !out.suggested_reply.trim().is_empty() {
+    // ("Kedves XY!") kezdődjön — az üres (leiratkozó/házon kívüli/emberi
+    // beavatkozást kérő) kivételével.
+    if out.needs_human || out.intent == "needs_human" {
+        out.intent = "needs_human".to_string();
+        out.needs_human = true;
+        out.suggested_reply = String::new();
+        if out.human_question.trim().is_empty() {
+            out.human_question = "Ennél a levélnél emberi döntés kell: kérlek, olvasd el, és írd meg, mit válaszoljunk.".to_string();
+        }
+    } else if !out.suggested_reply.trim().is_empty() {
         let fixed = enforce_hungarian_email_quality(
             GeneratedEmail {
                 subject: String::new(),
@@ -2788,6 +3103,20 @@ Kizárólag JSON-t adj vissza: {\"subject\":\"...\",\"body\":\"...\"}";
     })
 }
 
+/// Normalizes any company_size value (legacy buckets or free "MIN-MAX") into the
+/// canonical "MIN-MAX" / "any" format used by the size slider and the Fit gates.
+pub fn normalize_company_size(raw: &str) -> String {
+    let t = raw.trim().to_lowercase();
+    if t.is_empty() || t == "any" {
+        return "any".to_string();
+    }
+    let (lo, hi) = parse_company_size_range(&t);
+    if lo <= 1 && hi >= 10_000 {
+        return "any".to_string();
+    }
+    format!("{}-{}", lo, hi)
+}
+
 /// AI Search Optimizer: fixes, sharpens, and configures a SearchJob based on the Project + user's goal
 pub async fn optimize_search_config(
     settings: &AppSettings,
@@ -2802,7 +3131,7 @@ pub async fn optimize_search_config(
         .collect();
 
     if has_live_ai(settings) {
-        let system = "Te egy senior B2B lead-generálási és keresés-optimalizálási szakértő vagy. A saját projekt adatai, ajánlatai és a felhasználó instrukciója alapján optimalizáld a keresési paramétereket MAGYAR nyelven, hogy maximális relevanciájú, konvertálható cégeket találjon a rendszer. Kizárólag JSON-t adj vissza pontosan ezekkel a kulcsokkal: name, query (tömör, ütős keresőszó város nélkül), industry, location, company_size ('any'|'1-10'|'11-50'|'51-200'|'200+'), target_problem (konkrét, weboldalon ellenőrizhető hiányosság), source ('smart_hybrid'|'duckduckgo'|'gmaps_scraper'|'ai_cli_search'|'osm'), max_results (minimum 1, felső korlát nélkül), auto_enrich_threshold (60..85), offer_id (null vagy a legjobban illő ajánlat ID-ja), reasoning (2-3 mondat magyarul, miért így állítottad be).";
+        let system = "Te egy senior B2B lead-generálási és keresés-optimalizálási szakértő vagy. A saját projekt adatai, ajánlatai és a felhasználó instrukciója alapján optimalizáld a keresési paramétereket MAGYAR nyelven, hogy maximális relevanciájú, konvertálható cégeket találjon a rendszer. Kizárólag JSON-t adj vissza pontosan ezekkel a kulcsokkal: name, query (tömör, ütős keresőszó város nélkül), industry, location, company_size ('any' vagy 'MIN-MAX' szabad tartomány, pl. '1-50', '5-100', '10-200'), target_problem (konkrét, weboldalon ellenőrizhető hiányosság), source ('smart_hybrid'|'duckduckgo'|'gmaps_scraper'|'ai_cli_search'|'osm'), max_results (minimum 1, felső korlát nélkül), auto_enrich_threshold (60..85), offer_id (null vagy a legjobban illő ajánlat ID-ja), reasoning (2-3 mondat magyarul, miért így állítottad be).";
         let user = format!(
             "SAJÁT PROJEKT:\nNév: {}\nÉrtékajánlat: {}\nCélközönség: {}\nMegoldott problémák: {:?}\nAjánlatok: {}\n\nJELENLEGI KERESÉS:\nNév: {}\nKulcsszó: {}\nIparág: {}\nLokáció: {}\nCégméret: {}\nCélprobléma: {}\nForrás: {}\n\nFELHASZNÁLÓ KÉRÉSE / CÉLJA:\n{}",
             project.name,
@@ -2832,7 +3161,7 @@ pub async fn optimize_search_config(
                         query: v["query"].as_str().unwrap_or(&current.query).to_string(),
                         industry: v["industry"].as_str().unwrap_or(&current.industry).to_string(),
                         location: v["location"].as_str().unwrap_or(&current.location).to_string(),
-                        company_size: v["company_size"].as_str().unwrap_or(&current.company_size).to_string(),
+                        company_size: normalize_company_size(v["company_size"].as_str().unwrap_or(&current.company_size)),
                         target_problem: v["target_problem"].as_str().unwrap_or(&current.target_problem).to_string(),
                         source: v["source"].as_str().unwrap_or("smart_hybrid").to_string(),
                         max_results: v["max_results"].as_i64().unwrap_or(15).max(1),
@@ -3003,6 +3332,115 @@ mod tests {
             ),
             "Business Coach Kft."
         );
+    }
+
+    #[test]
+    fn test_human_handoff_requests_are_detected() {
+        for text in [
+            "Élő emberrel beszélhetek?",
+            "Szeretnék egy élő emberrel beszélni",
+            "Hívjanak fel telefonon!",
+            "Kérek egy visszahívást",
+            "Van ügyfélszolgálatuk?",
+            "Nem robottal akarok beszélni",
+            "Személyesen szeretném megbeszélni",
+            "Munkatársukkal beszélnék",
+        ] {
+            assert!(
+                is_human_handoff_request(&text.to_lowercase()),
+                "handoff várt: {}",
+                text
+            );
+        }
+        for text in [
+            "Mennyibe kerül az előfizetés?",
+            "Szeretnék időpontot foglalni keddre",
+            "Köszönöm, nem érdekel",
+            "Kérem a demót",
+            "Mikor ér rá egy hívásra?",
+        ] {
+            assert!(
+                !is_human_handoff_request(&text.to_lowercase()),
+                "nem handoff: {}",
+                text
+            );
+        }
+    }
+
+    #[test]
+    fn test_company_size_range_parsing() {
+        assert_eq!(parse_company_size_range("any"), (1, 10_000));
+        assert_eq!(parse_company_size_range("1-50"), (1, 50));
+        assert_eq!(parse_company_size_range("5-100"), (5, 100));
+        assert_eq!(parse_company_size_range("200+"), (200, 10_000));
+        assert_eq!(parse_company_size_range("11-50"), (11, 50));
+        assert_eq!(normalize_company_size("11-50"), "11-50");
+        assert_eq!(normalize_company_size("any"), "any");
+    }
+
+    #[test]
+    fn test_public_sector_rejected_even_for_civil_search() {
+        let search = SearchJob {
+            id: "s1".into(),
+            project_id: "p1".into(),
+            project_name: "OKOSűrlap".into(),
+            offer_id: None,
+            offer_title: None,
+            name: "Egyesületek — online tagfelvétel".into(),
+            query: "egyesület tagfelvétel tagdíj".into(),
+            industry: "egyesület tagfelvétel tagdíj".into(),
+            location: "Budapest".into(),
+            company_size: "1-50".into(),
+            target_problem: "nincs online jelentkezési űrlap".into(),
+            source: "smart_hybrid".into(),
+            max_results: 50,
+            auto_audit: true,
+            auto_enrich_threshold: 70,
+            status: "running".into(),
+            leads_found: 0,
+            promising_count: 0,
+            last_error: None,
+            last_run_at: None,
+            created_at: String::new(),
+        };
+        let make_lead = |name: &str, domain: &str| Lead {
+            id: "l1".into(),
+            company_name: name.into(),
+            domain: domain.into(),
+            website_url: format!("https://{}", domain),
+            industry: "egyesület".into(),
+            location: "Budapest".into(),
+            address: String::new(),
+            phone: String::new(),
+            primary_email: String::new(),
+            employee_estimate: String::new(),
+            google_rating: None,
+            google_reviews: None,
+            source: String::new(),
+            status: "new".into(),
+            fit_score: 0,
+            enriched: false,
+            company_summary: String::new(),
+            pain_points: vec![],
+            how_we_can_help: String::new(),
+            recommended_pitch: String::new(),
+            tech_stack: vec![],
+            contacts: vec![],
+            audit: None,
+            tags: vec![],
+            notes: String::new(),
+            searches: vec![],
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let onkorm = make_lead("Budapest Főváros Önkormányzata", "budapest.hu");
+        assert!(!check_search_relevance(Some(&search), &onkorm, None, "tagdíj ügyintézés", "önkormányzati hivatal"));
+        let birosag = make_lead("Magyarország Bíróságai", "birosag.hu");
+        assert!(!check_search_relevance(Some(&search), &birosag, None, "bírósági eljárás", "országos bírósági hivatal"));
+        let noe = make_lead("Nagycsaládosok Országos Egyesülete", "tagsag.noe.hu");
+        assert!(check_search_relevance(Some(&search), &noe, None, "egyesület tagfelvétel tagdíj online", "egyesület tagfelvétel"));
+        assert_eq!(estimate_headcount_mid("250-500 fő"), Some(375));
+        assert_eq!(estimate_headcount_mid("1000+ fő"), Some(1000));
     }
 
     #[test]
@@ -3245,6 +3683,7 @@ mod tests {
                 &lead,
                 inbound,
                 &[],
+                None,
             )
             .await;
             if c.suggested_reply.trim().is_empty() {
@@ -3256,5 +3695,135 @@ mod tests {
                 inbound
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_human_needed_mail_gets_no_draft_but_question() {
+        // Panasz/jogi jellegű levél: nincs automatikus válasz, helyette
+        // emberi tanácskérés születik.
+        let settings = AppSettings::default();
+        let project = make_test_project();
+        let lead = make_test_lead();
+
+        let c = classify_and_draft_reply(
+            &settings,
+            &project,
+            None,
+            "",
+            "on_interest",
+            "",
+            &lead,
+            "Felháborító a szolgáltatásuk! Panaszt teszek, és ha nem térítik vissza a díjat, ügyvédhez fordulok!",
+            &[],
+            None,
+        )
+        .await;
+        assert_eq!(c.intent, "needs_human");
+        assert!(c.needs_human);
+        assert!(c.suggested_reply.trim().is_empty());
+        assert!(!c.human_question.trim().is_empty());
+    }
+
+    fn make_test_single_lead() -> Lead {
+        Lead {
+            id: "l2".into(),
+            company_name: "Sziráki Coaching".into(),
+            domain: String::new(),
+            website_url: String::new(),
+            industry: String::new(),
+            location: String::new(),
+            address: String::new(),
+            phone: String::new(),
+            primary_email: "edit.sziraki@szirakicoaching.hu".into(),
+            employee_estimate: String::new(),
+            google_rating: None,
+            google_reviews: None,
+            source: String::new(),
+            status: "new".into(),
+            fit_score: 0,
+            enriched: false,
+            company_summary: "Sziráki Edit executive coach".into(),
+            pain_points: vec![],
+            how_we_can_help: String::new(),
+            recommended_pitch: String::new(),
+            tech_stack: vec![],
+            contacts: vec![],
+            audit: None,
+            tags: vec![],
+            notes: String::new(),
+            searches: vec![],
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_single_person_reply_uses_singular_and_subscription_cta() {
+        let settings = AppSettings::default();
+        let project = make_test_project();
+        let lead = make_test_single_lead();
+
+        // Kérdés: egyes szám + előfizetés a fő CTA, időpont csak másodlagos.
+        let c = classify_and_draft_reply(
+            &settings,
+            &project,
+            None,
+            "",
+            "on_interest",
+            "",
+            &lead,
+            "Mennyibe kerül a megoldás, és hogyan működik a fizetés?",
+            &[],
+            None,
+        )
+        .await;
+        assert!(c.suggested_reply.starts_with("Kedves Edit!\n\n"));
+        assert!(c.suggested_reply.contains("találja"));
+        assert!(!c.suggested_reply.contains("találják"));
+        assert!(!c.suggested_reply.contains("Önök"));
+        assert!(c.suggested_reply.contains("előfizetést"));
+        assert!(c.suggested_reply.contains("https://okosurlap.hu"));
+
+        // Kifejezett időpontkérés: a foglaló link marad, de egyes számban.
+        let c = classify_and_draft_reply(
+            &settings,
+            &project,
+            None,
+            "",
+            "on_interest",
+            "",
+            &lead,
+            "Szeretnénk időpontot egyeztetni egy bemutatóra a jövő héten.",
+            &[],
+            None,
+        )
+        .await;
+        assert!(c.suggested_reply.starts_with("Kedves Edit!\n\n"));
+        assert!(c.suggested_reply.contains("Önnek megfelelő"));
+        assert!(!c.suggested_reply.contains("tudnak"));
+        assert!(!c.suggested_reply.contains("Önök"));
+    }
+
+    #[tokio::test]
+    async fn test_team_reply_uses_plural() {
+        let settings = AppSettings::default();
+        let project = make_test_project();
+        let lead = make_test_lead();
+
+        let c = classify_and_draft_reply(
+            &settings,
+            &project,
+            None,
+            "",
+            "on_interest",
+            "",
+            &lead,
+            "Mennyibe kerül a megoldás, és hogyan működik a fizetés?",
+            &[],
+            None,
+        )
+        .await;
+        assert!(c.suggested_reply.starts_with("Kedves ProMan Csapat!\n\n"));
+        assert!(c.suggested_reply.contains("találják"));
     }
 }

@@ -376,11 +376,13 @@ pub async fn execute_search_pipeline(
                     continuous,
                 );
                 empty_rounds += 1;
-                if empty_rounds >= 3 {
+                if !continuous && empty_rounds >= 3 {
                     break;
                 }
                 round += 1;
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                // Folyamatos módban hosszabb várakozás ismételt hiba esetén, de SOHA nem állunk le magunktól!
+                let wait_secs = if continuous { 5 } else { 2 };
+                tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
                 continue;
             }
         };
@@ -421,11 +423,13 @@ pub async fn execute_search_pipeline(
                 global_batch,
                 continuous,
             );
-            if !continuous || empty_rounds >= 4 {
+            if !continuous {
                 break;
             }
             round += 1;
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            // Folyamatos módban üres kör után backoff-pal folytatjuk — csak a Stop gomb állíthatja le!
+            let wait_secs = (2 + empty_rounds.min(10) as u64).min(12);
+            tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
             continue;
         }
         empty_rounds = 0;
@@ -1179,7 +1183,7 @@ ELÉRHETŐ ESZKÖZÖK (MINDEN VALÓBAN VÉGREHAJTÓDIK):
 - enrich_leads: {"leadIds":[],"minScore":70}
 - create_project: {"name","websiteUrl","industry","description","bookingUrl","landingUrl"}
 - crawl_project: {"projectId":"id|LAST"}
-- create_search: {"projectId":"id|LAST","name","query","industry","location","companySize":"any|1-10|11-50|51-200|200+","targetProblem","source":"smart_hybrid|duckduckgo|gmaps_scraper|ai_cli_search|osm","maxResults":15,"autoAudit":true,"autoEnrichThreshold":70}
+- create_search: {"projectId":"id|LAST","name","query","industry","location","companySize":"any vagy MIN-MAX tartomány, pl. 1-50, 5-100 (az állami/önkormányzati/óriás szervezetek automatikusan kizárva)","targetProblem","source":"smart_hybrid|duckduckgo|gmaps_scraper|ai_cli_search|osm","maxResults":15,"autoAudit":true,"autoEnrichThreshold":70}
 - update_search: {"searchId":"id|activeSearchId","name","query","industry","location","companySize","targetProblem","source","maxResults","autoEnrichThreshold"}
 - run_search: {"searchId":"id|LAST|activeSearchId","continuous":false}
 - stop_search: {"searchId":"id|activeSearchId"}
@@ -1806,7 +1810,7 @@ FONTOS: Ha a felhasználó konkrét műveletet kér (pl. törlés, státuszvált
                     query: q.clone(),
                     industry: args["industry"].as_str().unwrap_or(&q).to_string(),
                     location: loc,
-                    company_size: args["companySize"].as_str().unwrap_or("any").to_string(),
+                    company_size: crate::ai::normalize_company_size(args["companySize"].as_str().unwrap_or("any")),
                     target_problem: args["targetProblem"].as_str().unwrap_or_default().to_string(),
                     source: args["source"].as_str().unwrap_or("smart_hybrid").to_string(),
                     max_results: args["maxResults"].as_i64().unwrap_or(15).max(1),
@@ -1842,7 +1846,7 @@ FONTOS: Ha a felhasználó konkrét műveletet kér (pl. törlés, státuszvált
                             query: args["query"].as_str().unwrap_or(&cur.query).to_string(),
                             industry: args["industry"].as_str().unwrap_or(&cur.industry).to_string(),
                             location: args["location"].as_str().unwrap_or(&cur.location).to_string(),
-                            company_size: args["companySize"].as_str().unwrap_or(&cur.company_size).to_string(),
+                            company_size: crate::ai::normalize_company_size(args["companySize"].as_str().unwrap_or(&cur.company_size)),
                             target_problem: args["targetProblem"].as_str().unwrap_or(&cur.target_problem).to_string(),
                             source: args["source"].as_str().unwrap_or(&cur.source).to_string(),
                             max_results: args["maxResults"].as_i64().unwrap_or(cur.max_results).max(1),

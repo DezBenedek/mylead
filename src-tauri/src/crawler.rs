@@ -50,7 +50,15 @@ fn build_client() -> Result<Client, String> {
 
 fn extract_clean_text(doc: &Html) -> String {
     let body_sel = Selector::parse("body").unwrap();
-    let skip_tags = ["script", "style", "noscript", "svg", "iframe"];
+    let skip_tags = [
+        "script", "style", "noscript", "svg", "iframe", "header", "footer", "nav", "aside",
+    ];
+    // Sablon-zaj: süti-sávok, felugrók, átfedő rétegek — ezek minden aloldalon
+    // ismétlődnének, és elnyomnák a valódi tartalmat az AI-elemzés elől.
+    const BOILERPLATE_CLASS: &[&str] = &[
+        "cookie", "suti", "consent", "popup", "modal", "overlay", "offcanvas", "toast",
+        "snackbar",
+    ];
     let mut parts = Vec::new();
     if let Some(body) = doc.select(&body_sel).next() {
         for node in body.descendants() {
@@ -60,6 +68,16 @@ fn extract_clean_text(doc: &Html) -> String {
                 while let Some(p) = parent {
                     if let Some(el) = p.value().as_element() {
                         if skip_tags.contains(&el.name()) {
+                            skip = true;
+                            break;
+                        }
+                        let class_id = format!(
+                            "{} {}",
+                            el.attr("class").unwrap_or_default(),
+                            el.attr("id").unwrap_or_default()
+                        )
+                        .to_lowercase();
+                        if BOILERPLATE_CLASS.iter().any(|b| class_id.contains(b)) {
                             skip = true;
                             break;
                         }
@@ -78,6 +96,32 @@ fn extract_clean_text(doc: &Html) -> String {
     let joined = parts.join(" ");
     let ws = Regex::new(r"\s+").unwrap();
     ws.replace_all(&joined, " ").trim().to_string()
+}
+
+/// Megállapítja, hogy egy aloldal-kivonat túlnyomórészt olyan szöveg-e, ami
+/// már szerepel az eddig gyűjtött tartalomban (menü / lábléc / sablonismétlés).
+/// Ilyenkor az aloldal szövegét nem fűzzük hozzá, hogy a 12 000 karakteres
+/// keretbe valódi, egyedi tartalom kerüljön az AI-elemzéshez.
+fn is_boilerplate_repeat(snippet: &str, collected: &str) -> bool {
+    let words: Vec<&str> = snippet.split_whitespace().collect();
+    if words.len() < 30 || collected.len() < 200 {
+        return false;
+    }
+    let mut total = 0usize;
+    let mut dup = 0usize;
+    let mut i = 0;
+    while i + 25 <= words.len() {
+        let window = words[i..i + 25].join(" ");
+        total += 1;
+        if collected.contains(&window) {
+            dup += 1;
+        }
+        i += 12;
+    }
+    if total == 0 {
+        return false;
+    }
+    dup * 100 / total >= 55
 }
 
 fn decode_cfemail(hex: &str) -> Option<String> {
@@ -589,10 +633,14 @@ where
                     let sub_doc = Html::parse_document(&sub_html);
                     let sub_text = extract_clean_text(&sub_doc);
                     let sub_snippet: String = sub_text.chars().take(2500).collect();
-                    all_text.push_str("\n\n--- ALOLDAL: ");
-                    all_text.push_str(sub);
-                    all_text.push_str(" ---\n");
-                    all_text.push_str(&sub_snippet);
+                    // Sablonismétlés (azonos menü / lábléc minden aloldalon):
+                    // nem fűzzük hozzá, hogy valódi tartalom maradjon a keretben.
+                    if !is_boilerplate_repeat(&sub_snippet, &all_text) {
+                        all_text.push_str("\n\n--- ALOLDAL: ");
+                        all_text.push_str(sub);
+                        all_text.push_str(" ---\n");
+                        all_text.push_str(&sub_snippet);
+                    }
 
                     all_html_lower.push_str(&sub_html.to_lowercase());
 
@@ -882,4 +930,46 @@ where
         meta_description,
         audit,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boilerplate_elements_are_excluded_from_text() {
+        let html = r#"<html><body>
+            <header><nav>Főoldal Rólunk Árak Kapcsolat</nav></header>
+            <main><h1>Okos űrlap mindenkinek</h1><p>Árajánlatkérés és időpontfoglalás egy űrlapon.</p></main>
+            <div class="cookie-consent">Ez az oldal sütiket használ. Elfogadom.</div>
+            <div id="popup-overlay">Iratkozz fel hírlevelünkre!</div>
+            <footer>© 2026 Cég Kft. Minden jog fenntartva.</footer>
+        </body></html>"#;
+        let text = extract_clean_text(&Html::parse_document(html));
+        assert!(text.contains("Okos űrlap mindenkinek"), "fő tartalom: {}", text);
+        assert!(!text.contains("Főoldal Rólunk"), "navigáció: {}", text);
+        assert!(!text.contains("sütiket használ"), "süti-sáv: {}", text);
+        assert!(!text.contains("hírlevelünkre"), "popup: {}", text);
+        assert!(!text.contains("Minden jog fenntartva"), "lábléc: {}", text);
+    }
+
+    #[test]
+    fn repeated_template_text_is_detected() {
+        // 50 közös szó (menü + sablon), utána eltérő folytatás.
+        let shared = "Főoldal Rólunk Szolgáltatások Árak Kapcsolat Belépés Regisztráció Hírek Blog GYIK Árajánlatkérés és időpontfoglalás egy űrlapon keresztül könnyedén és gyorsan megoldható mindenféle extra költség nélkül akár hétvégén is folyamatosan Cégünk tizenöt éve foglalkozik online marketinggel és weboldal készítéssel Budapesten számos referenciával és elégedett ügyféllel büszkélkedhetünk ezért válasszon minket bizalommal köszönjük érdeklődését";
+        let collected = format!(
+            "{} ez egy teljesen más folytatás ami nem egyezik meg semmiben sem az előző szöveggel hiszen más szavakból áll össze egészében",
+            shared
+        );
+        let repeat = format!(
+            "{} továbbá kedvezményes csomagok és akciók folyamatosan elérhetők minden kedves látogatónk számára még ma érdemes körülnézni az ajánlatok között is bátran",
+            shared
+        );
+        assert!(is_boilerplate_repeat(&repeat, &collected));
+        assert!(!is_boilerplate_repeat(
+            "Az esküvői fotózás árairól és csomagjairól részletes tájékoztatást talál a galéria alatt, kérjen ajánlatot telefonon vagy e-mailben, munkatársunk hamarosan válaszol minden megkeresésre. Vállalunk családi rendezvényeket keresztelőket születésnapokat és céges eseményeket is országszerte kedvező áron.",
+            &collected
+        ));
+        assert!(!is_boilerplate_repeat("Rövid.", &collected));
+    }
 }

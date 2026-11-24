@@ -27,7 +27,10 @@ pub struct DiscoveredCompany {
     pub source: String,
 }
 
-/// Aggregators, social networks, news portals, authorities, PDF repositories, and business directories to exclude from direct B2B company leads
+/// Aggregators, social networks, news portals, authorities, PDF repositories, business directories, and
+/// Hungarian municipal / state administration sites to exclude from direct B2B company leads.
+/// (Municipal district sites like budapest.hu, bpxv.hu, kobanya.hu would otherwise flood
+/// civil/association searches with non-marketable public administration hits.)
 const NOISE_DOMAINS: &[&str] = &[
     "facebook.com",
     "instagram.com",
@@ -130,6 +133,23 @@ const NOISE_DOMAINS: &[&str] = &[
     "wolt.com",
     "foodora.hu",
     "netpincer.hu",
+    // Hungarian municipal / state administration portals (never B2B-outreach targets)
+    "budapest.hu",
+    "bpxv.hu",
+    "kobanya.hu",
+    "jozsefvaros.hu",
+    "erzsebetvaros.hu",
+    "birosag.hu",
+    "kormany.hu",
+    "magyarorszag.hu",
+    "parlament.hu",
+    "police.hu",
+    "katasztrofavedelem.hu",
+    "honvedelem.hu",
+    "allamkincstar.gov.hu",
+    "oep.hu",
+    "neak.gov.hu",
+    "onkormanyzat.net",
 ];
 
 fn enriched_path_env() -> String {
@@ -168,12 +188,118 @@ pub fn is_noise_domain(domain: &str) -> bool {
     if d.is_empty() {
         return false;
     }
-    if d.ends_with(".gov.hu") || d.ends_with(".gov") || d.ends_with(".gov.uk") || d.ends_with(".edu") {
+    if d.ends_with(".gov.hu") || d.ends_with(".gov") || d.ends_with(".gov.uk") || d.ends_with(".edu") || d.ends_with(".mil") {
+        return true;
+    }
+    // Hungarian municipal / state subdomains (e.g. bpxv.onkormanyzat.hu, info.birosag.hu)
+    if d.contains("onkormanyzat") || d.contains("polgarmester") || d.contains("kormanyhivatal") || d.contains("jarasihivatal") {
         return true;
     }
     NOISE_DOMAINS
         .iter()
         .any(|noise| d == *noise || d.ends_with(&format!(".{}", noise)))
+}
+
+/// Hard exclusion for Hungarian public-administration / authority hits that must never
+/// become B2B outreach leads (municipalities, mayor's offices, courts, ministries,
+/// police/disaster-management/defence, tax/pension/health-insurance authorities,
+/// school districts). Civil membership orgs (egyesület, alapítvány, szövetség,
+/// kamara, társaság, klub, kör) are explicitly NOT excluded here.
+pub fn is_public_sector_lead(name: &str, domain: &str) -> bool {
+    let norm = |s: &str| {
+        s.to_lowercase()
+            .chars()
+            .map(|c| match c {
+                'á' => 'a',
+                'é' => 'e',
+                'í' => 'i',
+                'ó' | 'ö' | 'ő' => 'o',
+                'ú' | 'ü' | 'ű' => 'u',
+                _ => c,
+            })
+            .collect::<String>()
+    };
+    let n = norm(name);
+    let d = norm(domain);
+    // Domain-level: never outreach targets
+    if d.ends_with(".gov.hu") || d.ends_with(".gov") || d.ends_with(".mil") {
+        return true;
+    }
+    let official_markers = [
+        "onkormanyzat",
+        "polgarmester",
+        "kepviselo-testulet",
+        "kepviselotestulet",
+        "kormanyhivatal",
+        "jarasi hivatal",
+        "jarasihivatal",
+        "birosag",
+        "torvenyszek",
+        "itelotabla",
+        "ugyeszseg",
+        "rendorseg",
+        "katasztrofavedelem",
+        "honvedseg",
+        "honvedelem",
+        "miniszterium",
+        "orszaggyules",
+        "allamkincstar",
+        "tankeruleti",
+        "tankerulet",
+        "oktatasi hivatal",
+        "adohatosag",
+        "adohivatal",
+        "nyugdij",
+        "egeszsegbiztosit",
+        "nepegeszsegugy",
+        "kozutkezelo",
+        "kataszter",
+        "foldhivatal",
+    ];
+    if official_markers.iter().any(|m| n.contains(m) || d.contains(&m.replace(' ', ""))) {
+        return true;
+    }
+    // "Országos / Megyei / Fővárosi ... Hivatal / Hatóság / Szolgálat / Bíróság" combos —
+    // but plain "Országos Egyesület / Szövetség / Kamara" stays VALID.
+    let has_geo_admin_prefix = n.contains("orszagos")
+        || n.contains("megyei")
+        || n.contains("fovarosi")
+        || n.contains("fo varosi")
+        || n.contains("keruleti")
+        || n.contains("jarasi");
+    let has_admin_suffix =
+        n.contains("hivatal") || n.contains("hatosag") || n.contains("birosag") || n.contains("szolgalat") || n.contains("szakszolgalat") || n.contains("kormany");
+    if has_geo_admin_prefix && has_admin_suffix {
+        // Double-check it is not a civil org despite the prefix
+        let is_civil = ["egyesulet", "alapitvany", "szovetseg", "kamara", "tarsasag", "klub", "kor ", "egylet"]
+            .iter()
+            .any(|m| n.contains(m));
+        if !is_civil {
+            return true;
+        }
+    }
+    // Exact known municipal portal brand names without the word "önkormányzat"
+    // (e.g. "Budapest Főváros", "Józsefváros", "Kőbányai", "Erzsébetváros" + district offices)
+    let municipal_brands = [
+        "budapest fovaros",
+        "jozsefvarosi",
+        "jozsefvaros",
+        "kobanyai",
+        "kobanya",
+        "erzsebetvaros",
+        "xv. kerulet",
+        "magyarorszag birosagai",
+        "orszagos birosagi hivatal",
+    ];
+    if municipal_brands.iter().any(|m| n.contains(m)) {
+        let is_civil = ["egyesulet", "alapitvany", "szovetseg", "tarsasag", "klub", "kor "]
+            .iter()
+            .any(|m| n.contains(m));
+        if !is_civil {
+            return true;
+        }
+    }
+    false
 }
 
 fn to_root_homepage(raw_url: &str) -> String {
@@ -491,6 +617,9 @@ fn merge_and_rank_companies(raw: Vec<DiscoveredCompany>, limit: usize) -> Vec<Di
         if is_noise_domain(&domain) {
             continue;
         }
+        if is_public_sector_lead(&c.company_name, &domain) {
+            continue;
+        }
         if !c.website_url.trim().is_empty() {
             c.website_url = to_root_homepage(&c.website_url);
         }
@@ -590,22 +719,54 @@ pub async fn discover_companies_for_round(
             "Debrecen", "Győr", "Szeged", "Pécs", "Miskolc", "Székesfehérvár",
             "Kecskemét", "Nyíregyháza", "Szombathely", "Veszprém", "Eger", "Sopron",
         ];
+        let hu_regions = [
+            "Pest megye", "Fejér megye", "Győr-Moson-Sopron megye", "Hajdú-Bihar megye",
+            "Csongrád-Csanád megye", "Baranya megye", "Borsod-Abaúj-Zemplén megye",
+            "Veszprém megye", "Vas megye", "Zala megye", "Bács-Kiskun megye", "Heves megye",
+        ];
         // Avoid bare "Bt" which matches British Telecom (bt.com / UK news) in search engines
         let modifiers = [
             "szolgáltatások", "kapcsolat", "jelentkezés", "időpont",
             "Kft", "központ", "stúdió", "akadémia", "iroda", "szakértő",
         ];
+        let extra_modifiers = [
+            "árak", "vélemények", "nyitvatartás", "elérhetőség",
+            "bemutatkozás", "referenciák", "csapat", "munkatársak",
+        ];
 
-        let modifier = modifiers[(round - 2) % modifiers.len()];
-        if loc_lower.contains("budapest") {
-            let dist = bp_districts[(round - 2) % bp_districts.len()];
-            expanded.location = dist.to_string();
-            expanded.query = format!("{} {}", search.query.trim(), modifier);
-        } else if search.location.trim().is_empty() || loc_lower.contains("magyar") || loc_lower.contains("országos") {
-            let city = hu_cities[(round - 2) % hu_cities.len()];
-            expanded.location = city.to_string();
+        let idx = round - 2;
+        let modifier = modifiers[idx % modifiers.len()];
+        // Minden N. körben második módosítót is adunk, hogy a kombinációk ne ismétlődjenek hamar!
+        let cycle = idx / modifiers.len();
+        let extra = if cycle > 0 {
+            format!(" {}", extra_modifiers[cycle % extra_modifiers.len()])
         } else {
-            expanded.query = format!("{} {}", search.query.trim(), modifier);
+            String::new()
+        };
+        if loc_lower.contains("budapest") {
+            // Kerületek + régiók váltogatása, hogy több tucat egyedi kör kiteljen ismétlés nélkül!
+            let all_areas: Vec<&str> = bp_districts.iter().chain(hu_regions.iter()).map(|s| *s).collect();
+            let dist = all_areas[idx % all_areas.len()];
+            expanded.location = dist.to_string();
+            expanded.query = format!("{} {}{}", search.query.trim(), modifier, extra);
+        } else if search.location.trim().is_empty() || loc_lower.contains("magyar") || loc_lower.contains("országos") {
+            let city_idx = idx % hu_cities.len();
+            let city_cycle = idx / hu_cities.len();
+            let city = hu_cities[city_idx];
+            expanded.location = city.to_string();
+            // Országos keresésnél is variáljuk a kulcsszót, különben minden kör ugyanazt adná!
+            if city_cycle > 0 || idx % 2 == 1 {
+                expanded.query = format!("{} {}{}", search.query.trim(), modifier, extra);
+            }
+        } else {
+            let region = hu_regions[idx % hu_regions.len()];
+            // Vidéki fix helynél felváltva: egyszer módosító, egyszer szomszédos régió — így nem fogy ki!
+            if idx % 2 == 0 {
+                expanded.query = format!("{} {}{}", search.query.trim(), modifier, extra);
+            } else {
+                expanded.query = format!("{} {}{}", search.query.trim(), modifier, extra);
+                expanded.location = format!("{} környéke", region);
+            }
         }
     }
 
@@ -720,18 +881,45 @@ async fn discover_via_ddgs(search: &SearchJob, limit: usize) -> Result<Vec<Disco
         .trim()
         .to_string();
 
-    // Multi-angle Hungarian/B2B queries to maximize real company websites (not news/articles/foreign telecoms)
-    let queries = vec![
-        format!("{} kapcsolat OR jelentkezés", base_q),
-        format!("{} szolgáltatások OR árak -hirek -cikk -pdf", base_q),
-        if !search.industry.trim().is_empty()
-            && !search.industry.eq_ignore_ascii_case(&search.query)
-        {
-            format!("{} {} Kft OR központ OR stúdió kapcsolat", search.industry.trim(), search.location.trim())
-        } else {
-            format!("{} Kft OR központ OR akadémia OR stúdió", base_q)
-        },
-    ];
+    // Multi-angle Hungarian/B2B queries to maximize real company websites (not news/articles/foreign telecoms).
+    // Municipal / authority noise is explicitly negated so "egyesület / tagfelvétel" style
+    // civil searches don't drown in önkormányzat / hivatal / bíróság hits.
+    let noise_neg = "-önkormányzat -polgármester -hivatal -bíróság -minisztérium -hatóság";
+    let civil_search = {
+        let ql = format!("{} {}", search.query, search.industry).to_lowercase();
+        ql.contains("egyesület")
+            || ql.contains("egyesulet")
+            || ql.contains("egyesülete")
+            || ql.contains("alapítvány")
+            || ql.contains("alapítvany")
+            || ql.contains("civil")
+            || ql.contains("szövetség")
+            || ql.contains("szovetseg")
+            || ql.contains("tagfelvétel")
+            || ql.contains("tagdíj")
+            || ql.contains("tagdij")
+    };
+    let queries = if civil_search {
+        vec![
+            format!("{} tagfelvétel OR tagdíj {} -site:gov.hu", base_q, noise_neg),
+            format!("{} egyesület OR alapítvány kapcsolat jelentkezés {}", base_q, noise_neg),
+            format!("{} {} {}", search.industry.trim(), search.location.trim(), noise_neg)
+                .trim()
+                .to_string(),
+        ]
+    } else {
+        vec![
+            format!("{} kapcsolat OR jelentkezés {}", base_q, noise_neg),
+            format!("{} szolgáltatások OR árak -hirek -cikk -pdf {}", base_q, noise_neg),
+            if !search.industry.trim().is_empty()
+                && !search.industry.eq_ignore_ascii_case(&search.query)
+            {
+                format!("{} {} Kft OR központ OR stúdió kapcsolat {}", search.industry.trim(), search.location.trim(), noise_neg)
+            } else {
+                format!("{} Kft OR központ OR akadémia OR stúdió {}", base_q, noise_neg)
+            },
+        ]
+    };
 
     let py_script = r#"
 import json, sys
@@ -796,8 +984,12 @@ print(json.dumps(out, ensure_ascii=False))
         if domain.is_empty() || is_noise_domain(&domain) || href_lower.ends_with(".pdf") {
             continue;
         }
+        let cleaned = clean_company_title(&title, &domain);
+        if is_public_sector_lead(&cleaned, &domain) || is_public_sector_lead(&title, &domain) {
+            continue;
+        }
         out.push(DiscoveredCompany {
-            company_name: clean_company_title(&title, &domain),
+            company_name: cleaned,
             website_url: to_root_homepage(&href),
             industry: if search.industry.trim().is_empty() {
                 search.query.clone()
@@ -928,6 +1120,10 @@ async fn discover_via_gmaps_scraper(
             .to_string();
         let rating = r["review_rating"].as_f64();
         let reviews = r["review_count"].as_i64();
+        let web_domain = extract_domain(&website);
+        if is_public_sector_lead(&name, &web_domain) {
+            continue;
+        }
 
         out.push(DiscoveredCompany {
             company_name: name,
@@ -994,9 +1190,10 @@ async fn discover_via_ai_cli(
 
 FONTOS SZABÁLYOK:
 1. KIZÁRÓLAG olyan valódi cégek saját hivatalos weboldalát add vissza, amelyek TÉNYLEG a megadott iparágban ({industry} / {query}) működnek és megfelelnek a keresett problémának ({problem})! Soha ne adj vissza más iparágú céget, hírportált, hatóságot, gyűjtőoldalt vagy PDF-et!
-2. A "company_name" mezőben MINDIG a cég, márka vagy szakember VALÓDI, hivatalos nevét add meg (pl. "Gordio Csoport", "Sugár Márton Coaching", "ASCON Consulting") — SOHA ne adj meg aloldal-címet vagy SEO kulcsszót (mint "Coaching árak" vagy "Főoldal")!
-3. Ne találj ki domain neveket — csak olyan cégeket adj vissza, amiket a webkeresésed ténylegesen megtalált!
-4. Kizárólag érvényes JSON objektumot adj vissza semmilyen magyarázat nélkül, pontosan ebben a formátumban:
+2. SZIGORÚAN TILOS visszaadni: önkormányzatot, polgármesteri hivatalt, járási / kormányhivatalt, bíróságot / törvényszéket / ügyészséget, rendőrséget / katasztrófavédelmet / honvédséget, minisztériumot, NAV / adóhatóságot / államkincstárat / tankerületet, és bármilyen 250+ fős állami óriásszervezetet! Ezek egyike sem jó lead — még akkor sem, ha a kulcsszóra ráillenek!
+3. A "company_name" mezőben MINDIG a cég, márka vagy szakember VALÓDI, hivatalos nevét add meg (pl. "Gordio Csoport", "Sugár Márton Coaching", "ASCON Consulting") — SOHA ne adj meg aloldal-címet vagy SEO kulcsszót (mint "Coaching árak" vagy "Főoldal")!
+4. Ne találj ki domain neveket — csak olyan cégeket adj vissza, amiket a webkeresésed ténylegesen megtalált!
+5. Kizárólag érvényes JSON objektumot adj vissza semmilyen magyarázat nélkül, pontosan ebben a formátumban:
 {{"companies":[{{"company_name":"...","website_url":"https://...","industry":"...","location":"...","address":"...","phone":"...","email":"..."}}]}}"#,
         limit = limit.min(20),
         query = search.query,
@@ -1190,7 +1387,7 @@ async fn discover_via_searxng(
         return Err("SearXNG URL nincs beállítva a Beállítások → Keresési API-k fülön.".to_string());
     }
     let client = build_client()?;
-    let q = format!("{} {} kapcsolat", search.query.trim(), search.location.trim());
+    let q = format!("{} {} kapcsolat -önkormányzat -polgármester -hivatal -bíróság", search.query.trim(), search.location.trim());
     let resp = client
         .get(format!("{}/search", base))
         .query(&[("q", q.as_str()), ("format", "json"), ("language", "hu")])
@@ -1211,8 +1408,12 @@ async fn discover_via_searxng(
             if domain.is_empty() || is_noise_domain(&domain) {
                 continue;
             }
+            let cleaned = clean_company_title(title, &domain);
+            if is_public_sector_lead(&cleaned, &domain) {
+                continue;
+            }
             out.push(DiscoveredCompany {
-                company_name: clean_company_title(title, &domain),
+                company_name: cleaned,
                 website_url: to_root_homepage(url),
                 industry: search.industry.clone(),
                 location: search.location.clone(),
@@ -1393,6 +1594,9 @@ async fn discover_via_osm_upgraded(search: &SearchJob, limit: usize) -> Result<V
                     .unwrap_or_default()
                     .to_string();
                 let address = item["display_name"].as_str().unwrap_or_default().to_string();
+                if is_public_sector_lead(&name, &extract_domain(&website)) {
+                    continue;
+                }
 
                 out.push(DiscoveredCompany {
                     company_name: name,
@@ -1552,6 +1756,9 @@ async fn discover_via_osm_upgraded(search: &SearchJob, limit: usize) -> Result<V
                                 .split_whitespace()
                                 .collect::<Vec<_>>()
                                 .join(" ");
+                            if is_public_sector_lead(&name, &extract_domain(&website)) {
+                                continue;
+                            }
 
                             out.push(DiscoveredCompany {
                                 company_name: name,
@@ -1578,4 +1785,28 @@ async fn discover_via_osm_upgraded(search: &SearchJob, limit: usize) -> Result<V
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_public_sector_leads_are_excluded() {
+        assert!(is_public_sector_lead("Budapest Főváros Önkormányzata", "budapest.hu"));
+        assert!(is_public_sector_lead("Józsefvárosi Önkormányzat", "jozsefvaros.hu"));
+        assert!(is_public_sector_lead("Magyarország Bíróságai (Országos Bírósági Hivatal)", "birosag.hu"));
+        assert!(is_public_sector_lead("Pest Megyei Területi Gyermekvédelmi Szakszolgálat", "veszely.hu"));
+        assert!(is_noise_domain("bpxv.hu"));
+        assert!(is_noise_domain("kobanya.hu"));
+    }
+
+    #[test]
+    fn test_civil_orgs_are_not_excluded() {
+        assert!(!is_public_sector_lead("Nagycsaládosok Országos Egyesülete (NOE)", "tagsag.noe.hu"));
+        assert!(!is_public_sector_lead("Budapesti Honismereti Társaság", "bpht.hu"));
+        assert!(!is_public_sector_lead("Magyar Számviteli Szakemberek Egyesülete", "mszsze.hu"));
+        assert!(!is_public_sector_lead("Rackhost Zrt.", "rackhost.hu"));
+        assert!(!is_noise_domain("bpht.hu"));
+    }
 }

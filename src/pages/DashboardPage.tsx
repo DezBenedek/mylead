@@ -13,6 +13,7 @@ import {
   Title,
 } from "@mantine/core";
 import {
+  IconAlertTriangle,
   IconArrowRight,
   IconBriefcase,
   IconDatabase,
@@ -30,17 +31,20 @@ import {
   YAxis,
 } from "recharts";
 import { formatShortDate } from "../lib/api";
-import type { AnalyticsOverview, NavSection } from "../types";
+import type { AnalyticsOverview, InboxThread, NavSection } from "../types";
 
 interface Props {
   analytics: AnalyticsOverview | null;
   loadingDemo: boolean;
   onLoadDemo: () => void;
   onNavigate: (section: NavSection) => void;
+  threads: InboxThread[];
+  onOpenThread: (threadKey: string) => void;
 }
 
-export function DashboardPage({ analytics, loadingDemo, onLoadDemo, onNavigate }: Props) {
+export function DashboardPage({ analytics, loadingDemo, onLoadDemo, onNavigate, threads, onOpenThread }: Props) {
   const isEmpty = !analytics || (analytics.totalProjects === 0 && analytics.totalLeads === 0);
+  const attentionThreads = threads.filter((t) => t.needsAdvice);
 
   return (
     <Box>
@@ -137,6 +141,64 @@ export function DashboardPage({ analytics, loadingDemo, onLoadDemo, onNavigate }
           </Paper>
         ) : (
           <Stack gap="lg">
+            {/* Human attention needed: AI asked for the owner's call */}
+            {attentionThreads.length > 0 && (
+              <Paper
+                p="sm"
+                withBorder
+                style={{
+                  borderColor: "var(--mantine-color-orange-4)",
+                  background: "var(--mantine-color-orange-0)",
+                }}
+              >
+                <Group justify="space-between" mb="xs" wrap="nowrap" gap="xs">
+                  <Group gap={8} wrap="nowrap" style={{ minWidth: 0 }}>
+                    <IconAlertTriangle size={16} color="var(--mantine-color-orange-6)" style={{ flexShrink: 0 }} />
+                    <Text fw={700} size="sm" truncate>
+                      Beavatkozást igényel ({attentionThreads.length})
+                    </Text>
+                  </Group>
+                  <Button
+                    size="compact-xs"
+                    color="orange"
+                    rightSection={<IconArrowRight size={12} />}
+                    onClick={() => onOpenThread(attentionThreads[0].threadKey)}
+                  >
+                    Megnyitás
+                  </Button>
+                </Group>
+                <Stack gap={4}>
+                  {attentionThreads.slice(0, 3).map((t) => (
+                    <Group key={t.threadKey} justify="space-between" wrap="nowrap" gap="sm">
+                      <Text size="xs" truncate style={{ flex: 1 }}>
+                        <Text span fw={600}>
+                          {t.leadCompany}
+                        </Text>
+                        <Text span c="dimmed">
+                          {" "}
+                          — {t.humanQuestion || t.subject || "Tanácsot kér az AI"}
+                        </Text>
+                      </Text>
+                      <Text
+                        size="11px"
+                        c="dimmed"
+                        className="ml-tabular"
+                        style={{ whiteSpace: "nowrap", cursor: "pointer" }}
+                        onClick={() => onOpenThread(t.threadKey)}
+                      >
+                        {formatShortDate(t.lastMessageAt)}
+                      </Text>
+                    </Group>
+                  ))}
+                  {attentionThreads.length > 3 && (
+                    <Text size="xs" c="dimmed">
+                      + {attentionThreads.length - 3} további a Beérkező oldalon.
+                    </Text>
+                  )}
+                </Stack>
+              </Paper>
+            )}
+
             {/* Key Metric Strip */}
             <SimpleGrid cols={{ base: 2, sm: 3, lg: 6 }} spacing="sm">
               <Box className="ml-kpi-card">

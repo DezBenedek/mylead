@@ -209,6 +209,8 @@ export interface SenderAccount {
   fromName: string;
   fromEmail: string;
   replyTo: string;
+  /** A valódi postafiók címe (válaszok ide, Reply-To automatikusan ez). */
+  mailboxEmail: string;
   smtpHost: string;
   smtpPort: number;
   smtpUsername: string;
@@ -226,6 +228,8 @@ export interface SenderAccount {
   imapEnabled: boolean;
   isDefault: boolean;
   createdAt: string;
+  /** Melyik napra vonatkozik a sentToday (YYYY-MM-DD). */
+  sentDay?: string;
 }
 
 export interface SenderAccountInput {
@@ -235,6 +239,8 @@ export interface SenderAccountInput {
   fromName: string;
   fromEmail: string;
   replyTo: string;
+  /** A valódi postafiók címe (válaszok ide, Reply-To automatikusan ez). */
+  mailboxEmail: string;
   smtpHost: string;
   smtpPort: number;
   smtpUsername: string;
@@ -333,6 +339,8 @@ export interface EmailMessage {
   aiRewriteNote?: string | null;
   aiPriorityScore?: number;
   aiTags?: string[];
+  needsHuman?: boolean;
+  humanQuestion?: string | null;
 }
 
 export interface InboxThread {
@@ -361,6 +369,10 @@ export interface InboxThread {
   bookingLinkSent: boolean;
   /** Igaz, ha a beszélgetésben több eltérő tárgy van (érdemes ellenőrizni). */
   hasSubjectChange?: boolean;
+  /** Igaz, ha a döntési modell emberi tanácsot kér (nincs automatikus válasz). */
+  needsAdvice?: boolean;
+  /** A legfrissebb feloldatlan emberi kérés szövege. */
+  humanQuestion?: string | null;
   messageCount: number;
   messages: EmailMessage[];
 }
@@ -440,6 +452,8 @@ export interface AppSettings {
   decisionModelApiKey?: string;
   decisionModelId?: string;
   decisionAutoSortInbox?: boolean;
+  /** A valódi 1:1 ügyféllevelezés küldő fiókja (válaszok). */
+  replySenderAccountId?: string | null;
 }
 
 export interface DiscoveryToolStatus {
@@ -468,6 +482,13 @@ export interface SuppressionEntry {
   email: string;
   reason: string;
   createdAt: string;
+}
+
+export interface SyncInboxReport {
+  inserted: number;
+  newLeads: number;
+  skippedAutomated: number;
+  errors: string[];
 }
 
 export interface ActivityItem {

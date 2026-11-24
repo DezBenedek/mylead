@@ -27,6 +27,7 @@ fn fnv1a64_hex(input: &str) -> String {
 #[derive(Debug, Clone)]
 pub struct InboundEmail {
     pub from_email: String,
+    pub from_name: String,
     pub subject: String,
     pub body: String,
     pub message_id: String,
@@ -380,14 +381,22 @@ pub fn fetch_recent_imap_messages(account: &SenderAccount, max_fetch: u32) -> Re
     for msg in fetches.iter() {
         if let Some(raw_bytes) = msg.body() {
             if let Some(parsed) = parser.parse(raw_bytes) {
-                let from_email = parsed
-                    .from()
-                    .and_then(|addrs| addrs.first())
+                let from_addr = parsed.from().and_then(|addrs| addrs.first());
+                let from_email = from_addr
                     .and_then(|a| a.address())
                     .unwrap_or_default()
                     .to_lowercase();
+                let from_name = from_addr
+                    .and_then(|a| a.name())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
 
-                if from_email.is_empty() || from_email == account.from_email.to_lowercase() {
+                // Saját kimenő levelünket kihagyjuk; a postafiók címét is,
+                // mert SES-es fióknál a From (burner domain) eltérhet tőle.
+                let own_from = account.from_email.to_lowercase();
+                let own_mailbox = account.mailbox_email.to_lowercase();
+                if from_email.is_empty() || from_email == own_from || (!own_mailbox.is_empty() && from_email == own_mailbox) {
                     continue;
                 }
 
@@ -423,6 +432,7 @@ pub fn fetch_recent_imap_messages(account: &SenderAccount, max_fetch: u32) -> Re
 
                 results.push(InboundEmail {
                     from_email,
+                    from_name,
                     subject,
                     body,
                     message_id,
